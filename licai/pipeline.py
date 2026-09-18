@@ -231,7 +231,7 @@ class Pipeline:
             product.asset = "USDT"
             product.kind = "flexible"
             holdings.append((product, amount))
-        bfusd = self.earn.bfusd_balance()
+        bfusd = max(self.earn.bfusd_balance(), self.earn.spot_free("BFUSD"))
         if bfusd > 0:
             holdings.append((self.earn.bfusd_product(), bfusd))
         return holdings
@@ -429,32 +429,42 @@ class Pipeline:
         if spot >= 1:
             steps.append(
                 self._mutate(
-                    f"现货 {fmt_amount(spot)} USDT 划入统一账户（全仓），不是经典 U 本位",
+                    f"现货 {fmt_amount(spot)} USDT 划入统一账户全仓（不是 U 本位合约）",
                     lambda: self.futures.spot_to_unified("USDT", spot),
                 )
             )
         bfusd_spot = self.earn.spot_free("BFUSD")
-        bfusd_earn = self.earn.bfusd_balance()
-        try:
-            pm = self.futures.papi_balances()
-        except BinanceAPIError:
-            pm = {}
-        in_pm = pm.get("BFUSD", Decimal("0"))
-        if bfusd_spot >= 1 and in_pm <= 0:
+        if bfusd_spot >= 1:
             steps.append(
                 self._mutate(
-                    f"现货 BFUSD {fmt_amount(bfusd_spot)} 划入统一账户",
+                    f"现货 BFUSD {fmt_amount(bfusd_spot)} 划入统一账户全仓（不是 U 本位合约）",
                     lambda: self.futures.spot_to_unified("BFUSD", bfusd_spot),
                 )
             )
-        elif bfusd_earn > 0 and in_pm <= 0:
-            steps.append(
-                StepResult(
-                    "BFUSD 理财",
-                    True,
-                    f"统一账户下 {fmt_amount(bfusd_earn)} BFUSD 活期本身就算保证金，不用再划到经典全仓",
+        elif self.earn.bfusd_balance() > 0:
+            try:
+                equity = self.futures.refresh_account_risk().get("equity") or Decimal("0")
+                pm = self.futures.papi_balances()
+            except BinanceAPIError:
+                equity = Decimal("0")
+                pm = {}
+            in_pm = pm.get("BFUSD", Decimal("0"))
+            if equity >= 1 or in_pm > 0:
+                steps.append(
+                    StepResult(
+                        "BFUSD 已在保证金",
+                        True,
+                        f"统一账户已计入 BFUSD {fmt_amount(in_pm or equity, 4)}，不用再划",
+                    )
                 )
-            )
+            else:
+                steps.append(
+                    StepResult(
+                        "BFUSD 未进保证金",
+                        False,
+                        "BFUSD 还在现货/理财账户，统一账户权益仍是 0，需要划入全仓后才能开对冲",
+                    )
+                )
         if len(steps) == 1:
             steps.append(StepResult("无需划转", True, "统一账户里已经有保证金，或没有可划的仓位"))
         return steps

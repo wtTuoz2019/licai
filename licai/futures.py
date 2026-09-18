@@ -319,21 +319,30 @@ class FuturesAPI:
             {"asset": asset.upper(), "transferType": "EARN_TO_FUTURE", "amount": fmt_amount(amount)},
         )
 
+    def _post_first(self, attempts: list[tuple[str, dict]], fail: str) -> dict:
+        errors: list[str] = []
+        for path, params in attempts:
+            try:
+                data = self.client.signed("POST", path, params)
+                self._clear_risk()
+                return data if isinstance(data, dict) else {"result": data}
+            except BinanceAPIError as exc:
+                label = params.get("type", path)
+                errors.append(f"{label}: {exc}")
+        raise BinanceAPIError(fail + "；".join(errors))
+
     def spot_to_unified(self, asset: str, amount: Decimal) -> dict:
-        self._clear_risk()
         params = {"asset": asset.upper(), "amount": fmt_amount(amount)}
-        try:
-            return self.client.signed(
-                "POST",
-                "/sapi/v1/asset/transfer",
-                {"type": "MAIN_PORTFOLIO_MARGIN", **params},
-            )
-        except BinanceAPIError:
-            return self.client.signed(
-                "POST",
-                "/sapi/v1/asset/transfer",
-                {"type": "MAIN_MARGIN", **params},
-            )
+        # 子账户/未开万向划转的 key 调 /sapi/v1/asset/transfer 会 -1002。
+        # 统一账户入金口是全仓杠杆钱包，用现货↔杠杆划转即可。
+        return self._post_first(
+            [
+                ("/sapi/v1/margin/transfer", {**params, "type": 1}),
+                ("/sapi/v1/asset/transfer", {**params, "type": "MAIN_PORTFOLIO_MARGIN"}),
+                ("/sapi/v1/asset/transfer", {**params, "type": "MAIN_MARGIN"}),
+            ],
+            fail="现货划入统一账户全仓失败，没有走 U 本位合约。",
+        )
 
     def collect_to_margin(self, asset: str = "USDT") -> dict:
         self._clear_risk()
@@ -373,20 +382,15 @@ class FuturesAPI:
         return d(data.get("amount") or data.get("maxWithdrawAmount") or data.get("transferable"))
 
     def unified_to_spot(self, asset: str, amount: Decimal) -> dict:
-        self._clear_risk()
         params = {"asset": asset.upper(), "amount": fmt_amount(amount)}
-        try:
-            return self.client.signed(
-                "POST",
-                "/sapi/v1/asset/transfer",
-                {"type": "PORTFOLIO_MARGIN_MAIN", **params},
-            )
-        except BinanceAPIError:
-            return self.client.signed(
-                "POST",
-                "/sapi/v1/asset/transfer",
-                {"type": "MARGIN_MAIN", **params},
-            )
+        return self._post_first(
+            [
+                ("/sapi/v1/margin/transfer", {**params, "type": 2}),
+                ("/sapi/v1/asset/transfer", {**params, "type": "PORTFOLIO_MARGIN_MAIN"}),
+                ("/sapi/v1/asset/transfer", {**params, "type": "MARGIN_MAIN"}),
+            ],
+            fail="统一账户全仓转出现货失败。",
+        )
 
     def refresh_account_risk(self) -> dict:
         self._clear_risk()
