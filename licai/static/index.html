@@ -309,6 +309,7 @@
           <div class="ops">
             <button id="btn-refresh" class="ghost" type="button">刷新</button>
             <button id="btn-enter" class="primary" type="button">一键入场</button>
+            <button id="btn-scale" class="warn" type="button" disabled>加仓</button>
             <button id="btn-harvest" class="good" type="button">一键收利</button>
             <button id="btn-switch" class="warn" type="button">换年化</button>
             <button type="button" id="btn-settings" class="ghost">设置</button>
@@ -348,7 +349,9 @@
             <button type="button" id="btn-save-tp">保存</button>
             <button type="button" id="btn-tp-auto" hidden>恢复自动</button>
           </div>
-          <p class="muted harvest-why" id="scale-why"></p>
+          <div class="harvest-set" id="scale-box" hidden>
+            <span class="muted" id="scale-why"></span>
+          </div>
         </div>
         <div id="settings-box" class="edit-box" hidden>
           <p class="muted">出口 IP <b id="ip">-</b> · <span id="proxy-mode"></span> · 代理 <b id="proxy-now">默认</b> · <span id="snap-age"></span></p>
@@ -414,6 +417,7 @@
     }
     const ACTIONS = {
       enter: { title: "一键入场", hint: "申购理财、转入保证金并开对冲。" },
+      scale: { title: "加仓", hint: "在 uniMMR 安全线内，两边一起放大仓位。" },
       harvest: { title: "一键收利", hint: "平掉盈利腿并补仓。" },
       switch: { title: "换更高年化", hint: "分批换成更高年化产品。" },
       leverage: { title: "设置杠杆", hint: "按账号允许的最高倍数设置，100x 不行就 20x、5x。" },
@@ -701,12 +705,26 @@
         : (need > 0 ? `还差 ${gap.toFixed(2)} 到收利门槛` : (h.reason || ""));
       $("btn-harvest").title = h.reason || "";
       const en = s.enter || {};
+      const scaleBox = $("scale-box");
       const scaleEl = $("scale-why");
-      if (scaleEl) {
-        if (en.scale_ok) {
-          scaleEl.textContent = `仓位可放到 ${en.target_qty}（现在 ${en.current_qty}，还可加 ${en.add_qty}）`;
-        } else {
-          scaleEl.textContent = "";
+      const scaleBtn = $("btn-scale");
+      if (en.scale_ok) {
+        if (scaleBox) scaleBox.hidden = false;
+        if (scaleEl) {
+          scaleEl.textContent =
+            `可加仓：目标 ${en.target_qty}，现在 ${en.current_qty}，两边各加 ${en.add_qty}` +
+            (en.uni_mmr ? `，uniMMR ${en.uni_mmr}` : "");
+        }
+        if (scaleBtn) {
+          scaleBtn.disabled = false;
+          scaleBtn.title = en.reason || "两边一起加仓";
+        }
+      } else {
+        if (scaleBox) scaleBox.hidden = true;
+        if (scaleEl) scaleEl.textContent = "";
+        if (scaleBtn) {
+          scaleBtn.disabled = true;
+          scaleBtn.title = en.reason || "当前不能加仓";
         }
       }
       const st = s.stability || {};
@@ -811,6 +829,7 @@
           $("proxy-mode").textContent = s.proxy_mode || "";
           $("btn-enter").disabled = true;
           $("btn-harvest").disabled = true;
+          $("btn-scale").disabled = true;
           $("btn-switch").disabled = true;
           if (s.account) fillSymbolSelect($("symbol-edit"), s.account.hedge_symbol || "ETHUSDT");
           showSnapAge();
@@ -869,30 +888,51 @@
         if (!ok) return;
         payload.force = true;
         payload.mode = "force";
+      } else if (action === "scale") {
+        const en = live.enter || {};
+        if (!en.scale_ok && !unstable) {
+          setActionMsg(en.reason || "当前不能加仓");
+          return;
+        }
+        if (unstable) {
+          const choice = await confirmChoices({
+            title: "价格不稳",
+            body: `预估两边各加 ${en.add_qty || "-"}（目标 ${en.target_qty || "-"}）。现在加仓可能挂不齐。`,
+            okText: "强行加仓",
+            okId: "force",
+            danger: true,
+          });
+          if (!choice) return;
+          payload.force = true;
+          payload.mode = "force";
+        } else {
+          const ok = await confirmAction({
+            title: "加仓",
+            body: `uniMMR 安全线内预估：目标 ${en.target_qty}，现在 ${en.current_qty}，两边各加 ${en.add_qty}`,
+            okText: "确认加仓",
+            danger: true,
+          });
+          if (!ok) return;
+        }
       } else if (action === "enter" && unstable) {
         const legs = live.legs || {};
         const hedged = Number(legs.long_qty) > 0 && Number(legs.short_qty) > 0;
+        if (hedged) {
+          setActionMsg("已有对冲。要放大仓位请点「加仓」");
+          return;
+        }
         const choice = await confirmChoices({
           title: "价格不稳",
-          body: hedged ? "现在加仓两边可能挂不齐。" : "现在开仓两边可能挂不齐。",
+          body: "现在开仓两边可能挂不齐。",
           extraText: "只买理财",
           extraId: "earn_only",
-          okText: hedged ? "强行加仓" : "强行开仓",
+          okText: "强行开仓",
           okId: "force",
           danger: true,
         });
         if (!choice) return;
         payload.mode = choice;
         payload.force = choice === "force";
-      } else if (action === "enter" && ((live.enter || {}).scale_ok)) {
-        const en = live.enter || {};
-        const ok = await confirmAction({
-          title: "放大仓位",
-          body: `目标 ${en.target_qty}，现在 ${en.current_qty}，两边各加 ${en.add_qty}`,
-          okText: "确认加仓",
-          danger: true,
-        });
-        if (!ok) return;
       } else if (action === "harvest" && unstable) {
         const choice = await confirmChoices({
           title: "价格不稳",
@@ -1083,6 +1123,7 @@
     };
     $("btn-set-leverage").onclick = () => act("leverage");
     $("btn-enter").onclick = () => act("enter");
+    $("btn-scale").onclick = () => act("scale");
     $("btn-harvest").onclick = () => act("harvest");
     $("btn-switch").onclick = () => act("switch");
     $("btn-proxy").onclick = async () => {

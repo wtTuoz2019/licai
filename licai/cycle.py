@@ -146,15 +146,6 @@ class HedgeCycle:
             return steps
 
         if hedged:
-            if not force_hedge:
-                try:
-                    stability = price_stability(self.futures, self.settings)
-                except Exception:
-                    stability = None
-                if stability is not None and not stability.stable:
-                    return [
-                        StepResult("暂不加仓", True, "已有对冲，价格不稳。要加仓请选「强行加仓」"),
-                    ]
             try:
                 idle = self.pipeline.spot_cash()
             except Exception:
@@ -163,7 +154,13 @@ class HedgeCycle:
                 steps.extend(self._bootstrap_funds())
                 if any(not s.ok for s in steps):
                     return steps
-            steps.extend(self._scale_to_collateral())
+            steps.append(
+                StepResult(
+                    "已有对冲",
+                    True,
+                    "对冲已齐。要放大仓位请点「加仓」，这里不再自动加",
+                )
+            )
             return steps
 
         if repairing:
@@ -283,19 +280,32 @@ class HedgeCycle:
             ]
         legs = self.futures.legs(self.symbol)
         if legs.missing_side is None:
-            steps = [StepResult("对冲已平衡", True, self._legs_text(legs))]
-            steps.extend(self._scale_to_collateral())
-            return steps
+            return [StepResult("对冲已平衡", True, self._legs_text(legs))]
         qty = self._restore_qty(legs)
         if qty <= 0:
             qty = self._collateral_qty()
         if qty <= 0:
             return [StepResult("开对冲", False, "算出的下单数量为 0，检查理财仓位或 hedge_qty")]
-        steps = self._quote_until_balanced(qty, reduce_only=False)
+        return self._quote_until_balanced(qty, reduce_only=False)
+
+    def scale_once(self, force: bool = False) -> list[StepResult]:
         legs = self.futures.legs(self.symbol)
-        if legs.missing_side is None:
-            steps.extend(self._scale_to_collateral())
-        return steps
+        if legs.missing_side is not None or legs.long_qty <= 0 or legs.short_qty <= 0:
+            return [StepResult("加仓跳过", False, f"对冲不齐，先入场补仓：{self._legs_text(legs)}")]
+        if not force:
+            try:
+                stability = price_stability(self.futures, self.settings)
+            except Exception:
+                stability = None
+            if stability is not None and not stability.stable:
+                return [
+                    StepResult(
+                        "暂不加仓",
+                        True,
+                        "价格不稳。要加仓请选「强行加仓」",
+                    )
+                ]
+        return self._scale_to_collateral()
 
     def _watch_loop(self, steps: list[StepResult]) -> list[StepResult]:
         print("进入盯盘，Ctrl+C 结束")
@@ -362,7 +372,7 @@ class HedgeCycle:
             time.sleep(max(int(self.settings.settle_seconds or 0), 2))
         steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
         if restored.missing_side is None:
-            steps.extend(self._scale_to_collateral())
+            steps.append(StepResult("收利完成", True, "对冲已齐。要放大仓位请点「加仓」"))
         return steps
 
     def _profit_to_spot(self, realized: Decimal) -> list[StepResult]:

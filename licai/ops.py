@@ -276,7 +276,7 @@ class OpsService:
         }
 
     def run_action(self, account: Account, action: str, force: bool = False, mode: str | None = None) -> dict:
-        if action not in {"enter", "harvest", "switch", "sweep", "hedge", "recycle", "fund", "leverage"}:
+        if action not in {"enter", "harvest", "switch", "sweep", "hedge", "recycle", "fund", "leverage", "scale"}:
             raise ValueError(f"未知动作: {action}")
         try:
             pipe = pipeline_for(account, self.base, dry_run=False)
@@ -305,6 +305,21 @@ class OpsService:
                     "steps": [],
                     "snapshot": self.snapshot(account),
                 }
+        if action == "scale":
+            live = self.monitor(account)
+            enter = (live or {}).get("enter") or {}
+            allowed = enter.get("scale_ok") or force
+            if not allowed:
+                reason = enter.get("reason") or "当前不能加仓（uniMMR 不够或已开满）"
+                self.store.add_event(account.id, action, False, "已拦截：" + reason[:500])
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "live": True,
+                    "reason": reason,
+                    "steps": [],
+                    "snapshot": self.snapshot(account),
+                }
         if action == "switch":
             snap = self.snapshot(account)
             switch = snap.get("switch") or {}
@@ -320,6 +335,8 @@ class OpsService:
                 }
         if action == "harvest":
             steps = cycle.harvest_once()
+        elif action == "scale":
+            steps = cycle.scale_once(force=force or mode == "force")
         elif action == "switch":
             steps = pipe.switch_to_best()
         elif action == "leverage":

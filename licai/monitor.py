@@ -216,15 +216,10 @@ def enter_advice(legs: HedgeLegs, stability: Stability, idle_spot: Decimal = Dec
         current = plan.get("current_qty") or fmt_amount(legs.long_qty)
         mmr = plan.get("uni_mmr") or "-"
         scale_ok = bool(plan.get("scale_ok"))
-        extra = (
-            "点「一键入场」两边一起加。"
-            if stability.stable
-            else "价格不稳，点入场后选「强行加仓」。"
-        )
         if scale_ok:
             reason = (
                 f"已有对冲。uniMMR {mmr}（越大越安全，爆仓约 1.05）。"
-                f"目标 {target}，当前 {current}，还可加 {add}。{extra}"
+                f"目标 {target}，当前 {current}，还可加 {add}。点「加仓」手动放大。"
             )
         else:
             reason = f"仓位已按安全上限开满。uniMMR {mmr}，目标 {target}。"
@@ -235,6 +230,7 @@ def enter_advice(legs: HedgeLegs, stability: Stability, idle_spot: Decimal = Dec
             "target_qty": str(target),
             "current_qty": str(current),
             "add_qty": str(add),
+            "uni_mmr": str(mmr),
             "reason": reason,
         }
     if idle_spot > 0:
