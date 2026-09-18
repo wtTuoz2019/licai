@@ -406,6 +406,7 @@
     const SNAP_TTL = 24 * 60 * 60 * 1000;
     const FUNDS_STORE = "licai_funds_cache_v1";
     let pollMs = 120000;
+    let liveAt = 0;
     const $ = (id) => document.getElementById(id);
 
     function cacheId(id) {

@@ -56,6 +56,7 @@ class OpsService:
         self.base = base or load_settings()
         self._snap_cache: dict[int, tuple[float, dict]] = {}
         self._snap_ttl = 86400.0
+        self._risk_cache: dict[int, dict] = {}
 
     def _idle_spot(self, account: Account) -> Decimal:
         hit = self._snap_cache.get(account.id)
@@ -65,6 +66,28 @@ class OpsService:
 
     def invalidate_snapshot(self, account_id: int) -> None:
         self._snap_cache.pop(account_id, None)
+        self._risk_cache.pop(account_id, None)
+
+    def _remember_risk(self, account_id: int, risk: dict) -> dict:
+        stored = {
+            "uni_mmr": risk.get("uni_mmr") or Decimal("0"),
+            "equity": risk.get("equity") or Decimal("0"),
+            "available": risk.get("available") or Decimal("0"),
+        }
+        self._risk_cache[account_id] = stored
+        return stored
+
+    def _risk_for(self, account: Account, futures, *, refresh: bool) -> dict:
+        empty = {"uni_mmr": Decimal("0"), "equity": Decimal("0"), "available": Decimal("0")}
+        if not refresh:
+            return self._risk_cache.get(account.id) or empty
+        if not getattr(futures, "unified", True):
+            return self._remember_risk(account.id, empty)
+        try:
+            risk = futures.refresh_account_risk()
+        except Exception:
+            return self._risk_cache.get(account.id) or empty
+        return self._remember_risk(account.id, risk)
 
     def snapshot(self, account: Account, *, force: bool = False) -> dict:
         now = time.monotonic()
@@ -94,9 +117,9 @@ class OpsService:
         futures = pipe.futures
         try:
             legs = futures.legs(settings.hedge_symbol)
-            risk = futures.account_risk() if settings.unified_account else {"uni_mmr": Decimal("0"), "equity": Decimal("0"), "available": Decimal("0")}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+        risk = self._risk_for(account, futures, refresh=False)
         mmr = risk.get("uni_mmr") or Decimal("0")
         try:
             stability = price_stability(futures, settings)
@@ -111,7 +134,7 @@ class OpsService:
             coll = risk.get("equity") or Decimal("0")
         advice = harvest_advice(legs, stability, settings, last_harvest, principal=coll)
         mmr_text = format_uni_mmr(mmr, legs.long_qty > 0 or legs.short_qty > 0)
-        lev = int(settings.hedge_leverage)
+        lev = int(legs.leverage or settings.hedge_leverage)
         plan = position_plan(
             settings,
             stability.mid,
@@ -156,22 +179,27 @@ class OpsService:
         ip = exit_ip(pipe.client)
         base["exit_ip"] = ip
         base["schedule"] = schedule_hint(settings)
+        earn_error = ""
         try:
-            collateral = pipe.earn.earn_margin_usdt()
+            wallet = pipe.wallet_view()
         except Exception as exc:
-            collateral = Decimal("0")
             earn_error = str(exc)
-        else:
-            earn_error = ""
-        try:
-            spot_usdt = pipe.earn.spot_free("USDT")
-        except Exception:
-            spot_usdt = Decimal("0")
+            wallet = {
+                "spot_usdt": "0",
+                "usdt_flexible": "0",
+                "bfusd": "0",
+                "earn_total": "0",
+                "holdings": [],
+                "next_buy": None,
+                "status": str(exc),
+            }
+        spot_usdt = d(wallet.get("spot_usdt") or "0")
+        collateral = d(wallet.get("earn_total") or "0") + spot_usdt
         try:
             legs = futures.legs(settings.hedge_symbol)
-            risk = futures.account_risk() if settings.unified_account else {"uni_mmr": Decimal("0"), "equity": Decimal("0"), "available": Decimal("0")}
         except Exception as exc:
             return {**base, "ok": False, "error": str(exc)}
+        risk = self._risk_for(account, futures, refresh=True)
         mmr = risk.get("uni_mmr") or Decimal("0")
         try:
             stability = price_stability(futures, settings)
@@ -198,30 +226,12 @@ class OpsService:
         except Exception as exc:
             switch = {"needed": False, "can_click": False, "reason": str(exc)}
         try:
-            wallet = pipe.wallet_view()
-        except Exception as exc:
-            wallet = {
-                "spot_usdt": fmt_amount(spot_usdt, 4),
-                "usdt_flexible": "0",
-                "bfusd": "0",
-                "earn_total": "0",
-                "holdings": [],
-                "next_buy": None,
-                "status": str(exc),
-            }
-        try:
             margin = pipe.margin_status()
         except Exception as exc:
             margin = {"equity": "0", "need_move": False, "can_click": False, "summary": str(exc), "rows": []}
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
         mmr_text = format_uni_mmr(mmr, has_pos)
-        lev = int(settings.hedge_leverage)
-        try:
-            cur = futures.current_leverage(settings.hedge_symbol)
-            if cur > 0:
-                lev = cur
-        except Exception:
-            pass
+        lev = int(legs.leverage or settings.hedge_leverage or 0) or int(settings.hedge_leverage)
         return {
             **base,
             "ok": True,

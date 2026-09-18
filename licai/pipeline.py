@@ -36,6 +36,7 @@ class Pipeline:
         self.earn = EarnAPI(self.client)
         self.convert_api = ConvertAPI(self.client)
         self.futures = FuturesAPI(self.client, unified_account=settings.unified_account)
+        self._product_list: list[FlexibleProduct] | None = None
 
     def require_keys(self) -> None:
         if not self.settings.api_key or not self.settings.api_secret:
@@ -45,6 +46,8 @@ class Pipeline:
         return {a.upper() for a in self.settings.margin_earn_assets}
 
     def list_products(self) -> list[FlexibleProduct]:
+        if self._product_list is not None:
+            return self._product_list
         allowed = self.margin_assets()
         if self.settings.api_key and self.settings.api_secret:
             try:
@@ -60,6 +63,7 @@ class Pipeline:
         filtered = [p for p in products if p.asset in allowed]
         if "BFUSD" in allowed and not any(p.asset == "BFUSD" for p in filtered):
             filtered.append(self.earn.bfusd_product())
+        self._product_list = filtered
         return filtered
 
     def pick(self, products: list[FlexibleProduct] | None = None, margin_assets: set[str] | None = None) -> FlexibleProduct:
@@ -446,8 +450,7 @@ class Pipeline:
             return {"needed": False, "can_click": False, "reason": str(exc)}
         sources = [(p, amt) for p, amt in self.earn_holdings() if not self._same_product(p, target)]
         try:
-            mmr = self.futures.uni_mmr() if self.settings.unified_account else Decimal("0")
-            equity = self.futures.account_equity() if self.settings.unified_account else Decimal("0")
+            mmr, equity = self._mmr_equity() if self.settings.unified_account else (Decimal("0"), Decimal("0"))
         except BinanceAPIError as exc:
             return {"needed": False, "can_click": False, "reason": str(exc)}
         safe = self.settings.switch_safe_uni_mmr
@@ -577,7 +580,8 @@ class Pipeline:
         if not self.settings.unified_account:
             return Decimal("0"), Decimal("0")
         try:
-            return self.futures.uni_mmr(), self.futures.account_equity()
+            risk = self.futures.account_risk()
+            return risk.get("uni_mmr") or Decimal("0"), risk.get("equity") or Decimal("0")
         except BinanceAPIError:
             return Decimal("1"), Decimal("0")
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import threading
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -29,6 +30,9 @@ class BinanceClient:
     SPOT = "https://api.binance.com"
     FUTURES = "https://fapi.binance.com"
     PAPI = "https://papi.binance.com"
+    _time_lock = threading.Lock()
+    _shared_offset_ms = 0
+    _shared_offset_at = 0.0
 
     def __init__(self, api_key: str, api_secret: str, recv_window: int = 5000, timeout: int = 20, proxy: str | None = None):
         self.api_key = api_key
@@ -41,16 +45,27 @@ class BinanceClient:
         self.session.headers.update({"X-MBX-APIKEY": api_key, "Accept": "application/json"})
         if self.proxy:
             self.session.proxies.update({"http": self.proxy, "https": self.proxy})
-        self._time_offset_ms = 0
+        self._time_offset_ms = BinanceClient._shared_offset_ms
         if api_key:
             try:
                 self.sync_time()
             except BinanceAPIError:
-                self._time_offset_ms = 0
+                self._time_offset_ms = BinanceClient._shared_offset_ms
 
-    def sync_time(self) -> None:
-        data = self.public("GET", "/api/v3/time")
-        self._time_offset_ms = int(data["serverTime"]) - int(time.time() * 1000)
+    def sync_time(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - BinanceClient._shared_offset_at < 300:
+            self._time_offset_ms = BinanceClient._shared_offset_ms
+            return
+        with BinanceClient._time_lock:
+            now = time.monotonic()
+            if not force and now - BinanceClient._shared_offset_at < 300:
+                self._time_offset_ms = BinanceClient._shared_offset_ms
+                return
+            data = self.public("GET", "/api/v3/time")
+            BinanceClient._shared_offset_ms = int(data["serverTime"]) - int(time.time() * 1000)
+            BinanceClient._shared_offset_at = time.monotonic()
+            self._time_offset_ms = BinanceClient._shared_offset_ms
 
     def timestamp(self) -> int:
         return int(time.time() * 1000) + self._time_offset_ms
@@ -71,7 +86,7 @@ class BinanceClient:
             return self._send(method, path, payload, signed=True, futures=futures, papi=papi)
         except BinanceAPIError as exc:
             if self._is_timestamp_error(exc):
-                self.sync_time()
+                self.sync_time(force=True)
                 payload["timestamp"] = self.timestamp()
                 query = urlencode({k: v for k, v in payload.items() if k != "signature"}, doseq=True)
                 payload["signature"] = hmac.new(self.api_secret, query.encode("utf-8"), hashlib.sha256).hexdigest()

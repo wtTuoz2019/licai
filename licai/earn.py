@@ -52,6 +52,14 @@ class EarnAPI:
 
     def __init__(self, client: BinanceClient):
         self.client = client
+        self._spot: dict[str, Decimal] = {}
+        self._positions: dict[str, list[dict]] = {}
+        self._bfusd: Decimal | None = None
+
+    def _bust(self) -> None:
+        self._spot.clear()
+        self._positions.clear()
+        self._bfusd = None
 
     def list_flexible(self) -> list[FlexibleProduct]:
         products: list[FlexibleProduct] = []
@@ -98,6 +106,7 @@ class EarnAPI:
         return products
 
     def subscribe_bfusd(self, amount: Decimal, source_asset: str = "USDT") -> dict:
+        self._bust()
         return self.client.signed(
             "POST",
             "/sapi/v1/bfusd/subscribe",
@@ -149,6 +158,7 @@ class EarnAPI:
         return d(data.get("leftPersonalQuota"))
 
     def subscribe(self, product_id: str, amount: Decimal, source_account: str = "SPOT") -> dict:
+        self._bust()
         return self.client.signed(
             "POST",
             "/sapi/v1/simple-earn/flexible/subscribe",
@@ -170,30 +180,51 @@ class EarnAPI:
             if amount is None:
                 raise ValueError("赎回必须指定 amount 或 redeem_all")
             params["amount"] = fmt_amount(amount)
+        self._bust()
         return self.client.signed("POST", "/sapi/v1/simple-earn/flexible/redeem", params)
 
     def positions(self, asset: str | None = None) -> list[dict]:
+        key = (asset or "").upper()
+        hit = self._positions.get(key)
+        if hit is not None:
+            return hit
         params = {"size": 100, "current": 1}
         if asset:
             params["asset"] = asset
         data = self.client.signed("GET", "/sapi/v1/simple-earn/flexible/position", params)
-        return data.get("rows") or []
+        rows = data.get("rows") or []
+        self._positions[key] = rows
+        return rows
 
     def spot_free(self, asset: str) -> Decimal:
+        name = asset.upper()
+        if name in self._spot:
+            return self._spot[name]
         data = self.client.signed("GET", "/api/v3/account")
+        found = Decimal("0")
         for item in data.get("balances") or []:
-            if str(item.get("asset", "")).upper() == asset.upper():
-                return d(item.get("free"))
-        return Decimal("0")
+            token = str(item.get("asset", "")).upper()
+            free = d(item.get("free"))
+            self._spot[token] = free
+            if token == name:
+                found = free
+        if name not in self._spot:
+            self._spot[name] = found
+        return found
 
     def bfusd_balance(self) -> Decimal:
+        if self._bfusd is not None:
+            return self._bfusd
         try:
             data = self.client.signed("GET", "/sapi/v1/bfusd/account")
         except BinanceAPIError:
-            return Decimal("0")
-        return d(data.get("bfusdAmount") or data.get("totalAmount") or data.get("amount"))
+            self._bfusd = Decimal("0")
+            return self._bfusd
+        self._bfusd = d(data.get("bfusdAmount") or data.get("totalAmount") or data.get("amount"))
+        return self._bfusd
 
     def redeem_bfusd(self, amount: Decimal, redeem_type: str = "FAST") -> dict:
+        self._bust()
         return self.client.signed(
             "POST",
             "/sapi/v1/bfusd/redeem",

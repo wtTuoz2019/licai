@@ -7,6 +7,7 @@ from decimal import Decimal, ROUND_DOWN
 
 from .client import BinanceAPIError, BinanceClient
 from .config import d, fmt_amount
+from . import market
 
 _NEW_ACCOUNT_LEV_RE = re.compile(
     r"more than\s+(\d+)x\s+leverage\s+by\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})",
@@ -49,6 +50,7 @@ class HedgeLegs:
     short_pnl: Decimal
     long_entry: Decimal
     short_entry: Decimal
+    leverage: int = 0
 
     @property
     def missing_side(self) -> str | None:
@@ -67,6 +69,10 @@ class FuturesAPI:
     def __init__(self, client: BinanceClient, unified_account: bool = True):
         self.client = client
         self.unified = unified_account
+        self._risk_memo: dict | None = None
+
+    def _clear_risk(self) -> None:
+        self._risk_memo = None
 
     def _um_signed(self, method: str, classic_path: str, papi_path: str, params: dict | None = None):
         if self.unified:
@@ -74,24 +80,16 @@ class FuturesAPI:
         return self.client.signed(method, classic_path, params, futures=True)
 
     def margin_assets(self) -> set[str]:
-        data = self.client.public("GET", "/fapi/v1/assetIndex", futures=True)
-        assets: set[str] = set()
-        rows = data if isinstance(data, list) else [data]
-        for row in rows:
-            symbol = str(row.get("symbol") or "")
-            if symbol.endswith("USD"):
-                assets.add(symbol[:-3].upper())
-        assets.update({"USDT", "USDC", "BFUSD", "FDUSD", "BNFCR", "LDUSDT", "RWUSD", "USD1"})
-        return {a for a in assets if a}
+        try:
+            return market.margin_assets()
+        except Exception:
+            return {"USDT", "USDC", "BFUSD", "FDUSD", "BNFCR", "LDUSDT", "RWUSD", "USD1"}
 
     def portfolio_margin_assets(self) -> set[str]:
-        data = self.client.public("GET", "/sapi/v1/portfolio/collateralRate")
-        assets: set[str] = set()
-        rows = data if isinstance(data, list) else data.get("collateralRate") or data.get("data") or []
-        for row in rows:
-            asset = str(row.get("asset") or "").upper()
-            if asset:
-                assets.add(asset)
+        try:
+            assets = set(market.collateral_rates())
+        except Exception:
+            assets = set()
         assets.update({"USDT", "USDC", "BFUSD", "FDUSD", "BNFCR", "LDUSDT", "RWUSD", "USD1"})
         return assets
 
@@ -170,6 +168,7 @@ class FuturesAPI:
         return best
 
     def _post_leverage(self, symbol: str, leverage: int) -> dict:
+        self._clear_risk()
         data = self._um_signed(
             "POST",
             "/fapi/v1/leverage",
@@ -233,35 +232,13 @@ class FuturesAPI:
         return self.apply_best_leverage(symbol, leverage)
 
     def book(self, symbol: str) -> tuple[Decimal, Decimal]:
-        data = self.client.public("GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol}, futures=True)
-        return d(data["bidPrice"]), d(data["askPrice"])
+        return market.book(symbol)
 
     def klines(self, symbol: str, interval: str = "1m", limit: int = 20) -> list:
-        return self.client.public(
-            "GET",
-            "/fapi/v1/klines",
-            {"symbol": symbol, "interval": interval, "limit": limit},
-            futures=True,
-        )
+        return market.klines(symbol, interval, limit)
 
     def filters(self, symbol: str) -> tuple[Decimal, Decimal]:
-        cached = getattr(self, "_filters_cache", {}).get(symbol)
-        if cached:
-            return cached
-        info = self.client.public("GET", "/fapi/v1/exchangeInfo", futures=True)
-        for item in info.get("symbols") or []:
-            if item.get("symbol") != symbol:
-                continue
-            tick = Decimal("0.01")
-            step = Decimal("0.001")
-            for filt in item.get("filters") or []:
-                if filt.get("filterType") == "PRICE_FILTER":
-                    tick = d(filt.get("tickSize"), "0.01")
-                if filt.get("filterType") == "LOT_SIZE":
-                    step = d(filt.get("stepSize"), "0.001")
-            self._filters_cache = {**getattr(self, "_filters_cache", {}), symbol: (tick, step)}
-            return tick, step
-        raise RuntimeError(f"找不到合约 {symbol}")
+        return market.filters(symbol)
 
     def round_price(self, price: Decimal, tick: Decimal) -> Decimal:
         return (price / tick).to_integral_value(rounding=ROUND_DOWN) * tick
@@ -274,6 +251,7 @@ class FuturesAPI:
         if isinstance(rows, dict):
             rows = [rows]
         long_qty = short_qty = long_pnl = short_pnl = long_entry = short_entry = Decimal("0")
+        leverage = 0
         for row in rows or []:
             if str(row.get("symbol")) != symbol:
                 continue
@@ -281,6 +259,12 @@ class FuturesAPI:
             amt = d(row.get("positionAmt"))
             pnl = d(row.get("unRealizedProfit"))
             entry = d(row.get("entryPrice"))
+            try:
+                lev = int(row.get("leverage") or 0)
+            except (TypeError, ValueError):
+                lev = 0
+            if lev > leverage:
+                leverage = lev
             if side == "LONG" or (side in {"BOTH", ""} and amt > 0):
                 long_qty = abs(amt)
                 long_pnl = pnl
@@ -289,25 +273,16 @@ class FuturesAPI:
                 short_qty = abs(amt)
                 short_pnl = pnl
                 short_entry = entry
-        return HedgeLegs(long_qty, short_qty, long_pnl, short_pnl, long_entry, short_entry)
+        return HedgeLegs(long_qty, short_qty, long_pnl, short_pnl, long_entry, short_entry, leverage)
 
     def available_usdt(self) -> Decimal:
-        if self.unified:
-            data = self.client.signed("GET", "/papi/v1/account", papi=True)
-            return d(data.get("totalAvailableBalance") or data.get("actualEquity") or data.get("accountEquity"))
-        data = self.client.signed("GET", "/fapi/v2/account", futures=True)
-        return d(data.get("availableBalance"))
+        return self.account_risk().get("available") or Decimal("0")
 
     def collateral_rates(self) -> dict[str, Decimal]:
-        data = self.client.public("GET", "/sapi/v1/portfolio/collateralRate")
-        rows = data if isinstance(data, list) else data.get("collateralRate") or data.get("data") or []
-        rates: dict[str, Decimal] = {}
-        for row in rows:
-            asset = str(row.get("asset") or "").upper()
-            if not asset:
-                continue
-            rates[asset] = d(row.get("collateralRate") or row.get("rate") or row.get("collateralRateLevel"))
-        return rates
+        try:
+            return market.collateral_rates()
+        except Exception:
+            return {}
 
     def papi_balances(self) -> dict[str, Decimal]:
         data = self.client.signed("GET", "/papi/v1/balance", papi=True)
@@ -337,6 +312,7 @@ class FuturesAPI:
         return d(data.get("amount") or data.get("balance") or data.get("transferableAmount"))
 
     def earn_to_pm(self, asset: str, amount: Decimal) -> dict:
+        self._clear_risk()
         return self.client.signed(
             "POST",
             "/sapi/v1/portfolio/earn-asset-transfer",
@@ -344,6 +320,7 @@ class FuturesAPI:
         )
 
     def spot_to_unified(self, asset: str, amount: Decimal) -> dict:
+        self._clear_risk()
         return self.client.signed(
             "POST",
             "/sapi/v1/asset/transfer",
@@ -351,6 +328,7 @@ class FuturesAPI:
         )
 
     def collect_to_margin(self, asset: str = "USDT") -> dict:
+        self._clear_risk()
         last_exc: BinanceAPIError | None = None
         try:
             return self.client.signed("POST", "/papi/v1/asset-collection", {"asset": asset.upper()}, papi=True)
@@ -387,6 +365,7 @@ class FuturesAPI:
         return d(data.get("amount") or data.get("maxWithdrawAmount") or data.get("transferable"))
 
     def unified_to_spot(self, asset: str, amount: Decimal) -> dict:
+        self._clear_risk()
         params = {"asset": asset.upper(), "amount": fmt_amount(amount)}
         try:
             return self.client.signed(
@@ -401,20 +380,28 @@ class FuturesAPI:
                 {"type": "MARGIN_MAIN", **params},
             )
 
+    def refresh_account_risk(self) -> dict:
+        self._clear_risk()
+        return self.account_risk()
+
     def account_risk(self) -> dict:
+        if self._risk_memo is not None:
+            return self._risk_memo
         if not self.unified:
             data = self.client.signed("GET", "/fapi/v2/account", futures=True)
             equity = d(data.get("totalMarginBalance") or data.get("availableBalance"))
             available = d(data.get("availableBalance"))
-            return {"uni_mmr": Decimal("0"), "equity": equity, "available": available}
+            self._risk_memo = {"uni_mmr": Decimal("0"), "equity": equity, "available": available}
+            return self._risk_memo
         data = self.client.signed("GET", "/papi/v1/account", papi=True)
         equity = d(data.get("actualEquity") or data.get("accountEquity") or data.get("totalAvailableBalance"))
         available = d(data.get("totalAvailableBalance") or data.get("accountEquity"))
-        return {
+        self._risk_memo = {
             "uni_mmr": d(data.get("uniMMR")),
             "equity": equity,
             "available": available,
         }
+        return self._risk_memo
 
     def uni_mmr(self) -> Decimal:
         if not self.unified:
@@ -422,11 +409,7 @@ class FuturesAPI:
         return self.account_risk()["uni_mmr"]
 
     def account_equity(self) -> Decimal:
-        if self.unified:
-            data = self.client.signed("GET", "/papi/v1/account", papi=True)
-            return d(data.get("actualEquity") or data.get("accountEquity") or data.get("totalAvailableBalance"))
-        data = self.client.signed("GET", "/fapi/v2/account", futures=True)
-        return d(data.get("totalMarginBalance") or data.get("availableBalance"))
+        return self.account_risk()["equity"]
 
     def place_limit(
         self,
@@ -449,6 +432,7 @@ class FuturesAPI:
         }
         if reduce_only and not self.unified:
             params["reduceOnly"] = "true"
+        self._clear_risk()
         return self._um_signed("POST", "/fapi/v1/order", "/papi/v1/um/order", params)
 
     def place_maker(
@@ -479,6 +463,7 @@ class FuturesAPI:
         }
         if reduce_only and not self.unified:
             params["reduceOnly"] = "true"
+        self._clear_risk()
         return self._um_signed("POST", "/fapi/v1/order", "/papi/v1/um/order", params)
 
     def cancel_open(self, symbol: str) -> dict:

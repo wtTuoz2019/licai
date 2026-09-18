@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+import time
 
 from .client import BinanceClient
 from .config import Settings, d, fmt_amount
@@ -73,13 +74,24 @@ def _pct(value: Decimal) -> str:
     return f"{(value * Decimal('100')):.3f}"
 
 
+_IP_TTL = 6 * 3600.0
+_ip_cache: dict[str, tuple[float, str]] = {}
+
+
 def exit_ip(client: BinanceClient) -> str:
+    key = client.proxy or ""
+    now = time.monotonic()
+    hit = _ip_cache.get(key)
+    if hit and now - hit[0] < _IP_TTL:
+        return hit[1]
     try:
-        response = client.session.get("https://api.ipify.org", timeout=8)
+        response = client.session.get("https://api.ipify.org", timeout=4)
         response.raise_for_status()
-        return response.text.strip()
+        ip = response.text.strip() or "未知"
     except Exception:
-        return "未知"
+        ip = "未知"
+    _ip_cache[key] = (now, ip)
+    return ip
 
 
 def price_stability(futures: FuturesAPI, settings: Settings) -> Stability:

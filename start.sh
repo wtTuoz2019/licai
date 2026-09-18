@@ -154,6 +154,8 @@ ensure_env() {
   fi
   if [[ -n "${LICAI_DASHBOARD_PASSWORD:-}" ]]; then
     write_env_key LICAI_DASHBOARD_PASSWORD "$LICAI_DASHBOARD_PASSWORD"
+    chmod 600 "$ROOT/.env"
+    log "访问密码已写入 $ROOT/.env（隐藏文件，用 ls -a 才能看到）"
     return
   fi
   if env_has_password; then
@@ -172,6 +174,7 @@ ensure_env() {
   [[ "$p1" == "$p2" ]] || die "两次密码不一致"
   write_env_key LICAI_DASHBOARD_PASSWORD "$p1"
   chmod 600 "$ROOT/.env"
+  log "访问密码已写入 $ROOT/.env（隐藏文件，用 ls -a 才能看到）"
 }
 
 start_web() {
