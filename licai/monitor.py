@@ -160,13 +160,13 @@ def min_harvest_profit(
     settings: Settings,
     notional: Decimal = Decimal("0"),
 ) -> Decimal:
-    auto = auto_harvest_profit(principal, fee, settings, notional)
-    fee_floor = fee * settings.min_profit_fee_multiple
-    if settings.harvest_min_usdt > 0:
-        fee_floor = max(fee_floor, settings.harvest_min_usdt)
+    # 自己填了「每次收利」就按填写值，不再被手续费×8 顶回去。
     if settings.take_profit_custom and settings.take_profit_usdt > 0:
-        return max(settings.take_profit_usdt, fee_floor)
-    return auto
+        floor = fee if fee > 0 else Decimal("0")
+        if settings.harvest_min_usdt > 0:
+            floor = max(floor, settings.harvest_min_usdt)
+        return max(settings.take_profit_usdt, floor)
+    return auto_harvest_profit(principal, fee, settings, notional)
 
 
 def cooldown_left(last_ok_at: str | None, minutes: int) -> int:
