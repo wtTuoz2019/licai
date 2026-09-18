@@ -862,8 +862,8 @@
       if (action === "enter" && (live.legs || {}).missing) {
         const ok = await confirmAction({
           title: "对冲缺口",
-          body: "现在是单边仓，必须立刻市价补齐另一边。",
-          okText: "立刻补齐",
+          body: "现在是单边仓。另一边先挂单 3 次，不成交再市价。",
+          okText: "补齐对冲",
           danger: true,
         });
         if (!ok) return;
