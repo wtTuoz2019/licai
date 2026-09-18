@@ -2,15 +2,29 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .auth import (
+    AuthMiddleware,
+    clear_login_fails,
+    clear_session_cookie,
+    client_ip,
+    login_blocked,
+    make_session_token,
+    mark_login_fail,
+    password_ok,
+    session_cookie,
+    valid_session,
+    COOKIE_NAME,
+)
 from .config import normalize_hedge_symbol
 from .ops import OpsService
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+NO_STORE = {"Cache-Control": "no-store"}
 ops = OpsService()
 store = ops.store
 
@@ -39,12 +53,42 @@ class ActionIn(BaseModel):
     mode: str | None = None
 
 
+class LoginIn(BaseModel):
+    password: str = ""
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="理财对冲操作台", docs_url=None, redoc_url=None)
+    app = FastAPI(title="理财对冲操作台", docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(AuthMiddleware)
 
     @app.get("/")
-    def index():
-        return FileResponse(STATIC_DIR / "index.html")
+    def index(request: Request):
+        if valid_session(request.cookies.get(COOKIE_NAME)):
+            return FileResponse(STATIC_DIR / "index.html", headers=NO_STORE)
+        return FileResponse(STATIC_DIR / "login.html", headers=NO_STORE)
+
+    @app.post("/api/login")
+    def login(request: Request, body: LoginIn):
+        ip = client_ip(request)
+        if login_blocked(ip):
+            raise HTTPException(429, "尝试次数过多，请稍后再试")
+        if not password_ok(body.password):
+            mark_login_fail(ip)
+            raise HTTPException(401, "密码错误")
+        clear_login_fails(ip)
+        response = JSONResponse({"ok": True})
+        session_cookie(response, make_session_token())
+        return response
+
+    @app.post("/api/logout")
+    def logout():
+        response = JSONResponse({"ok": True})
+        clear_session_cookie(response)
+        return response
+
+    @app.get("/api/session")
+    def session():
+        return {"ok": True}
 
     @app.get("/api/accounts")
     def list_accounts():

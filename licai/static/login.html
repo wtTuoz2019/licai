@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <title>访问密码</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #12181f;
+      --line: #243041;
+      --text: #e8eef6;
+      --muted: #7d8fa3;
+      --bad: #ff7a8a;
+      --accent: #4da3ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "PingFang SC", sans-serif;
+    }
+    form {
+      width: min(360px, 92vw);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 22px 20px 18px;
+    }
+    h1 { margin: 0 0 6px; font-size: 16px; }
+    p { margin: 0 0 14px; color: var(--muted); }
+    input, button { font: inherit; color: var(--text); }
+    input {
+      width: 100%;
+      background: #0d1319;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    button {
+      margin-top: 14px;
+      width: 100%;
+      background: #1a4f8f;
+      border: 1px solid #2d74c2;
+      border-radius: 8px;
+      padding: 10px 12px;
+      cursor: pointer;
+    }
+    .err { color: var(--bad); margin: 10px 0 0; }
+    .err[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <form id="login-form" autocomplete="on">
+    <h1>理财对冲操作台</h1>
+    <p>输入访问密码后才能查看和操作</p>
+    <input id="password" type="password" name="password" required autofocus autocomplete="current-password" placeholder="访问密码" />
+    <p id="err" class="err" hidden></p>
+    <button type="submit">进入</button>
+  </form>
+  <script>
+    const err = document.getElementById("err");
+    document.getElementById("login-form").onsubmit = async (event) => {
+      event.preventDefault();
+      err.hidden = true;
+      try {
+        const res = await fetch("/api/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: document.getElementById("password").value }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          err.textContent = data.detail || "密码错误";
+          err.hidden = false;
+          return;
+        }
+        location.replace("/");
+      } catch (exc) {
+        err.textContent = exc.message || "登录失败";
+        err.hidden = false;
+      }
+    };
+  </script>
+</body>
+</html>

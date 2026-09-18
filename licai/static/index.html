@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store" />
   <title>理财对冲操作台</title>
   <style>
     :root {
@@ -265,6 +266,7 @@
 <body>
   <header>
     <h1>理财对冲操作台</h1>
+    <button type="button" id="btn-logout" class="ghost">退出</button>
   </header>
   <div class="layout">
     <aside class="card">
@@ -601,7 +603,14 @@
     }
 
     async function api(path, opts) {
-      const res = await fetch(path, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
+      const res = await fetch(path, Object.assign({
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+      }, opts));
+      if (res.status === 401) {
+        location.replace("/");
+        throw new Error("未登录");
+      }
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         const detail = data.detail;
@@ -1111,6 +1120,12 @@
       } finally {
         hideModal();
       }
+    };
+    $("btn-logout").onclick = async () => {
+      try {
+        await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
+      } catch (err) {}
+      location.replace("/");
     };
     restoreFunds();
     loadAccounts();

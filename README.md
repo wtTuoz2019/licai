@@ -19,7 +19,7 @@ python -m licai cycle
 python -m licai cycle --live --confirm
 ```
 
-操作台 `python -m licai web` 打开 http://127.0.0.1:8765
+操作台 `python -m licai web` 打开 http://127.0.0.1:8765。必须先在 `.env` 写 `LICAI_DASHBOARD_PASSWORD`，打开页面先输密码；没登录看不到操作台，所有接口也会拒绝。
 
 - 绑定账号；每个账号可填 HTTP 代理，空则走本机默认 IP
 - 资金/理财一天拉一次，点「刷新」才重拉；仓位浮盈按 `live_poll_seconds` 更新
@@ -38,47 +38,36 @@ python -m licai cycle --live --confirm
 - 每个账号可单独选套保币对：ETHUSDT / BTCUSDT / SOLUSDT / BNBUSDT，默认 ETHUSDT
 - `harvest_pos_pct: 0.025` 每次收利默认建议值 = 单边仓位名义 × 2.5%
 
-## 服务器部署
+## 服务器一键部署
 
-仓库不含密钥和 sqlite。服务器上克隆后在页面里重新绑账号。
+仓库不含密钥和 sqlite。服务器上克隆后执行：
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y python3 python3-venv python3-pip git
 git clone git@github.com:wtTuoz2019/licai.git
 cd licai
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+chmod +x start.sh
+./start.sh
 ```
 
-需要的话改 `config.yaml`（杠杆、uniMMR、收利比例等）。不要把 API Key 写进仓库。
-
-后台跑操作台（监听所有网卡，方便用服务器 IP 访问）：
+第一次会提示设置操作台访问密码（写进本地 `.env`，不会进 git）。之后打开 `http://服务器IP:8765`，先输这个密码，再在页面里绑账号。
 
 ```bash
-source .venv/bin/activate
-mkdir -p logs
-nohup python -m licai web --host 0.0.0.0 --port 8765 > logs/web.log 2>&1 &
+./start.sh          # 安装依赖并后台启动
+./start.sh stop     # 停止
+./start.sh restart  # 重启
+./start.sh status   # 是否在跑
+./start.sh systemd  # 写成开机自启（需要 sudo）
 ```
 
-或用 systemd，把 `User`、路径改成你的：
+非交互环境把密码先放到环境变量再启动：
 
-```ini
-[Unit]
-Description=licai dashboard
-After=network.target
-
-[Service]
-WorkingDirectory=/opt/licai
-Environment=LICAI_DRY_RUN=true
-ExecStart=/opt/licai/.venv/bin/python -m licai web --host 0.0.0.0 --port 8765
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
+```bash
+export LICAI_DASHBOARD_PASSWORD='你的密码'
+./start.sh
 ```
 
-打开 `http://服务器IP:8765`，添加账号后点一键入场/收利。操作台默认仍要你在页面确认才会实盘下单。
+默认监听 `0.0.0.0:8765`。改端口或只听本机：`HOST=127.0.0.1 PORT=9000 ./start.sh`
 
-安全建议：用防火墙只放行自己的 IP，或前面加 nginx + 基本认证 / VPN。不要把 8765 裸暴露到公网。
+日志在 `logs/web.log`。不要把 `.env`、API Key 写进仓库。操作台默认仍要在页面确认才会实盘下单。
+
+安全建议：用防火墙只放行自己的 IP，或前面加 nginx / VPN。不要把 8765 裸暴露到公网。访问密码拦的是页面和接口，不能代替防火墙。

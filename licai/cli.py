@@ -4,6 +4,7 @@ import argparse
 import json
 import time
 
+from .auth import require_dashboard_password
 from .config import fmt_amount, load_settings
 from .earn import FlexibleProduct
 from .pipeline import Pipeline, StepResult, apr_percent
@@ -35,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
 
     settings = load_settings(args.config, dry_run_override=dry_run)
     if args.command == "web":
+        require_dashboard_password()
         return _cmd_web(args.host, args.port)
     pipeline = Pipeline(settings)
     if args.command not in {"scan", "pick"}:
@@ -59,7 +61,7 @@ def _cmd_web(host: str, port: int) -> int:
     from .web import app
 
     print(f"操作台: http://{host}:{port}")
-    print("默认不自动下单。页面上看利润和价格平稳后再点一键操作，确认后就是实盘。")
+    print("先输入访问密码才能看数据和操作。默认不自动下单，页面确认后才是实盘。")
     uvicorn.run(app, host=host, port=port, log_level="info")
     return 0
 
