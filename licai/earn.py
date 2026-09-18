@@ -68,6 +68,9 @@ class EarnAPI:
         self._positions.clear()
         self._bfusd = None
 
+    def invalidate(self) -> None:
+        self._bust()
+
     def list_flexible(self) -> list[FlexibleProduct]:
         products: list[FlexibleProduct] = []
         page = 1

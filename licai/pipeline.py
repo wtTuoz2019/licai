@@ -30,6 +30,9 @@ class StepResult:
     dry_run: bool = False
 
 
+SPOT_MIN = Decimal("1")
+
+
 class Pipeline:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -43,6 +46,12 @@ class Pipeline:
         self.convert_api = ConvertAPI(self.client)
         self.futures = FuturesAPI(self.client, unified_account=settings.unified_account)
         self._product_list: list[FlexibleProduct] | None = None
+
+    def spot_cash(self, asset: str | None = None) -> Decimal:
+        return self.earn.spot_free((asset or self.settings.source_asset).upper())
+
+    def spot_needs_move(self) -> bool:
+        return self.spot_cash("USDT") >= SPOT_MIN or self.spot_cash("BFUSD") >= SPOT_MIN
 
     def require_keys(self) -> None:
         if not self.settings.api_key or not self.settings.api_secret:
@@ -104,7 +113,9 @@ class Pipeline:
         return asset in margin_assets or f"LD{asset}" in margin_assets
 
     def plan_amount(self, product: FlexibleProduct, sweep_all: bool = False) -> Decimal:
-        free = self.earn.spot_free(self.settings.source_asset)
+        free = self.spot_cash()
+        if free < SPOT_MIN:
+            return Decimal("0")
         if sweep_all or self.settings.cycle_sweep_all and self.settings.amount == 0:
             requested = free
             amount = free
@@ -182,10 +193,16 @@ class Pipeline:
         return eligible[0]
 
     def sweep_spot_to_earn(self) -> list[StepResult]:
+        try:
+            free = self.spot_cash()
+        except BinanceAPIError as exc:
+            return [StepResult("归集理财", False, str(exc))]
+        if free < SPOT_MIN:
+            return [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
         product = self.pick()
         amount = self.plan_amount(product, sweep_all=True)
-        if amount <= 0:
-            return [StepResult("归集理财", True, "现货没有可申购的 USDT")]
+        if amount < SPOT_MIN:
+            return [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
         steps = [
             StepResult(
                 "归集理财",
@@ -259,16 +276,18 @@ class Pipeline:
                     "product_id": product.product_id,
                 }
             )
-        try:
-            target = self.pick()
-            next_buy = {
-                "asset": target.asset,
-                "apr": str(apr_percent(target.apr)),
-                "kind": "BFUSD" if target.kind == "bfusd" else "USDT 活期",
-                "amount": fmt_amount(spot, 4) if spot > 0 else "0",
-            }
-        except Exception:
-            next_buy = None
+        next_buy = None
+        if spot >= SPOT_MIN:
+            try:
+                target = self.pick()
+                next_buy = {
+                    "asset": target.asset,
+                    "apr": str(apr_percent(target.apr)),
+                    "kind": "BFUSD" if target.kind == "bfusd" else "USDT 活期",
+                    "amount": fmt_amount(spot, 4),
+                }
+            except Exception:
+                next_buy = None
         if usdt_flex + bfusd <= 0 and spot > 0:
             status = f"还没理财。{fmt_amount(spot, 2)} USDT 在现货闲着，不会生息。"
         elif spot > 0:
@@ -408,66 +427,43 @@ class Pipeline:
             "ld_transferable": fmt_amount(ld_free, 4),
         }
 
-    def fund_unified(self) -> list[StepResult]:
-        status = self.margin_status()
-        steps = [StepResult("保证金检查", True, status["summary"])]
+    def fund_unified(self, *, check_ldusdt: bool = True) -> list[StepResult]:
         if not self.settings.unified_account:
             return [StepResult("保证金", False, "当前配置不是统一账户")]
-        try:
-            ld_free = self.futures.earn_to_pm_balance("LDUSDT")
-        except BinanceAPIError as exc:
-            ld_free = Decimal("0")
-            steps.append(StepResult("查询 LDUSDT", True, str(exc)))
-        if ld_free > 0:
-            steps.append(
-                self._mutate(
-                    f"USDT 活期 LDUSDT {fmt_amount(ld_free)} 转入统一账户",
-                    lambda: self.futures.earn_to_pm("LDUSDT", ld_free),
-                )
-            )
-        spot = self.earn.spot_free("USDT")
-        if spot >= 1:
-            steps.append(
-                self._mutate(
-                    f"现货 {fmt_amount(spot)} USDT 划入统一账户全仓（不是 U 本位合约）",
-                    lambda: self.futures.spot_to_unified("USDT", spot),
-                )
-            )
-        bfusd_spot = self.earn.spot_free("BFUSD")
-        if bfusd_spot >= 1:
-            steps.append(
-                self._mutate(
-                    f"现货 BFUSD {fmt_amount(bfusd_spot)} 划入统一账户全仓（不是 U 本位合约）",
-                    lambda: self.futures.spot_to_unified("BFUSD", bfusd_spot),
-                )
-            )
-        elif self.earn.bfusd_balance() > 0:
+        steps: list[StepResult] = []
+        spot = self.spot_cash("USDT")
+        if spot >= SPOT_MIN:
+            steps.append(self._move_spot("USDT", spot))
+        bfusd_spot = self.spot_cash("BFUSD")
+        if bfusd_spot >= SPOT_MIN:
+            steps.append(self._move_spot("BFUSD", bfusd_spot))
+        if check_ldusdt and spot < SPOT_MIN:
             try:
-                equity = self.futures.refresh_account_risk().get("equity") or Decimal("0")
-                pm = self.futures.papi_balances()
-            except BinanceAPIError:
-                equity = Decimal("0")
-                pm = {}
-            in_pm = pm.get("BFUSD", Decimal("0"))
-            if equity >= 1 or in_pm > 0:
+                ld_free = self.futures.earn_to_pm_balance("LDUSDT")
+            except BinanceAPIError as exc:
+                ld_free = Decimal("0")
+                steps.append(StepResult("查询 LDUSDT", True, str(exc)))
+            if ld_free > 0:
                 steps.append(
-                    StepResult(
-                        "BFUSD 已在保证金",
-                        True,
-                        f"统一账户已计入 BFUSD {fmt_amount(in_pm or equity, 4)}，不用再划",
+                    self._mutate(
+                        f"USDT 活期 LDUSDT {fmt_amount(ld_free)} 转入统一账户",
+                        lambda: self.futures.earn_to_pm("LDUSDT", ld_free),
                     )
                 )
-            else:
-                steps.append(
-                    StepResult(
-                        "BFUSD 未进保证金",
-                        False,
-                        "BFUSD 还在现货/理财账户，统一账户权益仍是 0，需要划入全仓后才能开对冲",
-                    )
-                )
-        if len(steps) == 1:
-            steps.append(StepResult("无需划转", True, "统一账户里已经有保证金，或没有可划的仓位"))
+                if steps[-1].ok and not steps[-1].dry_run:
+                    self.earn.invalidate()
+        if not steps:
+            return [StepResult("无需划转", True, "现货没有可划入统一账户的余额")]
         return steps
+
+    def _move_spot(self, asset: str, amount: Decimal) -> StepResult:
+        step = self._mutate(
+            f"现货 {asset} {fmt_amount(amount)} 划入统一账户全仓（不是 U 本位合约）",
+            lambda: self.futures.spot_to_unified(asset, amount),
+        )
+        if step.ok and not step.dry_run:
+            self.earn.invalidate()
+        return step
 
     def switch_advice(self) -> dict:
         try:

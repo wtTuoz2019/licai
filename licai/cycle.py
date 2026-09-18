@@ -10,6 +10,10 @@ from .monitor import harvest_fee, min_harvest_profit, price_stability
 from .pipeline import Pipeline, StepResult
 
 
+def _subscribed(steps: list[StepResult]) -> bool:
+    return any((not step.dry_run) and step.ok and ("申购" in step.name) for step in steps)
+
+
 def _no_margin(step: StepResult) -> bool:
     if step.ok:
         return False
@@ -106,7 +110,7 @@ class HedgeCycle:
                     f"杠杆 {self.settings.hedge_leverage}x，单边浮盈平仓后若未立刻补仓，1% 波动就可能爆掉剩下的腿",
                 )
             )
-        steps.extend(self.pipeline.sweep_spot_to_earn())
+        steps.extend(self._bootstrap_funds())
         if any(not s.ok for s in steps):
             return steps
         steps.extend(self._prepare_account())
@@ -141,6 +145,14 @@ class HedgeCycle:
                     return [
                         StepResult("暂不加仓", True, "已有对冲，价格不稳。要加仓请选「强行加仓」"),
                     ]
+            try:
+                idle = self.pipeline.spot_cash()
+            except Exception:
+                idle = Decimal("0")
+            if idle >= 1:
+                steps.extend(self._bootstrap_funds())
+                if any(not s.ok for s in steps):
+                    return steps
             steps.extend(self._scale_to_collateral())
             return steps
 
@@ -171,31 +183,22 @@ class HedgeCycle:
         return steps
 
     def _bootstrap_funds(self) -> list[StepResult]:
-        steps: list[StepResult] = []
-        idle = Decimal("0")
-        try:
-            idle = self.pipeline.earn.spot_free(self.settings.source_asset)
-        except Exception:
-            idle = Decimal("0")
-        if idle >= 1:
-            before = len(steps)
-            steps.extend(self.pipeline.sweep_spot_to_earn())
-            if any(not s.ok for s in steps):
-                return steps
-            bought = any((not s.dry_run) and s.ok and ("申购" in s.name) for s in steps[before:])
-            if bought and not self.settings.dry_run:
-                wait = max(int(self.settings.settle_seconds or 0), 3)
-                time.sleep(wait)
-            steps.extend(self.pipeline.fund_unified())
+        steps = list(self.pipeline.sweep_spot_to_earn())
+        if any(not s.ok for s in steps):
             return steps
-        try:
-            equity = self.futures.account_equity()
-        except Exception:
-            equity = Decimal("0")
-        if equity >= 1:
-            return steps
-        steps.extend(self.pipeline.fund_unified())
+        bought = _subscribed(steps)
+        if bought and not self.settings.dry_run:
+            time.sleep(max(int(self.settings.settle_seconds or 0), 3))
+        steps.extend(self._fund_after_earn(steps, check_idle_ldusdt=True))
         return steps
+
+    def _fund_after_earn(self, earn_steps: list[StepResult], *, check_idle_ldusdt: bool) -> list[StepResult]:
+        bought = _subscribed(earn_steps)
+        bought_flex = any((not s.dry_run) and s.ok and "申购活期" in s.name for s in earn_steps)
+        check_ld = bought_flex or (check_idle_ldusdt and not bought)
+        if bought or self.pipeline.spot_needs_move() or check_ld:
+            return self.pipeline.fund_unified(check_ldusdt=check_ld)
+        return []
 
     def harvest_once(self) -> list[StepResult]:
         legs = self.futures.legs(self.symbol)
@@ -335,10 +338,11 @@ class HedgeCycle:
         restored = self.futures.legs(self.symbol)
         if restored.missing_side is not None:
             steps.append(StepResult("补仓未完成", False, self._legs_text(restored)))
-        steps.extend(self._spot_profit_to_earn())
+        earn_steps = self._spot_profit_to_earn()
+        steps.extend(earn_steps)
         if not self.settings.dry_run:
             time.sleep(max(int(self.settings.settle_seconds or 0), 2))
-        steps.extend(self.pipeline.fund_unified())
+        steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
         if restored.missing_side is None:
             steps.extend(self._scale_to_collateral())
         return steps
@@ -366,12 +370,13 @@ class HedgeCycle:
             )
             return steps
         amount = transferable
-        steps.append(
-            self._mutate(
-                f"最大可转出 {fmt_amount(amount)} USDT 转到现货（本次浮盈约 {fmt_amount(realized)}）",
-                lambda: self.futures.unified_to_spot("USDT", amount),
-            )
+        moved = self._mutate(
+            f"最大可转出 {fmt_amount(amount)} USDT 转到现货（本次浮盈约 {fmt_amount(realized)}）",
+            lambda: self.futures.unified_to_spot("USDT", amount),
         )
+        if moved.ok and not moved.dry_run:
+            self.pipeline.earn.invalidate()
+        steps.append(moved)
         return steps
 
     def _spot_profit_to_earn(self) -> list[StepResult]:
