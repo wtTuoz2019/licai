@@ -321,11 +321,19 @@ class FuturesAPI:
 
     def spot_to_unified(self, asset: str, amount: Decimal) -> dict:
         self._clear_risk()
-        return self.client.signed(
-            "POST",
-            "/sapi/v1/asset/transfer",
-            {"type": "MAIN_MARGIN", "asset": asset.upper(), "amount": fmt_amount(amount)},
-        )
+        params = {"asset": asset.upper(), "amount": fmt_amount(amount)}
+        try:
+            return self.client.signed(
+                "POST",
+                "/sapi/v1/asset/transfer",
+                {"type": "MAIN_PORTFOLIO_MARGIN", **params},
+            )
+        except BinanceAPIError:
+            return self.client.signed(
+                "POST",
+                "/sapi/v1/asset/transfer",
+                {"type": "MAIN_MARGIN", **params},
+            )
 
     def collect_to_margin(self, asset: str = "USDT") -> dict:
         self._clear_risk()

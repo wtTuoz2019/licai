@@ -8,6 +8,13 @@ from .client import BinanceAPIError, BinanceClient
 from .config import d, fmt_amount
 
 
+def _apr(value: object) -> Decimal:
+    apr = d(value)
+    if apr > 1:
+        return apr / Decimal("100")
+    return apr
+
+
 SubscribeKind = Literal["flexible", "bfusd"]
 
 
@@ -36,7 +43,7 @@ class FlexibleProduct:
         return cls(
             product_id=str(row.get("productId") or row.get("id") or ""),
             asset=str(row.get("asset") or "").upper(),
-            apr=d(row.get("latestAnnualPercentageRate") or row.get("latestAnnualInterestRate")),
+            apr=_apr(row.get("latestAnnualPercentageRate") or row.get("latestAnnualInterestRate")),
             can_purchase=bool(row.get("canPurchase")),
             can_redeem=bool(row.get("canRedeem", True)),
             is_sold_out=bool(sold_out),
@@ -126,7 +133,7 @@ class EarnAPI:
         if not rows:
             return Decimal("0")
         row = rows[0]
-        return d(
+        return _apr(
             row.get("annualPercentageRate")
             or row.get("latestAnnualPercentageRate")
             or row.get("apr")

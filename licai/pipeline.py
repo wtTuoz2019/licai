@@ -16,6 +16,12 @@ def apr_percent(apr: Decimal) -> Decimal:
     return apr if apr > 1 else apr * Decimal("100")
 
 
+def apr_ratio(apr: Decimal) -> Decimal:
+    if apr <= 0:
+        return Decimal("0")
+    return apr / Decimal("100") if apr > 1 else apr
+
+
 @dataclass
 class StepResult:
     name: str
@@ -72,7 +78,7 @@ class Pipeline:
         candidates = [p for p in products if self._eligible(p, margin_assets)]
         if not candidates:
             raise RuntimeError("没有可作合约保证金的保本活期，请检查 margin_earn_assets")
-        candidates.sort(key=lambda p: p.apr, reverse=True)
+        candidates.sort(key=lambda p: apr_ratio(p.apr), reverse=True)
         return candidates[0]
 
     def _eligible(self, product: FlexibleProduct, margin_assets: set[str]) -> bool:
@@ -172,7 +178,7 @@ class Pipeline:
         eligible = [p for p in products if self._eligible(p, self.margin_assets())]
         if not eligible:
             return None
-        eligible.sort(key=lambda p: p.apr, reverse=True)
+        eligible.sort(key=lambda p: apr_ratio(p.apr), reverse=True)
         return eligible[0]
 
     def sweep_spot_to_earn(self) -> list[StepResult]:
@@ -427,16 +433,26 @@ class Pipeline:
                     lambda: self.futures.spot_to_unified("USDT", spot),
                 )
             )
-        bfusd = max(self.earn.bfusd_balance(), self.earn.spot_free("BFUSD"))
+        bfusd_spot = self.earn.spot_free("BFUSD")
+        bfusd_earn = self.earn.bfusd_balance()
         try:
             pm = self.futures.papi_balances()
         except BinanceAPIError:
             pm = {}
-        if bfusd > 0 and pm.get("BFUSD", Decimal("0")) <= 0:
+        in_pm = pm.get("BFUSD", Decimal("0"))
+        if bfusd_spot >= 1 and in_pm <= 0:
             steps.append(
                 self._mutate(
-                    f"BFUSD {fmt_amount(bfusd)} 划入统一账户",
-                    lambda: self.futures.spot_to_unified("BFUSD", bfusd),
+                    f"现货 BFUSD {fmt_amount(bfusd_spot)} 划入统一账户",
+                    lambda: self.futures.spot_to_unified("BFUSD", bfusd_spot),
+                )
+            )
+        elif bfusd_earn > 0 and in_pm <= 0:
+            steps.append(
+                StepResult(
+                    "BFUSD 理财",
+                    True,
+                    f"统一账户下 {fmt_amount(bfusd_earn)} BFUSD 活期本身就算保证金，不用再划到经典全仓",
                 )
             )
         if len(steps) == 1:
