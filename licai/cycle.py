@@ -6,7 +6,7 @@ from decimal import Decimal
 from .client import BinanceAPIError
 from .config import d, fmt_amount, is_mmr_sentinel
 from .futures import FuturesAPI, HedgeLegs
-from .monitor import harvest_fee, min_harvest_profit, price_stability
+from .monitor import harvest_fee_estimate, min_harvest_profit, price_stability
 from .pipeline import Pipeline, StepResult
 
 
@@ -22,6 +22,13 @@ def _no_margin(step: StepResult) -> bool:
         return False
     text = str(step.detail or "").lower()
     return "-2019" in text or "margin is insufficient" in text
+
+
+def _post_only_reject(step: StepResult) -> bool:
+    if step.ok:
+        return False
+    text = str(step.detail or "").lower()
+    return "-5022" in text or "post only" in text or "could not be executed as maker" in text
 
 
 def margin_use_pct(settings) -> Decimal:
@@ -270,7 +277,7 @@ class HedgeCycle:
                     "开对冲",
                     True,
                     f"理财保证金约 {fmt_amount(collateral)} USDT，按 {margin_use_pct(self.settings)} 占用、{self.settings.hedge_leverage}x、双边各占保证金，开 "
-                    f"两边按中间价挂单，不成交就改价重试，最后市价补齐  数量={fmt_amount(qty)} {self.symbol}",
+                    f"两边先挂单（GTX），不成交再改价，最后市价补齐  数量={fmt_amount(qty)} {self.symbol}",
                     dry_run=True,
                 )
             ]
@@ -309,7 +316,7 @@ class HedgeCycle:
                     mid = (bid + ask) / 2
                     need = min_harvest_profit(
                         principal,
-                        harvest_fee(legs, mid, self.settings.maker_fee_rate),
+                        harvest_fee_estimate(legs, mid, self.settings),
                         self.settings,
                         max(legs.long_qty, legs.short_qty) * mid,
                     )
@@ -480,9 +487,7 @@ class HedgeCycle:
             return steps
         bid, ask = self.futures.book(self.symbol)
         tick, step = self.futures.filters(self.symbol)
-        mid = self.futures.round_price((bid + ask) / 2, tick)
-        buy_px = self.futures.round_price(ask if aggressive else mid, tick)
-        sell_px = self.futures.round_price(bid if aggressive else mid, tick)
+        buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=aggressive)
         qty = self.futures.round_qty(qty, step)
         if legs.long_qty > 0 and legs.short_qty > 0:
             extra = self.futures.round_qty(abs(legs.long_qty - legs.short_qty), step)
@@ -508,6 +513,28 @@ class HedgeCycle:
         if legs.short_qty <= 0:
             steps.append(self._place("SELL", "SHORT", target, sell_px, reduce_only, market=market))
         return steps
+
+    def _maker_prices(self, bid: Decimal, ask: Decimal, tick: Decimal, *, improve: bool = False) -> tuple[Decimal, Decimal]:
+        """挂单价必须站在盘口内侧，GTX 才不会变成吃单。"""
+        if bid <= 0 or ask <= 0 or ask <= bid:
+            mid = self.futures.round_price(max(bid, ask), tick)
+            return mid, mid
+        mid = self.futures.round_price((bid + ask) / 2, tick)
+        if improve:
+            buy_px = self.futures.round_price(min(mid, ask - tick), tick)
+            sell_px = self.futures.round_price(max(mid, bid + tick), tick)
+        else:
+            buy_px = self.futures.round_price(bid, tick)
+            sell_px = self.futures.round_price(ask, tick)
+        if buy_px >= ask:
+            buy_px = self.futures.round_price(ask - tick, tick)
+        if sell_px <= bid:
+            sell_px = self.futures.round_price(bid + tick, tick)
+        if buy_px <= 0:
+            buy_px = self.futures.round_price(bid, tick)
+        if sell_px <= 0:
+            sell_px = self.futures.round_price(ask, tick)
+        return buy_px, sell_px
 
     def _quote_side(self, order_side: str, position_side: str, qty: Decimal, reduce_only: bool) -> list[StepResult]:
         steps: list[StepResult] = []
@@ -561,11 +588,8 @@ class HedgeCycle:
         qty = self.futures.round_qty(qty, step)
         if qty <= 0:
             return [StepResult("下单跳过", False, "数量为 0")]
-        mid = self.futures.round_price((bid + ask) / 2, tick)
-        if order_side == "BUY":
-            price = self.futures.round_price(ask if aggressive else mid, tick)
-        else:
-            price = self.futures.round_price(bid if aggressive else mid, tick)
+        buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=aggressive)
+        price = buy_px if order_side == "BUY" else sell_px
         return [self._place(order_side, position_side, qty, price, reduce_only, market=market)]
 
     def _place(
@@ -586,8 +610,8 @@ class HedgeCycle:
                 lambda: self.futures.place_market(self.symbol, side, position_side, qty, reduce_only),
             )
         return self._mutate(
-            f"{action} 限价 {side} {position_side} {fmt_amount(qty)} @ {fmt_amount(price)}",
-            lambda: self.futures.place_limit(self.symbol, side, position_side, qty, price, reduce_only),
+            f"{action} 挂单 {side} {position_side} {fmt_amount(qty)} @ {fmt_amount(price)}",
+            lambda: self.futures.place_maker(self.symbol, side, position_side, qty, price, reduce_only),
         )
 
     def _collateral_qty(self) -> Decimal:
@@ -694,9 +718,7 @@ class HedgeCycle:
             self.futures.cancel_open(self.symbol)
             bid, ask = self.futures.book(self.symbol)
             tick, step = self.futures.filters(self.symbol)
-            mid = self.futures.round_price((bid + ask) / 2, tick)
-            buy_px = self.futures.round_price(ask if i > 0 else mid, tick)
-            sell_px = self.futures.round_price(bid if i > 0 else mid, tick)
+            buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=i > 0)
             if legs.long_qty < goal_long:
                 leftover = self.futures.round_qty(goal_long - legs.long_qty, step)
                 if leftover > 0:

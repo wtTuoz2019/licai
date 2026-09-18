@@ -108,6 +108,7 @@ class Settings:
     scale_min_add_pct: Decimal = Decimal("0.03")
     proxy: str | None = None
     maker_fee_rate: Decimal = Decimal("0.0002")
+    taker_fee_rate: Decimal = Decimal("0.0005")
     min_profit_fee_multiple: Decimal = Decimal("8")
     harvest_principal_pct: Decimal = Decimal("0.01")
     harvest_pos_pct: Decimal = Decimal("0.025")
@@ -197,6 +198,7 @@ def load_settings(config_path: str | Path | None = None, dry_run_override: bool 
         scale_min_add_pct=d(raw.get("scale_min_add_pct", "0.03")),
         proxy=(str(raw.get("proxy") or "").strip() or None),
         maker_fee_rate=d(raw.get("maker_fee_rate", "0.0002")),
+        taker_fee_rate=d(raw.get("taker_fee_rate", "0.0005")),
         min_profit_fee_multiple=d(raw.get("min_profit_fee_multiple", "8")),
         harvest_principal_pct=d(raw.get("harvest_principal_pct", "0.01")),
         harvest_pos_pct=d(raw.get("harvest_pos_pct", "0.025")),

@@ -60,9 +60,10 @@ live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
 min_free_usdt_keep: 0        # 默认不留。若未开 BNB 抵扣手续费，可留几 USDT 给合约成交费
 cycle_sweep_all: true        # 启动时把现货闲置 USDT 申购 USDT/BFUSD 活期（仓位继续当保证金）
 
-# 操作台：先看利润，不平自动单。平仓一轮 = 平盈利腿 + 补回，约 2 笔 maker
+# 操作台手续费预估：收利一轮 = 平盈利腿 + 补回，按吃单费率估（挂单成功会更低）
 maker_fee_rate: 0.0002
-min_profit_fee_multiple: 8   # 浮盈至少覆盖约 8 倍手续费，避免频繁磨损
+taker_fee_rate: 0.0005
+min_profit_fee_multiple: 8   # 自动门槛：浮盈至少覆盖约 8 倍预估手续费
 harvest_principal_pct: 0.01  # 还没仓位时，至少为本金的 1%
 harvest_pos_pct: 0.025       # 有仓位时按单边名义本金的 2.5%：0.081 ETH × 2450 ≈ 5 USDT
 harvest_sqrt_coeff: 0.5      # 无仓位时 0.5×√本金兜底
