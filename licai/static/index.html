@@ -859,7 +859,17 @@
       const live = (snapHit(selected) && snapHit(selected).data) || {};
       const unstable = !((live.stability || {}).stable);
       const payload = { action, force: false, mode: null };
-      if (action === "enter" && unstable) {
+      if (action === "enter" && (live.legs || {}).missing) {
+        const ok = await confirmAction({
+          title: "对冲缺口",
+          body: "现在是单边仓，必须立刻市价补齐另一边。",
+          okText: "立刻补齐",
+          danger: true,
+        });
+        if (!ok) return;
+        payload.force = true;
+        payload.mode = "force";
+      } else if (action === "enter" && unstable) {
         const legs = live.legs || {};
         const hedged = Number(legs.long_qty) > 0 && Number(legs.short_qty) > 0;
         const choice = await confirmChoices({
