@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -422,6 +423,80 @@ class FuturesAPI:
 
     def account_equity(self) -> Decimal:
         return self.account_risk()["equity"]
+
+    def um_commission_rates(self, symbol: str) -> dict[str, Decimal]:
+        memo = getattr(self, "_fee_rate_memo", None)
+        now = time.monotonic()
+        if isinstance(memo, dict):
+            hit = memo.get(symbol)
+            if hit and now - hit[0] < 3600:
+                return hit[1]
+        data = self._um_signed(
+            "GET",
+            "/fapi/v1/commissionRate",
+            "/papi/v1/um/commissionRate",
+            {"symbol": symbol},
+        )
+        rates = {
+            "maker": d(data.get("makerCommissionRate")),
+            "taker": d(data.get("takerCommissionRate")),
+        }
+        if not hasattr(self, "_fee_rate_memo") or not isinstance(self._fee_rate_memo, dict):
+            self._fee_rate_memo = {}
+        self._fee_rate_memo[symbol] = (now, rates)
+        return rates
+
+    def um_user_trades(self, symbol: str, limit: int = 20) -> list[dict]:
+        data = self._um_signed(
+            "GET",
+            "/fapi/v1/userTrades",
+            "/papi/v1/um/userTrades",
+            {"symbol": symbol, "limit": limit},
+        )
+        if isinstance(data, list):
+            return data
+        return data.get("list") or data.get("data") or []
+
+    def round_trip_fee(self, symbol: str, qty: Decimal, mid: Decimal) -> dict[str, Decimal | str]:
+        """收利一轮手续费：优先用近期同仓位成交的实付，否则按账户真实费率×名义。"""
+        qty = abs(qty)
+        notional = qty * mid if qty > 0 and mid > 0 else Decimal("0")
+        try:
+            rates = self.um_commission_rates(symbol)
+            maker = rates["maker"]
+            taker = rates["taker"]
+        except BinanceAPIError:
+            maker = Decimal("0.0002")
+            taker = Decimal("0.0005")
+        fee = notional * (maker + taker) if notional > 0 else Decimal("0")
+        source = "rate"
+        try:
+            trades = self.um_user_trades(symbol, limit=20)
+        except BinanceAPIError:
+            trades = []
+        matched: list[Decimal] = []
+        for row in trades:
+            asset = str(row.get("commissionAsset") or "").upper()
+            if asset and asset not in {"USDT", "USDC", "BFUSD", "BUSD", "FDUSD"}:
+                continue
+            trade_qty = abs(d(row.get("qty")))
+            if qty > 0 and trade_qty > 0:
+                ratio = trade_qty / qty if qty >= trade_qty else qty / trade_qty
+                if ratio < Decimal("0.7"):
+                    continue
+            matched.append(abs(d(row.get("commission"))))
+            if len(matched) >= 2:
+                break
+        if len(matched) >= 2:
+            fee = matched[0] + matched[1]
+            source = "trades"
+        return {
+            "fee": fee,
+            "maker_rate": maker,
+            "taker_rate": taker,
+            "notional": notional,
+            "source": source,
+        }
 
     def place_limit(
         self,

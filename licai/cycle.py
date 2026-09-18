@@ -6,7 +6,7 @@ from decimal import Decimal
 from .client import BinanceAPIError
 from .config import d, fmt_amount, is_mmr_sentinel
 from .futures import FuturesAPI, HedgeLegs
-from .monitor import harvest_fee_estimate, min_harvest_profit, price_stability
+from .monitor import min_harvest_profit, price_stability, resolve_harvest_fee
 from .pipeline import Pipeline, StepResult
 
 
@@ -316,7 +316,7 @@ class HedgeCycle:
                     mid = (bid + ask) / 2
                     need = min_harvest_profit(
                         principal,
-                        harvest_fee_estimate(legs, mid, self.settings),
+                        resolve_harvest_fee(self.futures, self.symbol, legs, mid, self.settings),
                         self.settings,
                         max(legs.long_qty, legs.short_qty) * mid,
                     )

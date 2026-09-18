@@ -125,14 +125,24 @@ def harvest_fee(legs: HedgeLegs, mid: Decimal, fee_rate: Decimal) -> Decimal:
     qty = max(legs.long_qty, legs.short_qty)
     if qty <= 0 or mid <= 0:
         return Decimal("0")
-    # 平盈利腿 + 补回另一边，按传入费率估两笔
     return qty * mid * fee_rate * Decimal("2")
 
 
 def harvest_fee_estimate(legs: HedgeLegs, mid: Decimal, settings) -> Decimal:
-    # 页面统计按吃单费率估，避免把 0.05% 当成 0.02% 低估
     rate = getattr(settings, "taker_fee_rate", None) or settings.maker_fee_rate
     return harvest_fee(legs, mid, rate)
+
+
+def resolve_harvest_fee(futures, symbol: str, legs: HedgeLegs, mid: Decimal, settings) -> Decimal:
+    qty = max(legs.long_qty, legs.short_qty)
+    try:
+        info = futures.round_trip_fee(symbol, qty, mid)
+        fee = info.get("fee") or Decimal("0")
+        if fee > 0:
+            return fee
+    except Exception:
+        pass
+    return harvest_fee_estimate(legs, mid, settings)
 
 
 def position_notional(legs: HedgeLegs, mid: Decimal) -> Decimal:
@@ -260,8 +270,10 @@ def harvest_advice(
     settings: Settings,
     last_harvest_at: str | None,
     principal: Decimal = Decimal("0"),
+    fee: Decimal | None = None,
 ) -> HarvestAdvice:
-    fee = harvest_fee_estimate(legs, stability.mid, settings)
+    if fee is None:
+        fee = harvest_fee_estimate(legs, stability.mid, settings)
     notional = position_notional(legs, stability.mid)
     auto = auto_harvest_profit(principal, fee, settings, notional)
     min_profit = min_harvest_profit(principal, fee, settings, notional)

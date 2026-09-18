@@ -6,7 +6,7 @@ from decimal import Decimal
 
 from .config import Settings, d, fmt_amount, is_mmr_sentinel, load_settings, settings_for_account
 from .cycle import HedgeCycle, position_plan
-from .monitor import enter_advice, exit_ip, harvest_advice, price_stability, schedule_hint
+from .monitor import enter_advice, exit_ip, harvest_advice, price_stability, resolve_harvest_fee, schedule_hint
 from .pipeline import Pipeline, StepResult
 from .store import Account, AccountStore
 
@@ -132,7 +132,8 @@ class OpsService:
             coll = d(hit[1].get("collateral_usdt") or hit[1].get("bfusd") or "0")
         if coll <= 0:
             coll = risk.get("equity") or Decimal("0")
-        advice = harvest_advice(legs, stability, settings, last_harvest, principal=coll)
+        fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
+        advice = harvest_advice(legs, stability, settings, last_harvest, principal=coll, fee=fee)
         mmr_text = format_uni_mmr(mmr, legs.long_qty > 0 or legs.short_qty > 0)
         lev = int(legs.leverage or settings.hedge_leverage)
         plan = position_plan(
@@ -206,7 +207,8 @@ class OpsService:
         except Exception as exc:
             return {**base, "ok": False, "error": f"价格监控失败: {exc}"}
         last_harvest = self.store.last_ok_action_at(account.id, "harvest")
-        advice = harvest_advice(legs, stability, settings, last_harvest, principal=collateral)
+        fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
+        advice = harvest_advice(legs, stability, settings, last_harvest, principal=collateral, fee=fee)
         try:
             _, step = futures.filters(settings.hedge_symbol)
         except Exception:
