@@ -1,0 +1,1119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>理财对冲操作台</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #12181f;
+      --panel2: #181f28;
+      --line: #243041;
+      --text: #e8eef6;
+      --muted: #7d8fa3;
+      --good: #3dd68c;
+      --warn: #f5c26b;
+      --bad: #ff7a8a;
+      --accent: #4da3ff;
+      --long: #3dd68c;
+      --short: #ff7a8a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "PingFang SC", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: .02em; }
+    .layout {
+      display: grid;
+      grid-template-columns: 240px 1fr;
+      gap: 12px;
+      padding: 12px 16px 24px;
+      min-height: calc(100vh - 48px);
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+    }
+    aside.card { padding: 12px; }
+    h2 { margin: 0 0 10px; font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: .04em; text-transform: none; }
+    label { display: block; color: var(--muted); margin: 8px 0 4px; font-size: 12px; }
+    input, button, textarea, select { font: inherit; color: var(--text); }
+    input, textarea, select {
+      width: 100%;
+      background: #0d1319;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
+    select { color: var(--text); }
+    button {
+      background: #1c2633;
+      border: 1px solid #33455c;
+      border-radius: 8px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    button.primary { background: #1a4f8f; border-color: #2d74c2; }
+    button.good { background: #147047; border-color: #1d9660; }
+    button.warn { background: #5a4314; border-color: #8a681d; }
+    button.ghost { background: transparent; }
+    button.danger { background: #6b1f2a; border-color: #a33; }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    .ops button.good:disabled {
+      opacity: 1;
+      background: #15241c;
+      border-color: #24382d;
+      color: #6d8a7a;
+    }
+    .ops button.warn:disabled {
+      opacity: 1;
+      background: #241c10;
+      border-color: #3a3018;
+      color: #8a7a58;
+    }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .row[hidden], #modal-spin[hidden], #modal-actions[hidden] { display: none !important; }
+    .edit-box { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+    .accounts { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+    .acct {
+      text-align: left;
+      width: 100%;
+      background: #0e141b;
+      padding: 10px 12px;
+    }
+    .acct b { display: block; font-size: 13px; }
+    .acct.active { outline: 1px solid var(--accent); background: #152033; }
+    .muted { color: var(--muted); }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding-bottom: 12px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid var(--line);
+      flex-wrap: wrap;
+    }
+    .meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .sym { font-size: 18px; font-weight: 700; letter-spacing: .04em; }
+    .lev-chip {
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #1c2836;
+      color: var(--muted);
+    }
+    .lev-chip b { color: var(--text); font-weight: 650; }
+    .ops { display: flex; gap: 6px; flex-wrap: wrap; }
+    .ops button { padding: 8px 14px; font-weight: 600; }
+    .funds {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+    .kpi {
+      background: var(--panel2);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .kpi span { display: block; color: var(--muted); font-size: 11px; }
+    .kpi b { display: block; font-size: 18px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .pos-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .pos {
+      background: var(--panel2);
+      border-radius: 10px;
+      padding: 12px 14px;
+      border-left: 3px solid transparent;
+    }
+    .pos.long { border-left-color: var(--long); }
+    .pos.short { border-left-color: var(--short); }
+    .pos-h { color: var(--muted); font-size: 11px; }
+    .pos .qty { font-size: 15px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .pos .pnl { font-size: 22px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+    .up { color: var(--good); }
+    .down { color: var(--bad); }
+    .wait { color: var(--warn); }
+    .harvest {
+      margin-top: 10px;
+      background: var(--panel2);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .harvest-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .harvest-top b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .track {
+      height: 6px;
+      background: #0d1319;
+      border-radius: 99px;
+      margin: 8px 0 6px;
+      overflow: hidden;
+    }
+    .track i {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: var(--accent);
+      border-radius: 99px;
+      transition: width .25s ease;
+    }
+    .track i.ready { background: var(--good); }
+    .harvest-set {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+    .harvest-set label { margin: 0; }
+    .harvest-set input {
+      width: 88px;
+      padding: 6px 8px;
+    }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    .chip {
+      background: var(--panel2);
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .chip b { color: var(--text); margin: 0 4px; }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+    }
+    .ok { background: #143d2a; color: var(--good); }
+    .no { background: #4a1d1d; color: var(--bad); }
+    .pill.wait { background: #3d3114; color: var(--warn); }
+    .hint {
+      background: #121920;
+      border-left: 3px solid var(--accent);
+      padding: 10px 12px;
+      margin: 10px 0 0;
+      white-space: pre-wrap;
+      border-radius: 0 8px 8px 0;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    td.detail { color: var(--muted); max-width: 420px; word-break: break-all; }
+    .err { color: var(--bad); margin: 0 0 10px; }
+    .overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(6, 10, 16, .72);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+      padding: 16px;
+    }
+    .overlay[hidden] { display: none !important; }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 20px 20px 16px;
+      width: min(520px, 94vw);
+      box-shadow: 0 16px 40px rgba(0,0,0,.4);
+    }
+    .modal h3 { margin: 0 0 8px; font-size: 17px; }
+    .modal p { margin: 0 0 16px; color: var(--muted); white-space: pre-wrap; }
+    .modal p:empty { display: none; margin: 0; }
+    .modal .row { justify-content: flex-end; margin-top: 12px; }
+    .spinner {
+      width: 36px;
+      height: 36px;
+      margin: 8px auto 4px;
+      border: 3px solid #2a3848;
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 720px) {
+      .layout { grid-template-columns: 1fr; }
+      .funds, .pos-row { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>理财对冲操作台</h1>
+  </header>
+  <div class="layout">
+    <aside class="card">
+      <h2>账号</h2>
+      <div class="row" style="margin-top:0">
+        <button class="primary" type="button" id="btn-show-add">添加账号</button>
+      </div>
+      <form id="add-form" hidden>
+        <label>名称</label>
+        <input name="name" required placeholder="主号" />
+        <label>API Key</label>
+        <input name="api_key" required autocomplete="off" />
+        <label>API Secret</label>
+        <input name="api_secret" required type="password" autocomplete="off" />
+        <label>代理</label>
+        <input name="proxy" placeholder="http://user:pass@ip:port" />
+        <label>套保币对</label>
+        <select name="hedge_symbol" id="add-symbol">
+          <option value="ETHUSDT" selected>ETHUSDT</option>
+          <option value="BTCUSDT">BTCUSDT</option>
+          <option value="SOLUSDT">SOLUSDT</option>
+          <option value="BNBUSDT">BNBUSDT</option>
+        </select>
+        <div class="row">
+          <button type="button" id="btn-cancel-add">取消</button>
+          <button class="primary" type="submit">确认添加</button>
+        </div>
+      </form>
+      <div class="accounts" id="accounts"></div>
+    </aside>
+    <main class="card">
+      <div id="empty" class="muted">选择账号</div>
+      <div id="panel" hidden>
+        <div class="toolbar">
+          <div class="meta">
+            <span class="sym" id="symbol-now">-</span>
+            <span class="lev-chip"><b id="lev">-</b>x</span>
+            <span id="stable-pill" class="pill wait">-</span>
+          </div>
+          <div class="ops">
+            <button id="btn-refresh" class="ghost" type="button">刷新</button>
+            <button id="btn-enter" class="primary" type="button">一键入场</button>
+            <button id="btn-harvest" class="good" type="button">一键收利</button>
+            <button id="btn-switch" class="warn" type="button">换年化</button>
+            <button type="button" id="btn-settings" class="ghost">设置</button>
+          </div>
+        </div>
+        <div id="error" class="err" hidden></div>
+        <div class="funds">
+          <div class="kpi"><span>现货 USDT</span><b id="spot">-</b></div>
+          <div class="kpi"><span>USDT 活期</span><b id="usdt-flex">-</b></div>
+          <div class="kpi"><span>BFUSD</span><b id="bfusd">-</b></div>
+          <div class="kpi"><span>uniMMR</span><b id="mmr">-</b></div>
+        </div>
+        <div class="chips" id="collateral" hidden></div>
+        <div class="pos-row">
+          <div class="pos long">
+            <div class="pos-h">多仓</div>
+            <div class="qty" id="long-qty">-</div>
+            <div class="pnl" id="long-pnl">-</div>
+          </div>
+          <div class="pos short">
+            <div class="pos-h">空仓</div>
+            <div class="qty" id="short-qty">-</div>
+            <div class="pnl" id="short-pnl">-</div>
+          </div>
+        </div>
+        <div class="harvest">
+          <div class="harvest-top">
+            <span>收利进度 <b id="best-pnl">-</b> / <b id="min-profit">-</b></span>
+            <span>手续费 <b id="fee">-</b></span>
+          </div>
+          <div class="track"><i id="harvest-fill"></i></div>
+          <p class="muted harvest-why" id="harvest-why"></p>
+          <div class="harvest-set">
+            <label>每次收利</label>
+            <input id="tp-edit" type="number" min="0" step="0.1" placeholder="按仓位" />
+            <span class="muted">USDT</span>
+            <button type="button" id="btn-save-tp">保存</button>
+            <button type="button" id="btn-tp-auto" hidden>恢复自动</button>
+          </div>
+          <p class="muted harvest-why" id="scale-why"></p>
+        </div>
+        <div id="settings-box" class="edit-box" hidden>
+          <p class="muted">出口 IP <b id="ip">-</b> · <span id="proxy-mode"></span> · 代理 <b id="proxy-now">默认</b> · <span id="snap-age"></span></p>
+          <div class="row">
+            <button type="button" id="btn-set-leverage">设置杠杆</button>
+            <button type="button" id="btn-edit-symbol">修改币对</button>
+            <button type="button" id="btn-edit-proxy">修改代理</button>
+            <button type="button" id="btn-delete">解绑</button>
+          </div>
+          <div id="edit-symbol-box" class="edit-box" hidden>
+            <label>套保币对</label>
+            <select id="symbol-edit"></select>
+            <div class="row">
+              <button type="button" id="btn-cancel-symbol">取消</button>
+              <button type="button" id="btn-save-symbol" class="primary">保存</button>
+            </div>
+          </div>
+          <div id="edit-proxy-box" class="edit-box" hidden>
+            <label>代理</label>
+            <input id="proxy-edit" placeholder="http://user:pass@ip:port" />
+            <div class="row">
+              <button type="button" id="btn-cancel-proxy">取消</button>
+              <button type="button" id="btn-proxy" class="primary">保存</button>
+            </div>
+          </div>
+          <h2>最近操作</h2>
+          <table>
+            <thead><tr><th>时间</th><th>动作</th><th>结果</th><th>详情</th></tr></thead>
+            <tbody id="events"></tbody>
+          </table>
+        </div>
+        <p class="hint" id="action-msg" hidden></p>
+      </div>
+    </main>
+  </div>
+  <div id="overlay" class="overlay" hidden aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true">
+      <h3 id="modal-title">请确认</h3>
+      <p id="modal-body"></p>
+      <div id="modal-spin" class="spinner" hidden></div>
+      <div class="row" id="modal-actions">
+        <button type="button" id="modal-cancel">取消</button>
+        <button type="button" id="modal-extra" class="warn" hidden>只买理财</button>
+        <button type="button" id="modal-ok" class="primary">确认</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    let selected = null;
+    let timer = null;
+    let busy = false;
+    let lastSymbol = "ETHUSDT";
+    let hedgeSymbols = ["ETHUSDT", "BTCUSDT", "SOLUSDT", "BNBUSDT"];
+    const snapCache = {};
+    const SNAP_TTL = 24 * 60 * 60 * 1000;
+    const FUNDS_STORE = "licai_funds_cache_v1";
+    let pollMs = 120000;
+    const $ = (id) => document.getElementById(id);
+
+    function cacheId(id) {
+      return String(id);
+    }
+    const ACTIONS = {
+      enter: { title: "一键入场", hint: "申购理财、转入保证金并开对冲。" },
+      harvest: { title: "一键收利", hint: "平掉盈利腿并补仓。" },
+      switch: { title: "换更高年化", hint: "分批换成更高年化产品。" },
+      leverage: { title: "设置杠杆", hint: "按账号允许的最高倍数设置，100x 不行就 20x、5x。" },
+    };
+
+    function hideModal() {
+      busy = false;
+      $("overlay").hidden = true;
+      $("overlay").setAttribute("aria-hidden", "true");
+      $("modal-spin").hidden = true;
+      $("modal-actions").hidden = false;
+      $("modal-extra").hidden = true;
+      $("modal-ok").className = "primary";
+    }
+
+    function showLoading(title, body) {
+      busy = true;
+      $("overlay").hidden = false;
+      $("overlay").setAttribute("aria-hidden", "false");
+      $("modal-title").textContent = title || "执行中";
+      $("modal-body").textContent = body || "请稍候";
+      $("modal-spin").hidden = false;
+      $("modal-actions").hidden = true;
+      $("modal-extra").hidden = true;
+    }
+
+    function confirmAction({ title, body, okText, danger }) {
+      busy = true;
+      $("overlay").hidden = false;
+      $("overlay").setAttribute("aria-hidden", "false");
+      $("modal-title").textContent = title;
+      $("modal-body").textContent = body || "";
+      $("modal-spin").hidden = true;
+      $("modal-actions").hidden = false;
+      $("modal-extra").hidden = true;
+      $("modal-ok").textContent = okText || "确认";
+      $("modal-ok").className = danger ? "danger" : "primary";
+      $("modal-cancel").textContent = "取消";
+      return new Promise((resolve) => {
+        const ok = $("modal-ok");
+        const cancel = $("modal-cancel");
+        const extra = $("modal-extra");
+        const finish = (value) => {
+          ok.onclick = null;
+          cancel.onclick = null;
+          extra.onclick = null;
+          if (!value) hideModal();
+          resolve(value);
+        };
+        ok.onclick = () => finish(true);
+        cancel.onclick = () => finish(false);
+      });
+    }
+
+    function confirmChoices({ title, body, extraText, extraId, okText, okId, danger }) {
+      busy = true;
+      $("overlay").hidden = false;
+      $("overlay").setAttribute("aria-hidden", "false");
+      $("modal-title").textContent = title;
+      $("modal-body").textContent = body || "";
+      $("modal-spin").hidden = true;
+      $("modal-actions").hidden = false;
+      $("modal-cancel").textContent = "取消";
+      $("modal-ok").textContent = okText || "确认";
+      $("modal-ok").className = danger ? "danger" : "primary";
+      const extra = $("modal-extra");
+      extra.hidden = !extraText;
+      extra.textContent = extraText || "";
+      return new Promise((resolve) => {
+        const ok = $("modal-ok");
+        const cancel = $("modal-cancel");
+        const finish = (value) => {
+          ok.onclick = null;
+          cancel.onclick = null;
+          extra.onclick = null;
+          extra.hidden = true;
+          if (!value) hideModal();
+          resolve(value);
+        };
+        ok.onclick = () => finish(okId || "ok");
+        extra.onclick = () => finish(extraId || "extra");
+        cancel.onclick = () => finish(null);
+      });
+    }
+
+    function persistFunds() {
+      try {
+        localStorage.setItem(FUNDS_STORE, JSON.stringify(snapCache));
+      } catch (err) {}
+    }
+
+    function restoreFunds() {
+      try {
+        const raw = JSON.parse(localStorage.getItem(FUNDS_STORE) || "{}");
+        Object.keys(raw).forEach((key) => {
+          if (raw[key] && raw[key].data) snapCache[key] = raw[key];
+        });
+      } catch (err) {}
+    }
+
+    function snapHit(id) {
+      return snapCache[cacheId(id)];
+    }
+
+    function rememberSnap(id, data) {
+      const ageMs = (Number(data && data.cache_age) || 0) * 1000;
+      snapCache[cacheId(id)] = { at: Date.now() - ageMs, data };
+      persistFunds();
+    }
+
+    function snapFresh(id) {
+      const hit = snapHit(id);
+      return !!(hit && Date.now() - hit.at < SNAP_TTL);
+    }
+
+    function ageText(at, label) {
+      if (!at) return "";
+      const sec = Math.max(0, Math.round((Date.now() - at) / 1000));
+      if (sec < 5) return `${label}刚更新`;
+      if (sec < 60) return `${label} ${sec} 秒前`;
+      if (sec < 3600) return `${label} ${Math.round(sec / 60)} 分钟前`;
+      if (sec < 86400) return `${label} ${(sec / 3600).toFixed(1)} 小时前`;
+      return `${label} ${Math.round(sec / 86400)} 天前`;
+    }
+
+    function showSnapAge() {
+      const el = $("snap-age");
+      if (!el) return;
+      const hit = selected ? snapHit(selected) : null;
+      el.textContent = [ageText(hit && hit.at, "资金"), ageText(liveAt, "仓位")].filter(Boolean).join(" · ");
+    }
+
+    function fillSymbolSelect(el, current) {
+      if (!el) return;
+      el.innerHTML = "";
+      hedgeSymbols.forEach((sym) => {
+        const opt = document.createElement("option");
+        opt.value = sym;
+        opt.textContent = sym;
+        if (sym === current) opt.selected = true;
+        el.appendChild(opt);
+      });
+    }
+
+    function toNum(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : NaN;
+    }
+
+    function signedAmt(v, digits) {
+      const n = toNum(v);
+      if (!Number.isFinite(n)) return "-";
+      const t = n.toFixed(digits);
+      return n > 0 ? "+" + t : t;
+    }
+
+    function setPnl(el, v) {
+      el.textContent = signedAmt(v, 4);
+      el.classList.remove("up", "down");
+      const n = toNum(v);
+      if (n > 0) el.classList.add("up");
+      if (n < 0) el.classList.add("down");
+    }
+
+    function setMmr(text) {
+      const el = $("mmr");
+      el.textContent = text || "-";
+      el.classList.remove("up", "down", "wait");
+      const n = toNum(text);
+      if (!Number.isFinite(n)) return;
+      if (n < 1.5) el.classList.add("down");
+      else if (n < 2.5) el.classList.add("wait");
+      else el.classList.add("up");
+    }
+
+    function esc(s) {
+      return String(s || "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[ch]));
+    }
+
+    function shortTime(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return String(iso).slice(5, 16).replace("T", " ");
+      const p = (n) => String(n).padStart(2, "0");
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+
+    async function api(path, opts) {
+      const res = await fetch(path, Object.assign({ headers: { "Content-Type": "application/json" } }, opts));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail;
+        const msg = Array.isArray(detail) ? JSON.stringify(detail) : (detail || data.error || res.statusText);
+        throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+      }
+      return data;
+    }
+
+    async function loadAccounts() {
+      const data = await api("/api/accounts");
+      if (data.hedge_symbols && data.hedge_symbols.length) hedgeSymbols = data.hedge_symbols;
+      if (data.live_poll_seconds) pollMs = Number(data.live_poll_seconds) * 1000;
+      fillSymbolSelect($("add-symbol"), "ETHUSDT");
+      const box = $("accounts");
+      box.innerHTML = "";
+      data.accounts.forEach((a) => {
+        const btn = document.createElement("button");
+        btn.className = "acct" + (selected === a.id ? " active" : "");
+        btn.innerHTML = `<b>${esc(a.name)}</b><div class="muted">${esc(a.hedge_symbol || "ETHUSDT")}</div>`;
+        btn.onclick = () => selectAccount(a.id);
+        box.appendChild(btn);
+      });
+    }
+
+    async function selectAccount(id) {
+      if (busy) return;
+      selected = id;
+      $("settings-box").hidden = true;
+      hideEditBoxes();
+      await loadAccounts();
+      const hit = snapHit(id);
+      if (hit) {
+        render(hit.data);
+        showSnapAge();
+      }
+      if (timer) clearInterval(timer);
+      timer = setInterval(() => { if (!busy) pollLive(); }, pollMs);
+      pollLive();
+      if (snapFresh(id)) return;
+      if (!hit) {
+        showLoading("加载资金", "请稍候");
+        try {
+          await refresh({ force: false });
+        } finally {
+          hideModal();
+        }
+        return;
+      }
+      refresh({ silent: true, force: false });
+    }
+
+    function applyLive(s) {
+      if (s.uni_mmr != null) setMmr(s.uni_mmr || "-");
+      if (s.leverage != null) $("lev").textContent = s.leverage;
+      const legs = s.legs || {};
+      $("long-qty").textContent = legs.long_qty || "-";
+      $("short-qty").textContent = legs.short_qty || "-";
+      setPnl($("long-pnl"), legs.long_pnl);
+      setPnl($("short-pnl"), legs.short_pnl);
+      const h = s.harvest || {};
+      $("fee").textContent = h.round_trip_fee || "-";
+      $("min-profit").textContent = h.min_profit || "-";
+      const tp = $("tp-edit");
+      if (s.account && selected && snapHit(selected) && snapHit(selected).data) {
+        snapHit(selected).data.account = Object.assign(snapHit(selected).data.account || {}, s.account);
+      }
+      if (tp && document.activeElement !== tp) {
+        const acc = s.account || ((selected && snapHit(selected) && snapHit(selected).data && snapHit(selected).data.account) || {});
+        const custom = !!acc.take_profit_custom;
+        const suggested = h.min_profit || h.auto_profit || "";
+        tp.value = custom && acc.take_profit_usdt ? acc.take_profit_usdt : suggested;
+        tp.placeholder = h.auto_profit ? `建议 ${h.auto_profit}` : "按仓位";
+        const autoBtn = $("btn-tp-auto");
+        if (autoBtn) autoBtn.hidden = !custom;
+      }
+      const best = Math.max(toNum(h.winner_pnl) || 0, toNum(legs.long_pnl) || 0, toNum(legs.short_pnl) || 0, 0);
+      $("best-pnl").textContent = Number.isFinite(best) ? best.toFixed(4) : "-";
+      const need = Math.max(toNum(h.min_profit) || 0, 0);
+      const pct = need > 0 ? Math.min(100, (best / need) * 100) : 0;
+      const fill = $("harvest-fill");
+      fill.style.width = pct + "%";
+      fill.className = (h.can_click || h.force_ok) ? "ready" : "";
+      const gap = Math.max(0, need - best);
+      $("harvest-why").textContent = (h.can_click || h.force_ok)
+        ? (h.reason || "可以收利")
+        : (need > 0 ? `还差 ${gap.toFixed(2)} 到收利门槛` : (h.reason || ""));
+      $("btn-harvest").title = h.reason || "";
+      const en = s.enter || {};
+      const scaleEl = $("scale-why");
+      if (scaleEl) {
+        if (en.scale_ok) {
+          scaleEl.textContent = `仓位可放到 ${en.target_qty}（现在 ${en.current_qty}，还可加 ${en.add_qty}）`;
+        } else {
+          scaleEl.textContent = "";
+        }
+      }
+      const st = s.stability || {};
+      const pill = $("stable-pill");
+      pill.textContent = st.stable ? "平稳" : "不稳";
+      pill.className = "pill " + (st.stable ? "ok" : "no");
+      $("btn-enter").disabled = false;
+      $("btn-harvest").disabled = !(h.can_click || h.force_ok);
+      if (selected && snapHit(selected) && snapHit(selected).data) {
+        Object.assign(snapHit(selected).data, {
+          uni_mmr: s.uni_mmr || snapHit(selected).data.uni_mmr,
+          leverage: s.leverage || snapHit(selected).data.leverage,
+          legs: s.legs || snapHit(selected).data.legs,
+          stability: s.stability || snapHit(selected).data.stability,
+          enter: s.enter || snapHit(selected).data.enter,
+          harvest: s.harvest || snapHit(selected).data.harvest,
+        });
+        persistFunds();
+      }
+      showSnapAge();
+    }
+
+    async function pollLive() {
+      if (!selected) return;
+      const id = selected;
+      try {
+        const s = await api(`/api/accounts/${id}/monitor`);
+        if (selected !== id || !s.ok) return;
+        liveAt = Date.now();
+        applyLive(s);
+      } catch (err) {
+        showSnapAge();
+      }
+    }
+
+    function render(s) {
+      $("empty").hidden = true;
+      $("panel").hidden = false;
+      $("error").hidden = !s.error;
+      $("error").textContent = s.error || "";
+      $("ip").textContent = s.exit_ip || "-";
+      $("proxy-mode").textContent = s.proxy_mode || "";
+      $("spot").textContent = s.spot_usdt || "-";
+      $("usdt-flex").textContent = s.usdt_flexible || "0";
+      $("bfusd").textContent = s.bfusd || "0";
+      setMmr(s.uni_mmr || "-");
+      $("symbol-now").textContent = s.symbol || "-";
+      $("lev").textContent = s.leverage || "-";
+      const proxyVal = (s.account && s.account.proxy) || "";
+      $("proxy-now").textContent = proxyVal || "默认";
+      hideEditBoxes();
+      const mg = s.margin || {};
+      const box = $("collateral");
+      const rows = (mg.rows || []).filter((r) => Number(r.amount) > 0);
+      box.hidden = rows.length === 0;
+      box.innerHTML = "";
+      rows.forEach((r) => {
+        const el = document.createElement("span");
+        el.className = "chip";
+        el.innerHTML = `${esc(r.name)} <b>${esc(r.amount)}</b><em>计入 ${esc(r.in_pm)}</em> · ${esc(r.rate)}`;
+        box.appendChild(el);
+      });
+      applyLive(s);
+      liveAt = Date.now();
+      const sw = s.switch || {};
+      $("btn-switch").disabled = !sw.can_click;
+      $("btn-switch").title = sw.reason || "";
+      $("proxy-edit").value = (s.account && s.account.proxy) || "";
+      if (s.hedge_symbols && s.hedge_symbols.length) hedgeSymbols = s.hedge_symbols;
+      fillSymbolSelect($("symbol-edit"), (s.account && s.account.hedge_symbol) || s.symbol || "ETHUSDT");
+      lastSymbol = $("symbol-edit").value;
+      const tbody = $("events");
+      tbody.innerHTML = "";
+      (s.events || []).forEach((e) => {
+        const tr = document.createElement("tr");
+        const detail = String(e.detail || "");
+        const short = detail.length > 72 ? detail.slice(0, 72) + "…" : detail;
+        tr.innerHTML = `<td>${esc(shortTime(e.created_at))}</td><td>${esc(e.action)}</td><td>${e.ok ? "成功" : "失败"}</td><td class="detail" title="${esc(detail)}">${esc(short)}</td>`;
+        tbody.appendChild(tr);
+      });
+      showSnapAge();
+    }
+
+    async function refresh({ force = false, silent = false } = {}) {
+      if (!selected) return;
+      const id = selected;
+      if (!force && snapFresh(id)) {
+        render(snapHit(id).data);
+        showSnapAge();
+        return;
+      }
+      try {
+        const s = await api(`/api/accounts/${id}/snapshot${force ? "?force=true" : ""}`);
+        if (selected !== id) return;
+        rememberSnap(id, s);
+        if (!s.ok && s.error) {
+          $("empty").hidden = true;
+          $("panel").hidden = false;
+          $("error").hidden = false;
+          $("error").textContent = s.error;
+          $("ip").textContent = s.exit_ip || "-";
+          $("proxy-mode").textContent = s.proxy_mode || "";
+          $("btn-enter").disabled = true;
+          $("btn-harvest").disabled = true;
+          $("btn-switch").disabled = true;
+          if (s.account) fillSymbolSelect($("symbol-edit"), s.account.hedge_symbol || "ETHUSDT");
+          showSnapAge();
+          return;
+        }
+        render(s);
+      } catch (err) {
+        if (selected !== id) return;
+        if (snapHit(id) && silent) {
+          showSnapAge();
+          return;
+        }
+        $("empty").hidden = true;
+        $("panel").hidden = false;
+        $("error").hidden = false;
+        $("error").textContent = err.message;
+      }
+    }
+
+    function hideEditBoxes() {
+      $("edit-symbol-box").hidden = true;
+      $("edit-proxy-box").hidden = true;
+    }
+
+    function setActionMsg(text) {
+      const el = $("action-msg");
+      if (!text) {
+        el.hidden = true;
+        el.textContent = "";
+        return;
+      }
+      el.hidden = false;
+      el.textContent = text;
+    }
+
+    function formatActionResult(data) {
+      if (data.blocked) return "已拦截：" + (data.reason || "");
+      if (data.error) return data.error;
+      const rows = (data.steps || []).map((s) => `${s.ok ? "✓" : "✗"} ${s.name}：${s.detail || ""}`);
+      return (data.ok ? "完成" : "失败") + (rows.length ? "\n" + rows.join("\n") : "");
+    }
+
+    async function act(action) {
+      if (!selected || busy) return;
+      const meta = ACTIONS[action] || { title: action, hint: "" };
+      const live = (snapHit(selected) && snapHit(selected).data) || {};
+      const unstable = !((live.stability || {}).stable);
+      const payload = { action, force: false, mode: null };
+      if (action === "enter" && unstable) {
+        const legs = live.legs || {};
+        const hedged = Number(legs.long_qty) > 0 && Number(legs.short_qty) > 0;
+        const choice = await confirmChoices({
+          title: "价格不稳",
+          body: hedged ? "现在加仓两边可能挂不齐。" : "现在开仓两边可能挂不齐。",
+          extraText: "只买理财",
+          extraId: "earn_only",
+          okText: hedged ? "强行加仓" : "强行开仓",
+          okId: "force",
+          danger: true,
+        });
+        if (!choice) return;
+        payload.mode = choice;
+        payload.force = choice === "force";
+      } else if (action === "enter" && ((live.enter || {}).scale_ok)) {
+        const en = live.enter || {};
+        const ok = await confirmAction({
+          title: "放大仓位",
+          body: `目标 ${en.target_qty}，现在 ${en.current_qty}，两边各加 ${en.add_qty}`,
+          okText: "确认加仓",
+          danger: true,
+        });
+        if (!ok) return;
+      } else if (action === "harvest" && unstable) {
+        const choice = await confirmChoices({
+          title: "价格不稳",
+          body: "现在平仓可能滑点更大。",
+          okText: "强行收利",
+          okId: "force",
+          danger: true,
+        });
+        if (!choice) return;
+        payload.force = true;
+        payload.mode = "force";
+      } else {
+        const ok = await confirmAction({
+          title: meta.title,
+          body: "",
+          okText: "确认",
+          danger: true,
+        });
+        if (!ok) return;
+      }
+      showLoading(meta.title, "请稍候");
+      try {
+        const data = await api(`/api/accounts/${selected}/actions`, {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        hideModal();
+        if (data.snapshot) {
+          rememberSnap(selected, data.snapshot);
+          render(data.snapshot);
+        }
+        setActionMsg(formatActionResult(data));
+      } catch (err) {
+        hideModal();
+        setActionMsg(err.message);
+      }
+    }
+
+    $("add-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (busy) return;
+      const fd = new FormData(e.target);
+      const body = Object.fromEntries(fd.entries());
+      const ok = await confirmAction({
+        title: "绑定账号",
+        body: body.name || "",
+        okText: "确认",
+      });
+      if (!ok) return;
+      showLoading("绑定中", "请稍候");
+      try {
+        const created = await api("/api/accounts", { method: "POST", body: JSON.stringify(body) });
+        e.target.reset();
+        $("add-form").hidden = true;
+        await loadAccounts();
+        hideModal();
+        selectAccount(created.id);
+      } catch (err) {
+        hideModal();
+        alert(err.message);
+      }
+    });
+    $("btn-refresh").onclick = async () => {
+      if (!selected || busy) return;
+      showLoading("刷新资金", "请稍候");
+      try {
+        await refresh({ force: true });
+      } finally {
+        hideModal();
+      }
+    };
+    $("btn-show-add").onclick = () => {
+      if (busy) return;
+      $("add-form").hidden = false;
+      $("add-form").querySelector("input[name=name]").focus();
+    };
+    $("btn-cancel-add").onclick = () => {
+      $("add-form").reset();
+      $("add-form").hidden = true;
+    };
+    $("btn-settings").onclick = () => {
+      if (!selected || busy) return;
+      const box = $("settings-box");
+      box.hidden = !box.hidden;
+      if (box.hidden) hideEditBoxes();
+    };
+    $("btn-edit-symbol").onclick = () => {
+      if (!selected || busy) return;
+      $("edit-proxy-box").hidden = true;
+      $("edit-symbol-box").hidden = false;
+    };
+    $("btn-cancel-symbol").onclick = () => {
+      $("symbol-edit").value = lastSymbol;
+      $("edit-symbol-box").hidden = true;
+    };
+    $("btn-edit-proxy").onclick = () => {
+      if (!selected || busy) return;
+      $("edit-symbol-box").hidden = true;
+      $("edit-proxy-box").hidden = false;
+    };
+    $("btn-cancel-proxy").onclick = () => {
+      $("edit-proxy-box").hidden = true;
+    };
+    $("btn-save-symbol").onclick = async () => {
+      if (!selected || busy) return;
+      const symbol = $("symbol-edit").value;
+      if (symbol === lastSymbol) {
+        $("edit-symbol-box").hidden = true;
+        return;
+      }
+      const ok = await confirmAction({
+        title: "更换币对",
+        body: symbol,
+        okText: "确认",
+        danger: true,
+      });
+      if (!ok) {
+        $("symbol-edit").value = lastSymbol;
+        return;
+      }
+      showLoading("保存中", "请稍候");
+      try {
+        await api(`/api/accounts/${selected}`, {
+          method: "PATCH",
+          body: JSON.stringify({ hedge_symbol: symbol }),
+        });
+        lastSymbol = symbol;
+        $("edit-symbol-box").hidden = true;
+        await loadAccounts();
+        await refresh({ force: true });
+        setActionMsg("已保存 " + symbol);
+      } catch (err) {
+        $("symbol-edit").value = lastSymbol;
+        setActionMsg(err.message);
+      } finally {
+        hideModal();
+      }
+    };
+    $("btn-save-tp").onclick = async () => {
+      if (!selected || busy) return;
+      const raw = $("tp-edit").value.trim();
+      const value = raw === "" ? 0 : Number(raw);
+      if (!Number.isFinite(value) || value < 0) {
+        setActionMsg("请输入有效的收利金额");
+        return;
+      }
+      busy = true;
+      try {
+        const acc = await api(`/api/accounts/${selected}`, {
+          method: "PATCH",
+          body: JSON.stringify(
+            value > 0
+              ? { take_profit_usdt: value, take_profit_custom: true }
+              : { take_profit_usdt: 0, take_profit_custom: false }
+          ),
+        });
+        if (snapHit(selected) && snapHit(selected).data) {
+          snapHit(selected).data.account = Object.assign(snapHit(selected).data.account || {}, acc);
+          persistFunds();
+        }
+        await pollLive();
+        setActionMsg(value > 0 ? `已锁定每次浮盈 ${value} USDT 收利` : "已改回按仓位自动计算");
+      } catch (err) {
+        setActionMsg(err.message);
+      } finally {
+        busy = false;
+      }
+    };
+    $("btn-tp-auto").onclick = async () => {
+      if (!selected || busy) return;
+      busy = true;
+      try {
+        const acc = await api(`/api/accounts/${selected}`, {
+          method: "PATCH",
+          body: JSON.stringify({ take_profit_usdt: 0, take_profit_custom: false }),
+        });
+        if (snapHit(selected) && snapHit(selected).data) {
+          snapHit(selected).data.account = Object.assign(snapHit(selected).data.account || {}, acc);
+          persistFunds();
+        }
+        await pollLive();
+        setActionMsg("已改回按仓位自动计算，收利加仓后会重算");
+      } catch (err) {
+        setActionMsg(err.message);
+      } finally {
+        busy = false;
+      }
+    };
+    $("btn-set-leverage").onclick = () => act("leverage");
+    $("btn-enter").onclick = () => act("enter");
+    $("btn-harvest").onclick = () => act("harvest");
+    $("btn-switch").onclick = () => act("switch");
+    $("btn-proxy").onclick = async () => {
+      if (!selected || busy) return;
+      const ok = await confirmAction({
+        title: "保存代理",
+        body: "",
+        okText: "确认",
+      });
+      if (!ok) return;
+      showLoading("保存中", "请稍候");
+      try {
+        await api(`/api/accounts/${selected}`, {
+          method: "PATCH",
+          body: JSON.stringify({ proxy: $("proxy-edit").value }),
+        });
+        $("edit-proxy-box").hidden = true;
+        await loadAccounts();
+        await refresh({ force: true });
+        setActionMsg("已保存");
+      } catch (err) {
+        setActionMsg(err.message);
+      } finally {
+        hideModal();
+      }
+    };
+    $("btn-delete").onclick = async () => {
+      if (!selected || busy) return;
+      const ok = await confirmAction({
+        title: "解绑账号",
+        body: "",
+        okText: "确认",
+        danger: true,
+      });
+      if (!ok) return;
+      showLoading("解绑中", "请稍候");
+      try {
+        await api(`/api/accounts/${selected}`, { method: "DELETE" });
+        delete snapCache[cacheId(selected)];
+        persistFunds();
+        selected = null;
+        if (timer) clearInterval(timer);
+        $("panel").hidden = true;
+        $("empty").hidden = false;
+        await loadAccounts();
+      } finally {
+        hideModal();
+      }
+    };
+    restoreFunds();
+    loadAccounts();
+  </script>
+</body>
+</html>

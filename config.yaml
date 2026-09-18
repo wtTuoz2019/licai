@@ -1,0 +1,79 @@
+# 用现货里的哪种资产去买活期
+source_asset: USDT
+
+# 每次投入金额。0 表示用 source_asset 的全部可用余额
+amount: 0
+
+# 非 sweep 路径的单次投入硬顶。一键入场会 sweep_all，不受这个限制
+max_amount: 100000
+
+# 申购来源账户：SPOT / FUND / ALL
+source_account: SPOT
+
+# 统一账户（Portfolio Margin）：申购后仓位直接计入保证金，无需划转到合约
+unified_account: true
+
+# 只看 USDT 名下能当合约保证金的保本活期：USDT 活期 + BFUSD
+margin_earn_assets:
+  - USDT
+  - BFUSD
+
+asset_allowlist:
+  - USDT
+  - BFUSD
+
+# 申购后留在活期。统一账户下必须为 true
+keep_earn: true
+
+# 统一账户不划转
+transfer_to_futures: false
+enable_multi_assets: false
+
+# 年化过滤，单位是百分比。max_apr 设 0 表示不设上限
+min_apr: 0
+max_apr: 200
+
+asset_denylist: []
+
+settle_seconds: 3
+
+# ---- 对冲循环 ----
+# 只建议 BTC/ETH 这种深度好的合约。默认 ETHUSDT 套保；每个账号可在操作台改。
+hedge_symbol: ETHUSDT
+hedge_symbols:
+  - ETHUSDT
+  - BTCUSDT
+  - SOLUSDT
+  - BNBUSDT
+hedge_leverage: 100
+hedge_qty: 0                 # 0 表示按理财保证金自动算仓位，并随理财仓位变大加仓
+hedge_margin_use_pct: 0.85   # 低杠杆最多用到 85% 保证金；100x 仍按 40/杠杆 ≈ 40%，留给平仓补仓的单边窗口
+min_uni_mmr: 2               # uniMMR=权益/维持保证金，越大越安全；爆仓约 1.05，低于 2 不加仓
+scale_min_add_pct: 0.03      # 目标仓位比当前大 3% 以上才两边一起加
+# 收利门槛按单边仓位名义本金算，不再固定 5 USDT。账号里保存过自定义值才锁定
+take_profit_usdt: 0
+maker_only: false            # 先中间价限价，不成交改价；最后市价补齐，保证多空数量一致
+quote_refresh_seconds: 3
+hedge_quote_retries: 4       # 限价重试几次后再市价
+watch_seconds: 60            # 命令行盯盘间隔
+live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
+min_free_usdt_keep: 0        # 默认不留。若未开 BNB 抵扣手续费，可留几 USDT 给合约成交费
+cycle_sweep_all: true        # 启动时把现货闲置 USDT 申购 USDT/BFUSD 活期（仓位继续当保证金）
+
+# 操作台：先看利润，不平自动单。平仓一轮 = 平盈利腿 + 补回，约 2 笔 maker
+maker_fee_rate: 0.0002
+min_profit_fee_multiple: 8   # 浮盈至少覆盖约 8 倍手续费，避免频繁磨损
+harvest_principal_pct: 0.01  # 还没仓位时，至少为本金的 1%
+harvest_pos_pct: 0.025       # 有仓位时按单边名义本金的 2.5%：0.081 ETH × 2450 ≈ 5 USDT
+harvest_sqrt_coeff: 0.5      # 无仓位时 0.5×√本金兜底
+harvest_min_usdt: 1          # 绝对下限
+cooldown_minutes: 10         # 两次平仓最短间隔
+stable_range_pct: 0.0025     # 15 分钟振幅低于 0.25% 视为价格平稳
+
+# 换产品：分批赎回旧仓、立刻申购更高年化。按赎回瞬间这块保证金暂时失效来估
+switch_safe_uni_mmr: 2.5     # 换产品时 uniMMR 不得低于这个（比开仓安全线更严）
+switch_batch_pct: 0.15       # 每批最多赎当前仓位的 15%
+switch_batch_usdt: 200       # 每批硬顶 USDT
+switch_min_batch: 10         # 小于这个就并进本批或留到下次
+switch_max_batches: 5        # 点一次最多换几批，剩下再点
+
