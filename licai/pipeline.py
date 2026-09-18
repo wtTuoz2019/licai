@@ -46,6 +46,7 @@ class Pipeline:
         self.convert_api = ConvertAPI(self.client)
         self.futures = FuturesAPI(self.client, unified_account=settings.unified_account)
         self._product_list: list[FlexibleProduct] | None = None
+        self._wallet_transfer_blocked = False
 
     def spot_cash(self, asset: str | None = None) -> Decimal:
         return self.earn.spot_free((asset or self.settings.source_asset).upper())
@@ -85,6 +86,10 @@ class Pipeline:
         products = products if products is not None else self.list_products()
         margin_assets = margin_assets if margin_assets is not None else self.margin_assets()
         candidates = [p for p in products if self._eligible(p, margin_assets)]
+        if self._wallet_transfer_blocked:
+            no_bfusd = [p for p in candidates if p.kind != "bfusd"]
+            if no_bfusd:
+                candidates = no_bfusd
         if not candidates:
             raise RuntimeError("没有可作合约保证金的保本活期，请检查 margin_earn_assets")
         candidates.sort(key=lambda p: apr_ratio(p.apr), reverse=True)
@@ -433,11 +438,12 @@ class Pipeline:
         steps: list[StepResult] = []
         spot = self.spot_cash("USDT")
         if spot >= SPOT_MIN:
-            steps.append(self._move_spot("USDT", spot))
+            steps.extend(self._fund_spot_asset("USDT", spot))
         bfusd_spot = self.spot_cash("BFUSD")
         if bfusd_spot >= SPOT_MIN:
-            steps.append(self._move_spot("BFUSD", bfusd_spot))
-        if check_ldusdt and spot < SPOT_MIN:
+            steps.extend(self._fund_spot_asset("BFUSD", bfusd_spot))
+        already_ld = any("LDUSDT" in s.name and s.ok for s in steps)
+        if check_ldusdt and not already_ld:
             try:
                 ld_free = self.futures.earn_to_pm_balance("LDUSDT")
             except BinanceAPIError as exc:
@@ -456,6 +462,67 @@ class Pipeline:
             return [StepResult("无需划转", True, "现货没有可划入统一账户的余额")]
         return steps
 
+    def _fund_spot_asset(self, asset: str, amount: Decimal) -> list[StepResult]:
+        if self._wallet_transfer_blocked:
+            return self._spot_via_ldusdt(asset, amount)
+        step = self._move_spot(asset, amount)
+        if step.ok:
+            return [step]
+        if not self._unauthorized(step):
+            return [step]
+        self._wallet_transfer_blocked = True
+        note = StepResult(
+            "现货无法划转",
+            True,
+            "API 没有现货↔统一账户划转权限（-1002）。不划 U 本位，改用 USDT 活期 LDUSDT 入金。",
+        )
+        return [note, *self._spot_via_ldusdt(asset, amount)]
+
+    def _spot_via_ldusdt(self, asset: str, amount: Decimal) -> list[StepResult]:
+        steps: list[StepResult] = []
+        if asset == "BFUSD":
+            redeem = self._mutate(
+                f"赎回 BFUSD {fmt_amount(amount)}（FAST，回现货 USDT）",
+                lambda: self.earn.redeem_bfusd(amount, "FAST"),
+            )
+            steps.append(redeem)
+            if not redeem.ok:
+                return steps
+            if not self.settings.dry_run:
+                time.sleep(max(int(self.settings.settle_seconds or 0), 3))
+                self.earn.invalidate()
+            amount = self.spot_cash("USDT")
+        steps.extend(self._subscribe_usdt_and_move_ld(amount))
+        return steps
+
+    def _subscribe_usdt_and_move_ld(self, amount: Decimal) -> list[StepResult]:
+        amount = min(amount, self.spot_cash("USDT"))
+        if amount < SPOT_MIN:
+            return [StepResult("LDUSDT 入金", False, "现货 USDT 不足 1，无法走活期入金")]
+        alt = self._best_usdt_flexible()
+        if alt is None:
+            return [StepResult("申购 USDT 活期", False, "没有可申购的 USDT 活期产品")]
+        steps = list(self.buy(alt, amount))
+        if any(not s.ok for s in steps):
+            return steps
+        if not self.settings.dry_run:
+            time.sleep(max(int(self.settings.settle_seconds or 0), 3))
+            self.earn.invalidate()
+        try:
+            ld_free = self.futures.earn_to_pm_balance("LDUSDT")
+        except BinanceAPIError as exc:
+            return steps + [StepResult("查询 LDUSDT", False, str(exc))]
+        if ld_free <= 0:
+            return steps + [StepResult("LDUSDT 入金", False, "申购后还查不到可转入的 LDUSDT，稍后再点一次入场")]
+        move = self._mutate(
+            f"USDT 活期 LDUSDT {fmt_amount(ld_free)} 转入统一账户",
+            lambda: self.futures.earn_to_pm("LDUSDT", ld_free),
+        )
+        if move.ok and not move.dry_run:
+            self.earn.invalidate()
+        steps.append(move)
+        return steps
+
     def _move_spot(self, asset: str, amount: Decimal) -> StepResult:
         step = self._mutate(
             f"现货 {asset} {fmt_amount(amount)} 划入统一账户全仓（不是 U 本位合约）",
@@ -464,6 +531,11 @@ class Pipeline:
         if step.ok and not step.dry_run:
             self.earn.invalidate()
         return step
+
+    @staticmethod
+    def _unauthorized(step: StepResult) -> bool:
+        text = str(step.detail or "").lower()
+        return "-1002" in text or "not authorized" in text
 
     def switch_advice(self) -> dict:
         try:
