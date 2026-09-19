@@ -501,16 +501,28 @@ class FuturesAPI:
         except BinanceAPIError:
             trades = []
         matched: list[Decimal] = []
+        bnb_mid = Decimal("0")
         for row in trades:
             asset = str(row.get("commissionAsset") or "").upper()
-            if asset and asset not in {"USDT", "USDC", "BFUSD", "BUSD", "FDUSD"}:
+            if asset and asset not in {"USDT", "USDC", "BFUSD", "BUSD", "FDUSD", "BNB"}:
                 continue
             trade_qty = abs(d(row.get("qty")))
             if qty > 0 and trade_qty > 0:
                 ratio = trade_qty / qty if qty >= trade_qty else qty / trade_qty
                 if ratio < Decimal("0.7"):
                     continue
-            matched.append(abs(d(row.get("commission"))))
+            commission = abs(d(row.get("commission")))
+            if asset == "BNB" and commission > 0:
+                if bnb_mid <= 0:
+                    try:
+                        bb, ba = market.book("BNBUSDT")
+                        bnb_mid = (bb + ba) / 2 if bb + ba > 0 else Decimal("0")
+                    except Exception:
+                        bnb_mid = Decimal("0")
+                if bnb_mid <= 0:
+                    continue
+                commission = commission * bnb_mid
+            matched.append(commission)
             if len(matched) >= 2:
                 break
         if len(matched) >= 2:

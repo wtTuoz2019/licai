@@ -538,7 +538,16 @@ class HedgeCycle:
         steps.append(StepResult("单边未平净", False, self._legs_text(self.futures.legs(self.symbol))))
         return steps
 
-    def _hedge_pass(self, qty: Decimal, reduce_only: bool, *, market: bool, aggressive: bool, flatten: bool) -> list[StepResult]:
+    def _hedge_pass(
+        self,
+        qty: Decimal,
+        reduce_only: bool,
+        *,
+        market: bool,
+        aggressive: bool,
+        flatten: bool,
+        _retried: bool = False,
+    ) -> list[StepResult]:
         steps: list[StepResult] = []
         try:
             self.futures.cancel_open(self.symbol)
@@ -560,20 +569,23 @@ class HedgeCycle:
                     steps.append(self._place("SELL", "LONG", extra, sell_px, True, market=market))
                 else:
                     steps.append(self._place("BUY", "SHORT", extra, buy_px, True, market=market))
-                return steps
-            if legs.long_qty > legs.short_qty:
+            elif legs.long_qty > legs.short_qty:
                 steps.append(self._place("SELL", "SHORT", extra, sell_px, False, market=market))
             else:
                 steps.append(self._place("BUY", "LONG", extra, buy_px, False, market=market))
-            return steps
-        target = legs.long_qty if legs.long_qty > 0 else legs.short_qty if legs.short_qty > 0 else qty
-        target = self.futures.round_qty(target, step)
-        if target <= 0:
-            return [StepResult("开对冲", False, "算出的下单数量为 0")]
-        if legs.long_qty <= 0:
-            steps.append(self._place("BUY", "LONG", target, buy_px, reduce_only, market=market))
-        if legs.short_qty <= 0:
-            steps.append(self._place("SELL", "SHORT", target, sell_px, reduce_only, market=market))
+        else:
+            target = legs.long_qty if legs.long_qty > 0 else legs.short_qty if legs.short_qty > 0 else qty
+            target = self.futures.round_qty(target, step)
+            if target <= 0:
+                return [StepResult("开对冲", False, "算出的下单数量为 0")]
+            if legs.long_qty <= 0:
+                steps.append(self._place("BUY", "LONG", target, buy_px, reduce_only, market=market))
+            if legs.short_qty <= 0:
+                steps.append(self._place("SELL", "SHORT", target, sell_px, reduce_only, market=market))
+        if (not market) and (not _retried) and any(_post_only_reject(item) for item in steps):
+            steps.extend(
+                self._hedge_pass(qty, reduce_only, market=False, aggressive=True, flatten=flatten, _retried=True)
+            )
         return steps
 
     def _maker_prices(self, bid: Decimal, ask: Decimal, tick: Decimal, *, improve: bool = False) -> tuple[Decimal, Decimal]:
@@ -655,7 +667,19 @@ class HedgeCycle:
             return [StepResult("下单跳过", False, "数量为 0")]
         buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=aggressive)
         price = buy_px if order_side == "BUY" else sell_px
-        return [self._place(order_side, position_side, qty, price, reduce_only, market=market)]
+        placed = self._place(order_side, position_side, qty, price, reduce_only, market=market)
+        # GTX 被盘口吃掉（-5022）时立刻按新价再挂，避免空等一整轮
+        if (not market) and _post_only_reject(placed):
+            try:
+                self.futures.cancel_open(self.symbol)
+            except BinanceAPIError:
+                pass
+            bid, ask = self.futures.book(self.symbol)
+            buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=True)
+            price = buy_px if order_side == "BUY" else sell_px
+            retry = self._place(order_side, position_side, qty, price, reduce_only, market=False)
+            return [placed, retry]
+        return [placed]
 
     def _place(
         self,

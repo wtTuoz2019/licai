@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -16,6 +18,30 @@ def _apr(value: object) -> Decimal:
 
 
 SubscribeKind = Literal["flexible", "bfusd"]
+
+_YDAY_REWARD_CACHE: dict[str, tuple[float, dict]] = {}
+_YDAY_REWARD_TTL = 1800.0
+
+
+def _yesterday_utc_ms() -> tuple[int, int]:
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    yday = today - timedelta(days=1)
+    return int(yday.timestamp() * 1000), int(today.timestamp() * 1000) - 1
+
+
+def _sum_reward_rows(rows: list) -> Decimal:
+    total = Decimal("0")
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        total += d(
+            row.get("rewards")
+            or row.get("amount")
+            or row.get("reward")
+            or row.get("interest")
+            or row.get("assetReward")
+        )
+    return total
 
 
 @dataclass
@@ -250,3 +276,50 @@ class EarnAPI:
             pass
         total += self.bfusd_balance()
         return total
+
+    def yesterday_earn_reward(self) -> dict[str, object]:
+        """理财昨日收益：只认奖励记录，没有就返回 0，不做估算。"""
+        key = (self.client.api_key or "")[:12]
+        now = time.monotonic()
+        hit = _YDAY_REWARD_CACHE.get(key)
+        if hit and now - hit[0] < _YDAY_REWARD_TTL:
+            return hit[1]
+        start_ms, end_ms = _yesterday_utc_ms()
+        flex = Decimal("0")
+        bfusd = Decimal("0")
+        for typ in ("BONUS", "REALTIME"):
+            try:
+                data = self.client.signed(
+                    "GET",
+                    "/sapi/v1/simple-earn/flexible/history/rewardsRecord",
+                    {
+                        "type": typ,
+                        "asset": "USDT",
+                        "startTime": start_ms,
+                        "endTime": end_ms,
+                        "size": 100,
+                        "current": 1,
+                    },
+                )
+                flex += _sum_reward_rows(data.get("rows") if isinstance(data, dict) else [])
+            except BinanceAPIError:
+                pass
+        try:
+            data = self.client.signed(
+                "GET",
+                "/sapi/v1/bfusd/history/rewardsHistory",
+                {"startTime": start_ms, "endTime": end_ms, "size": 100, "current": 1},
+            )
+            bfusd += _sum_reward_rows(data.get("rows") if isinstance(data, dict) else [])
+        except BinanceAPIError:
+            pass
+        total = flex + bfusd
+        out = {
+            "amount": total,
+            "flex": flex,
+            "bfusd": bfusd,
+            "source": "records" if total > 0 else "none",
+            "text": fmt_amount(total, 4) if total > 0 else "0",
+        }
+        _YDAY_REWARD_CACHE[key] = (now, out)
+        return out

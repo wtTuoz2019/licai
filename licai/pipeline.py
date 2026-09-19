@@ -299,11 +299,18 @@ class Pipeline:
             status = f"已有理财仓位，现货还闲着 {fmt_amount(spot, 2)} USDT，可再申购。"
         else:
             status = "现货已扫完，保证金主要是理财仓位。"
+        try:
+            yday = self.earn.yesterday_earn_reward()
+        except Exception:
+            yday = {"amount": Decimal("0"), "text": "0", "source": "none"}
+        yday_amt = yday.get("amount") or Decimal("0")
         return {
             "spot_usdt": fmt_amount(spot, 4),
             "usdt_flexible": fmt_amount(usdt_flex, 4),
             "bfusd": fmt_amount(bfusd, 4),
             "earn_total": fmt_amount(usdt_flex + bfusd, 4),
+            "earn_yesterday": fmt_amount(yday_amt, 4) if yday_amt > 0 else "0",
+            "earn_yesterday_source": str(yday.get("source") or "none"),
             "holdings": holdings,
             "next_buy": next_buy,
             "status": status,

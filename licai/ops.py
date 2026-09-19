@@ -179,6 +179,7 @@ class OpsService:
             "uni_mmr": mmr_text,
             "live_poll_seconds": int(settings.live_poll_seconds),
             "auto_harvest_seconds": int(getattr(settings, "auto_harvest_seconds", 45) or 45),
+            "price": stability.as_dict().get("mid") or "0",
             "legs": {
                 "long_qty": fmt_amount(legs.long_qty),
                 "short_qty": fmt_amount(legs.short_qty),
@@ -286,10 +287,13 @@ class OpsService:
             "earn_total": wallet.get("earn_total") or "0",
             "usdt_flexible": wallet.get("usdt_flexible") or "0",
             "bfusd": wallet.get("bfusd") or "0",
+            "earn_yesterday": wallet.get("earn_yesterday") or "0",
+            "price": stability.as_dict().get("mid") or "0",
             "wallet_status": wallet.get("status") or "",
             "next_buy": wallet.get("next_buy"),
             "uni_mmr": mmr_text,
             "pm_equity": margin.get("equity") or "0",
+            "account_total": margin.get("equity") or fmt_amount(collateral, 4),
             "margin": margin,
             "legs": {
                 "long_qty": fmt_amount(legs.long_qty),

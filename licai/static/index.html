@@ -125,6 +125,7 @@
       grid-template-columns: repeat(4, 1fr);
       gap: 8px;
     }
+    .funds + .funds { margin-top: 8px; }
     .kpi {
       background: var(--panel2);
       border-radius: 10px;
@@ -329,10 +330,16 @@
         </div>
         <div id="error" class="err" hidden></div>
         <div class="funds">
+          <div class="kpi"><span>现价</span><b id="mid-price">-</b></div>
+          <div class="kpi"><span>账户总额</span><b id="equity">-</b></div>
+          <div class="kpi"><span>昨日收益</span><b id="earn-yesterday">-</b></div>
+          <div class="kpi"><span>uniMMR</span><b id="mmr">-</b></div>
+        </div>
+        <div class="funds">
           <div class="kpi"><span>现货 USDT</span><b id="spot">-</b></div>
           <div class="kpi"><span>USDT 活期</span><b id="usdt-flex">-</b></div>
           <div class="kpi"><span>BFUSD</span><b id="bfusd">-</b></div>
-          <div class="kpi"><span>uniMMR</span><b id="mmr">-</b></div>
+          <div class="kpi"><span>理财合计</span><b id="earn-total">-</b></div>
         </div>
         <div class="chips" id="collateral" hidden></div>
         <div class="pos-row">
@@ -691,6 +698,8 @@
     function applyLive(s) {
       if (s.uni_mmr != null) setMmr(s.uni_mmr || "-");
       if (s.leverage != null) $("lev").textContent = s.leverage;
+      const price = s.price || (s.stability && s.stability.mid) || "";
+      if (price) $("mid-price").textContent = price;
       const legs = s.legs || {};
       $("long-qty").textContent = legs.long_qty || "-";
       $("short-qty").textContent = legs.short_qty || "-";
@@ -826,6 +835,10 @@
       $("spot").textContent = s.spot_usdt || "-";
       $("usdt-flex").textContent = s.usdt_flexible || "0";
       $("bfusd").textContent = s.bfusd || "0";
+      $("earn-total").textContent = s.earn_total || "0";
+      $("equity").textContent = s.account_total || s.pm_equity || "-";
+      $("earn-yesterday").textContent = s.earn_yesterday || "0";
+      $("mid-price").textContent = s.price || (s.stability && s.stability.mid) || "-";
       setMmr(s.uni_mmr || "-");
       $("symbol-now").textContent = s.symbol || "-";
       $("lev").textContent = s.leverage || "-";
