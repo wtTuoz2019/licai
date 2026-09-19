@@ -57,6 +57,7 @@ quote_refresh_seconds: 3
 hedge_quote_retries: 4       # 限价重试几次后再市价
 watch_seconds: 60            # 命令行盯盘间隔
 live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
+auto_harvest_seconds: 45     # 开启「自动收利」后后台检查间隔
 min_free_usdt_keep: 0        # 默认不留。若未开 BNB 抵扣手续费，可留几 USDT 给合约成交费
 cycle_sweep_all: true        # 启动时把现货闲置 USDT 申购 USDT/BFUSD 活期（仓位继续当保证金）
 

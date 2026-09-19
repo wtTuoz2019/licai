@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from decimal import Decimal
 
@@ -56,7 +57,22 @@ class OpsService:
         self.base = base or load_settings()
         self._snap_cache: dict[int, tuple[float, dict]] = {}
         self._snap_ttl = 86400.0
-        self._risk_cache: dict[int, dict] = {}
+        self._risk_cache: dict[int, tuple[float, dict]] = {}
+        self._risk_ttl = 60.0
+        self._action_locks: dict[int, threading.Lock] = {}
+        self._action_guard = threading.Lock()
+        self._busy: set[int] = set()
+
+    def try_begin_action(self, account_id: int) -> bool:
+        with self._action_guard:
+            if account_id in self._busy:
+                return False
+            self._busy.add(account_id)
+            return True
+
+    def end_action(self, account_id: int) -> None:
+        with self._action_guard:
+            self._busy.discard(account_id)
 
     def _idle_spot(self, account: Account) -> Decimal:
         hit = self._snap_cache.get(account.id)
@@ -74,19 +90,30 @@ class OpsService:
             "equity": risk.get("equity") or Decimal("0"),
             "available": risk.get("available") or Decimal("0"),
         }
-        self._risk_cache[account_id] = stored
+        self._risk_cache[account_id] = (time.monotonic(), stored)
         return stored
+
+    def _cached_risk(self, account_id: int) -> dict | None:
+        hit = self._risk_cache.get(account_id)
+        if not hit:
+            return None
+        return hit[1]
 
     def _risk_for(self, account: Account, futures, *, refresh: bool) -> dict:
         empty = {"uni_mmr": Decimal("0"), "equity": Decimal("0"), "available": Decimal("0")}
+        now = time.monotonic()
+        hit = self._risk_cache.get(account.id)
         if not refresh:
-            return self._risk_cache.get(account.id) or empty
+            if hit and now - hit[0] < self._risk_ttl:
+                return hit[1]
+            # 缓存缺失或过期：轮询也要拉一次，否则有仓位时 uniMMR 会一直显示 —
+            refresh = True
         if not getattr(futures, "unified", True):
             return self._remember_risk(account.id, empty)
         try:
             risk = futures.refresh_account_risk()
         except Exception:
-            return self._risk_cache.get(account.id) or empty
+            return (hit[1] if hit else empty)
         return self._remember_risk(account.id, risk)
 
     def snapshot(self, account: Account, *, force: bool = False) -> dict:
@@ -151,16 +178,29 @@ class OpsService:
             "leverage": lev,
             "uni_mmr": mmr_text,
             "live_poll_seconds": int(settings.live_poll_seconds),
+            "auto_harvest_seconds": int(getattr(settings, "auto_harvest_seconds", 45) or 45),
             "legs": {
                 "long_qty": fmt_amount(legs.long_qty),
                 "short_qty": fmt_amount(legs.short_qty),
                 "long_pnl": fmt_amount(legs.long_pnl, 4),
                 "short_pnl": fmt_amount(legs.short_pnl, 4),
+                "long_entry": fmt_amount(legs.long_entry) if legs.long_entry > 0 else "",
+                "short_entry": fmt_amount(legs.short_entry) if legs.short_entry > 0 else "",
                 "missing": legs.missing_side,
             },
             "stability": stability.as_dict(),
             "enter": enter_advice(legs, stability, self._idle_spot(account), plan),
             "harvest": advice.as_dict(),
+            "events": [
+                {
+                    "id": event.id,
+                    "action": event.action,
+                    "ok": event.ok,
+                    "detail": event.detail,
+                    "created_at": event.created_at,
+                }
+                for event in self.store.recent_events(account.id, 12)
+            ],
         }
 
     def _build_snapshot(self, account: Account) -> dict:
@@ -256,6 +296,8 @@ class OpsService:
                 "short_qty": fmt_amount(legs.short_qty),
                 "long_pnl": fmt_amount(legs.long_pnl, 4),
                 "short_pnl": fmt_amount(legs.short_pnl, 4),
+                "long_entry": fmt_amount(legs.long_entry) if legs.long_entry > 0 else "",
+                "short_entry": fmt_amount(legs.short_entry) if legs.short_entry > 0 else "",
                 "missing": legs.missing_side,
             },
             "stability": stability.as_dict(),
@@ -275,7 +317,42 @@ class OpsService:
             ],
         }
 
-    def run_action(self, account: Account, action: str, force: bool = False, mode: str | None = None) -> dict:
+    def run_action(
+        self,
+        account: Account,
+        action: str,
+        force: bool = False,
+        mode: str | None = None,
+        *,
+        _locked: bool = False,
+        auto: bool = False,
+    ) -> dict:
+        own_lock = False
+        if not _locked:
+            if not self.try_begin_action(account.id):
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "live": True,
+                    "reason": "该账号正在执行其他操作，请稍后再试",
+                    "steps": [],
+                }
+            own_lock = True
+        try:
+            return self._run_action_body(account, action, force=force, mode=mode, auto=auto)
+        finally:
+            if own_lock:
+                self.end_action(account.id)
+
+    def _run_action_body(
+        self,
+        account: Account,
+        action: str,
+        force: bool = False,
+        mode: str | None = None,
+        *,
+        auto: bool = False,
+    ) -> dict:
         if action not in {"enter", "harvest", "switch", "sweep", "hedge", "recycle", "fund", "leverage", "scale"}:
             raise ValueError(f"未知动作: {action}")
         try:
@@ -293,17 +370,20 @@ class OpsService:
         if action == "harvest":
             live = self.monitor(account)
             harvest = (live or {}).get("harvest") or {}
-            allowed = harvest.get("can_click") or (force and harvest.get("force_ok"))
+            # 自动收利只走完整条件（含价格平稳）；手动仍可强行
+            if auto:
+                allowed = bool(harvest.get("can_click"))
+            else:
+                allowed = harvest.get("can_click") or (force and harvest.get("force_ok"))
             if not allowed:
                 reason = harvest.get("reason") or live.get("error") or "现在不适合平仓"
-                self.store.add_event(account.id, action, False, "已拦截：" + reason[:500])
+                self.store.add_event(account.id, action, False, ("自动收利已拦截：" if auto else "已拦截：") + reason[:500])
                 return {
                     "ok": False,
                     "blocked": True,
                     "live": True,
                     "reason": reason,
                     "steps": [],
-                    "snapshot": self.snapshot(account),
                 }
         if action == "scale":
             live = self.monitor(account)
@@ -318,7 +398,6 @@ class OpsService:
                     "live": True,
                     "reason": reason,
                     "steps": [],
-                    "snapshot": self.snapshot(account),
                 }
         if action == "switch":
             snap = self.snapshot(account)
@@ -331,7 +410,6 @@ class OpsService:
                     "blocked": True,
                     "reason": reason,
                     "steps": [],
-                    "snapshot": snap,
                 }
         if action == "harvest":
             steps = cycle.harvest_once()
@@ -354,7 +432,10 @@ class OpsService:
             )
         ok = all(step.ok for step in steps) if steps else True
         summary = "；".join(f"{step.name}: {_detail(step.detail)}" for step in steps[-4:]) or "无步骤"
+        if auto:
+            summary = "自动收利：" + summary
         self.store.add_event(account.id, action, ok, summary[:2000])
+        self.invalidate_snapshot(account.id)
         return {
             "ok": ok,
             "blocked": False,

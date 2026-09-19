@@ -18,7 +18,7 @@ RATE_TTL = 10 * 60.0
 _lock = threading.Lock()
 _session: requests.Session | None = None
 _books: dict[str, tuple[Decimal, Decimal]] = {}
-_books_at = 0.0
+_books_at: dict[str, float] = {}
 _klines: dict[tuple[str, str, int], tuple[float, list]] = {}
 _filters: dict[str, tuple[Decimal, Decimal]] = {}
 _filters_at = 0.0
@@ -50,38 +50,14 @@ def _get(url: str, params: dict | None = None) -> object:
     return data
 
 
-def _refresh_books_locked() -> None:
-    global _books, _books_at
-    now = time.monotonic()
-    if _books and now - _books_at < BOOK_TTL:
-        return
-    data = _get(f"{FAPI}/fapi/v1/ticker/bookTicker")
-    rows = data if isinstance(data, list) else [data]
-    books: dict[str, tuple[Decimal, Decimal]] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        symbol = str(row.get("symbol") or "")
-        if not symbol:
-            continue
-        books[symbol] = (d(row.get("bidPrice")), d(row.get("askPrice")))
-    if books:
-        _books = books
-        _books_at = now
-
-
 def book(symbol: str) -> tuple[Decimal, Decimal]:
+    """单币种盘口，带短 TTL；下单热路径不再拉全市场 bookTicker。"""
     symbol = symbol.upper()
+    now = time.monotonic()
     with _lock:
-        try:
-            _refresh_books_locked()
-        except Exception:
-            hit = _books.get(symbol)
-            if hit:
-                return hit
-            raise
         hit = _books.get(symbol)
-        if hit:
+        ts = _books_at.get(symbol, 0.0)
+        if hit and now - ts < BOOK_TTL:
             return hit
     data = _get(f"{FAPI}/fapi/v1/ticker/bookTicker", {"symbol": symbol})
     if isinstance(data, list):
@@ -89,6 +65,7 @@ def book(symbol: str) -> tuple[Decimal, Decimal]:
     bid, ask = d(data.get("bidPrice")), d(data.get("askPrice"))
     with _lock:
         _books[symbol] = (bid, ask)
+        _books_at[symbol] = time.monotonic()
     return bid, ask
 
 

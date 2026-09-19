@@ -16,6 +16,10 @@ _NEW_ACCOUNT_LEV_RE = re.compile(
 )
 _GREATER_THAN_LEV_RE = re.compile(r"greater than\s+(\d+)x", re.I)
 LEVERAGE_LADDER = [100, 75, 50, 25, 20, 10, 5]
+_TRADES_CACHE: dict[tuple, tuple[float, list]] = {}
+_ROUND_TRIP_FEE_CACHE: dict[tuple, tuple[float, dict]] = {}
+_TRADES_TTL = 300.0
+_ROUND_TRIP_FEE_TTL = 120.0
 
 
 def parse_leverage_limit(exc: BinanceAPIError) -> tuple[int, str | None, str]:
@@ -248,18 +252,21 @@ class FuturesAPI:
         return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
 
     def legs(self, symbol: str) -> HedgeLegs:
+        symbol = symbol.upper()
         rows = self._um_signed("GET", "/fapi/v2/positionRisk", "/papi/v1/um/positionRisk", {"symbol": symbol})
         if isinstance(rows, dict):
             rows = [rows]
         long_qty = short_qty = long_pnl = short_pnl = long_entry = short_entry = Decimal("0")
         leverage = 0
         for row in rows or []:
-            if str(row.get("symbol")) != symbol:
+            row_sym = str(row.get("symbol") or "").upper()
+            if row_sym and row_sym != symbol:
                 continue
             side = str(row.get("positionSide") or "").upper()
             amt = d(row.get("positionAmt"))
             pnl = d(row.get("unRealizedProfit"))
-            entry = d(row.get("entryPrice"))
+            entry = d(row.get("entryPrice") or row.get("breakEvenPrice"))
+            mark = d(row.get("markPrice"))
             try:
                 lev = int(row.get("leverage") or 0)
             except (TypeError, ValueError):
@@ -267,13 +274,20 @@ class FuturesAPI:
             if lev > leverage:
                 leverage = lev
             if side == "LONG" or (side in {"BOTH", ""} and amt > 0):
-                long_qty = abs(amt)
+                qty = abs(amt)
+                long_qty = qty
                 long_pnl = pnl
-                long_entry = entry
+                if entry <= 0 and qty > 0 and mark > 0:
+                    # 接口偶发缺 entryPrice 时，用标记价与浮盈反推
+                    entry = mark - (pnl / qty)
+                long_entry = entry if entry > 0 else long_entry
             elif side == "SHORT" or (side in {"BOTH", ""} and amt < 0):
-                short_qty = abs(amt)
+                qty = abs(amt)
+                short_qty = qty
                 short_pnl = pnl
-                short_entry = entry
+                if entry <= 0 and qty > 0 and mark > 0:
+                    entry = mark + (pnl / qty)
+                short_entry = entry if entry > 0 else short_entry
         return HedgeLegs(long_qty, short_qty, long_pnl, short_pnl, long_entry, short_entry, leverage)
 
     def available_usdt(self) -> Decimal:
@@ -447,20 +461,32 @@ class FuturesAPI:
         return rates
 
     def um_user_trades(self, symbol: str, limit: int = 20) -> list[dict]:
+        now = time.monotonic()
+        key = (self.client.api_key[:12], symbol, int(limit))
+        hit = _TRADES_CACHE.get(key)
+        if hit and now - hit[0] < _TRADES_TTL:
+            return hit[1]
         data = self._um_signed(
             "GET",
             "/fapi/v1/userTrades",
             "/papi/v1/um/userTrades",
             {"symbol": symbol, "limit": limit},
         )
-        if isinstance(data, list):
-            return data
-        return data.get("list") or data.get("data") or []
+        rows = data if isinstance(data, list) else (data.get("list") or data.get("data") or [])
+        _TRADES_CACHE[key] = (now, rows)
+        return rows
 
     def round_trip_fee(self, symbol: str, qty: Decimal, mid: Decimal) -> dict[str, Decimal | str]:
         """收利一轮手续费：优先用近期同仓位成交的实付，否则按账户真实费率×名义。"""
         qty = abs(qty)
         notional = qty * mid if qty > 0 and mid > 0 else Decimal("0")
+        qty_bucket = str(qty.quantize(Decimal("0.001"))) if qty > 0 else "0"
+        mid_bucket = str(mid.quantize(Decimal("0.01"))) if mid > 0 else "0"
+        fee_key = (self.client.api_key[:12], symbol, qty_bucket, mid_bucket)
+        now = time.monotonic()
+        hit = _ROUND_TRIP_FEE_CACHE.get(fee_key)
+        if hit and now - hit[0] < _ROUND_TRIP_FEE_TTL:
+            return hit[1]
         try:
             rates = self.um_commission_rates(symbol)
             maker = rates["maker"]
@@ -490,13 +516,15 @@ class FuturesAPI:
         if len(matched) >= 2:
             fee = matched[0] + matched[1]
             source = "trades"
-        return {
+        out = {
             "fee": fee,
             "maker_rate": maker,
             "taker_rate": taker,
             "notional": notional,
             "source": source,
         }
+        _ROUND_TRIP_FEE_CACHE[fee_key] = (now, out)
+        return out
 
     def place_limit(
         self,

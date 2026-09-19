@@ -148,6 +148,7 @@
     .pos.short { border-left-color: var(--short); }
     .pos-h { color: var(--muted); font-size: 11px; }
     .pos .qty { font-size: 15px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .pos .entry { color: var(--muted); font-size: 12px; margin-top: 2px; font-variant-numeric: tabular-nums; }
     .pos .pnl { font-size: 22px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
     .up { color: var(--good); }
     .down { color: var(--bad); }
@@ -190,10 +191,21 @@
       flex-wrap: wrap;
     }
     .harvest-set label { margin: 0; }
-    .harvest-set input {
+    .harvest-set input[type="number"] {
       width: 88px;
       padding: 6px 8px;
     }
+    .auto-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 12px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .auto-toggle input { width: auto; accent-color: var(--good); }
     .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
     .chip {
       background: var(--panel2);
@@ -327,11 +339,13 @@
           <div class="pos long">
             <div class="pos-h">多仓</div>
             <div class="qty" id="long-qty">-</div>
+            <div class="entry" id="long-entry">仓位价 -</div>
             <div class="pnl" id="long-pnl">-</div>
           </div>
           <div class="pos short">
             <div class="pos-h">空仓</div>
             <div class="qty" id="short-qty">-</div>
+            <div class="entry" id="short-entry">仓位价 -</div>
             <div class="pnl" id="short-pnl">-</div>
           </div>
         </div>
@@ -348,6 +362,10 @@
             <span class="muted">USDT</span>
             <button type="button" id="btn-save-tp">保存</button>
             <button type="button" id="btn-tp-auto" hidden>恢复自动</button>
+            <label class="auto-toggle" title="浮盈达标、冷却结束且价格平稳时，后台自动收利">
+              <input type="checkbox" id="auto-harvest" />
+              自动收利
+            </label>
           </div>
           <div class="harvest-set" id="scale-box" hidden>
             <span class="muted" id="scale-why"></span>
@@ -410,6 +428,7 @@
     const FUNDS_STORE = "licai_funds_cache_v1";
     let pollMs = 120000;
     let liveAt = 0;
+    let lastSeenEventId = 0;
     const $ = (id) => document.getElementById(id);
 
     function cacheId(id) {
@@ -644,6 +663,7 @@
     async function selectAccount(id) {
       if (busy) return;
       selected = id;
+      lastSeenEventId = 0;
       $("settings-box").hidden = true;
       hideEditBoxes();
       await loadAccounts();
@@ -674,6 +694,10 @@
       const legs = s.legs || {};
       $("long-qty").textContent = legs.long_qty || "-";
       $("short-qty").textContent = legs.short_qty || "-";
+      const longEntry = legs.long_entry || "";
+      const shortEntry = legs.short_entry || "";
+      $("long-entry").textContent = "仓位价 " + (toNum(longEntry) > 0 ? longEntry : "-");
+      $("short-entry").textContent = "仓位价 " + (toNum(shortEntry) > 0 ? shortEntry : "-");
       setPnl($("long-pnl"), legs.long_pnl);
       setPnl($("short-pnl"), legs.short_pnl);
       const h = s.harvest || {};
@@ -683,11 +707,15 @@
       if (s.account && selected && snapHit(selected) && snapHit(selected).data) {
         snapHit(selected).data.account = Object.assign(snapHit(selected).data.account || {}, s.account);
       }
+      const accLive = s.account || ((selected && snapHit(selected) && snapHit(selected).data && snapHit(selected).data.account) || {});
+      const autoBox = $("auto-harvest");
+      if (autoBox && document.activeElement !== autoBox) {
+        autoBox.checked = !!accLive.auto_harvest;
+      }
       if (tp && document.activeElement !== tp) {
-        const acc = s.account || ((selected && snapHit(selected) && snapHit(selected).data && snapHit(selected).data.account) || {});
-        const custom = !!acc.take_profit_custom;
+        const custom = !!accLive.take_profit_custom;
         const suggested = h.min_profit || h.auto_profit || "";
-        tp.value = custom && acc.take_profit_usdt ? acc.take_profit_usdt : suggested;
+        tp.value = custom && accLive.take_profit_usdt ? accLive.take_profit_usdt : suggested;
         tp.placeholder = h.auto_profit ? `建议 ${h.auto_profit}` : "按仓位";
         const autoBtn = $("btn-tp-auto");
         if (autoBtn) autoBtn.hidden = !custom;
@@ -700,9 +728,13 @@
       fill.style.width = pct + "%";
       fill.className = (h.can_click || h.force_ok) ? "ready" : "";
       const gap = Math.max(0, need - best);
-      $("harvest-why").textContent = (h.can_click || h.force_ok)
+      let why = (h.can_click || h.force_ok)
         ? (h.reason || "可以收利")
         : (need > 0 ? `还差 ${gap.toFixed(2)} 到收利门槛` : (h.reason || ""));
+      if (accLive.auto_harvest) {
+        why = (h.can_click ? "自动收利待命：条件已满足。 " : "自动收利已开：达标且平稳后会自动平。 ") + why;
+      }
+      $("harvest-why").textContent = why;
       $("btn-harvest").title = h.reason || "";
       const en = s.enter || {};
       const scaleBox = $("scale-box");
@@ -742,7 +774,22 @@
           enter: s.enter || snapHit(selected).data.enter,
           harvest: s.harvest || snapHit(selected).data.harvest,
         });
+        if (s.events) snapHit(selected).data.events = s.events;
         persistFunds();
+      }
+      if (Array.isArray(s.events) && s.events.length) {
+        fillEvents(s.events);
+        const top = s.events[0];
+        const eid = Number(top && top.id) || 0;
+        if (eid > lastSeenEventId) {
+          const prev = lastSeenEventId;
+          lastSeenEventId = eid;
+          // 后台自动收利完成后，主动刷资金/日志（首次加载只记 id，不刷）
+          if (prev > 0 && top.action === "harvest" && top.ok && !busy) {
+            setActionMsg(String(top.detail || "自动收利已完成").slice(0, 220));
+            refresh({ force: true, silent: true });
+          }
+        }
       }
       showSnapAge();
     }
@@ -755,6 +802,15 @@
         if (selected !== id || !s.ok) return;
         liveAt = Date.now();
         applyLive(s);
+        // 开了自动收利时加快轮询，便于收利后尽快刷资金
+        const autoOn = !!(s.account && s.account.auto_harvest);
+        const nextMs = autoOn
+          ? Math.max(15000, Math.min(pollMs, Number(s.auto_harvest_seconds || 45) * 1000))
+          : pollMs;
+        if (timer) {
+          clearInterval(timer);
+          timer = setInterval(() => { if (!busy) pollLive(); }, nextMs);
+        }
       } catch (err) {
         showSnapAge();
       }
@@ -796,16 +852,24 @@
       if (s.hedge_symbols && s.hedge_symbols.length) hedgeSymbols = s.hedge_symbols;
       fillSymbolSelect($("symbol-edit"), (s.account && s.account.hedge_symbol) || s.symbol || "ETHUSDT");
       lastSymbol = $("symbol-edit").value;
+      fillEvents(s.events || []);
+      if ((s.events || []).length) {
+        lastSeenEventId = Math.max(lastSeenEventId, Number(s.events[0].id) || 0);
+      }
+      showSnapAge();
+    }
+
+    function fillEvents(events) {
       const tbody = $("events");
+      if (!tbody) return;
       tbody.innerHTML = "";
-      (s.events || []).forEach((e) => {
+      (events || []).forEach((e) => {
         const tr = document.createElement("tr");
         const detail = String(e.detail || "");
         const short = detail.length > 72 ? detail.slice(0, 72) + "…" : detail;
         tr.innerHTML = `<td>${esc(shortTime(e.created_at))}</td><td>${esc(e.action)}</td><td>${e.ok ? "成功" : "失败"}</td><td class="detail" title="${esc(detail)}">${esc(short)}</td>`;
         tbody.appendChild(tr);
       });
-      showSnapAge();
     }
 
     async function refresh({ force = false, silent = false } = {}) {
@@ -960,11 +1024,15 @@
           body: JSON.stringify(payload),
         });
         hideModal();
-        if (data.snapshot) {
+        if (data.snapshot && !data.blocked) {
           rememberSnap(selected, data.snapshot);
           render(data.snapshot);
         }
         setActionMsg(formatActionResult(data));
+        // 收利后申购/划转刚落账，再强制刷一次资金与操作日志
+        if (action === "harvest" && !data.blocked) {
+          await refresh({ force: true, silent: true });
+        }
       } catch (err) {
         hideModal();
         setActionMsg(err.message);
@@ -1116,6 +1184,28 @@
         await pollLive();
         setActionMsg("已改回按仓位自动计算，收利加仓后会重算");
       } catch (err) {
+        setActionMsg(err.message);
+      } finally {
+        busy = false;
+      }
+    };
+    $("auto-harvest").onchange = async () => {
+      if (!selected || busy) return;
+      const on = !!$("auto-harvest").checked;
+      busy = true;
+      try {
+        const acc = await api(`/api/accounts/${selected}`, {
+          method: "PATCH",
+          body: JSON.stringify({ auto_harvest: on }),
+        });
+        if (snapHit(selected) && snapHit(selected).data) {
+          snapHit(selected).data.account = Object.assign(snapHit(selected).data.account || {}, acc);
+          persistFunds();
+        }
+        setActionMsg(on ? "已开启自动收利：达标且价格平稳时后台会执行" : "已关闭自动收利");
+        await pollLive();
+      } catch (err) {
+        $("auto-harvest").checked = !on;
         setActionMsg(err.message);
       } finally {
         busy = false;

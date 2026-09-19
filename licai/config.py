@@ -115,6 +115,7 @@ class Settings:
     harvest_sqrt_coeff: Decimal = Decimal("0.5")
     harvest_min_usdt: Decimal = Decimal("1")
     live_poll_seconds: int = 120
+    auto_harvest_seconds: int = 45
     cooldown_minutes: int = 10
     stable_range_pct: Decimal = Decimal("0.0025")
     switch_safe_uni_mmr: Decimal = Decimal("2.5")
@@ -205,6 +206,7 @@ def load_settings(config_path: str | Path | None = None, dry_run_override: bool 
         harvest_sqrt_coeff=d(raw.get("harvest_sqrt_coeff", "0.5")),
         harvest_min_usdt=d(raw.get("harvest_min_usdt", "1")),
         live_poll_seconds=int(raw.get("live_poll_seconds", 120)),
+        auto_harvest_seconds=int(raw.get("auto_harvest_seconds", 45)),
         cooldown_minutes=int(raw.get("cooldown_minutes", 10)),
         stable_range_pct=d(raw.get("stable_range_pct", "0.0025")),
         switch_safe_uni_mmr=load_uni_mmr_floor(raw, "switch_safe_uni_mmr", "2.5"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -20,6 +21,7 @@ from .auth import (
     valid_session,
     COOKIE_NAME,
 )
+from .autoharvest import AutoHarvestWorker
 from .config import normalize_hedge_symbol
 from .ops import OpsService
 
@@ -27,6 +29,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 NO_STORE = {"Cache-Control": "no-store"}
 ops = OpsService()
 store = ops.store
+_auto_worker = AutoHarvestWorker(ops)
 
 
 class AccountIn(BaseModel):
@@ -45,6 +48,7 @@ class AccountPatch(BaseModel):
     hedge_symbol: str | None = None
     take_profit_usdt: float | None = None
     take_profit_custom: bool | None = None
+    auto_harvest: bool | None = None
 
 
 class ActionIn(BaseModel):
@@ -57,8 +61,17 @@ class LoginIn(BaseModel):
     password: str = ""
 
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _auto_worker.start()
+    try:
+        yield
+    finally:
+        _auto_worker.stop()
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="理财对冲操作台", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="理财对冲操作台", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.add_middleware(AuthMiddleware)
 
     @app.get("/")
@@ -122,6 +135,7 @@ def create_app() -> FastAPI:
                 hedge_symbol=symbol,
                 take_profit_usdt=body.take_profit_usdt,
                 take_profit_custom=body.take_profit_custom,
+                auto_harvest=body.auto_harvest,
             )
         except KeyError:
             raise HTTPException(404, "账号不存在") from None

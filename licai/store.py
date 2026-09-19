@@ -24,6 +24,7 @@ class Account:
     leverage_unlock_at: str | None = None
     take_profit_usdt: float | None = None
     take_profit_custom: bool = False
+    auto_harvest: bool = False
 
     def public_dict(self) -> dict:
         return {
@@ -38,6 +39,7 @@ class Account:
             "leverage_unlock_at": self.leverage_unlock_at or "",
             "take_profit_usdt": self.take_profit_usdt if self.take_profit_usdt else None,
             "take_profit_custom": bool(self.take_profit_custom),
+            "auto_harvest": bool(self.auto_harvest),
         }
 
 
@@ -110,6 +112,8 @@ class AccountStore:
                 conn.execute("ALTER TABLE accounts ADD COLUMN take_profit_usdt TEXT")
             if "take_profit_custom" not in cols:
                 conn.execute("ALTER TABLE accounts ADD COLUMN take_profit_custom INTEGER NOT NULL DEFAULT 0")
+            if "auto_harvest" not in cols:
+                conn.execute("ALTER TABLE accounts ADD COLUMN auto_harvest INTEGER NOT NULL DEFAULT 0")
 
     def list_accounts(self) -> list[Account]:
         with self._connect() as conn:
@@ -145,6 +149,7 @@ class AccountStore:
         hedge_symbol: str | None = None,
         take_profit_usdt: float | None = None,
         take_profit_custom: bool | None = None,
+        auto_harvest: bool | None = None,
     ) -> Account:
         account = self.get(account_id)
         next_name = name.strip() if name is not None else account.name
@@ -169,9 +174,10 @@ class AccountStore:
                 next_tp = float(take_profit_usdt)
         elif take_profit_custom is True and account.take_profit_usdt:
             next_custom = True
+        next_auto = account.auto_harvest if auto_harvest is None else bool(auto_harvest)
         with self._connect() as conn:
             conn.execute(
-                "UPDATE accounts SET name = ?, api_key = ?, api_secret = ?, proxy = ?, hedge_symbol = ?, take_profit_usdt = ?, take_profit_custom = ? WHERE id = ?",
+                "UPDATE accounts SET name = ?, api_key = ?, api_secret = ?, proxy = ?, hedge_symbol = ?, take_profit_usdt = ?, take_profit_custom = ?, auto_harvest = ? WHERE id = ?",
                 (
                     next_name,
                     next_key,
@@ -180,6 +186,7 @@ class AccountStore:
                     next_symbol,
                     str(next_tp) if next_tp else None,
                     1 if next_custom else 0,
+                    1 if next_auto else 0,
                     account_id,
                 ),
             )
@@ -247,6 +254,7 @@ class AccountStore:
         custom = bool(int(raw_custom or 0))
         if not custom and tp is not None:
             custom = True
+        raw_auto = row["auto_harvest"] if "auto_harvest" in keys else None
         return Account(
             id=int(row["id"]),
             name=row["name"],
@@ -259,4 +267,5 @@ class AccountStore:
             leverage_unlock_at=str(unlock) if unlock else None,
             take_profit_usdt=tp,
             take_profit_custom=custom,
+            auto_harvest=bool(int(raw_auto or 0)),
         )

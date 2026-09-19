@@ -11,6 +11,7 @@ from .pipeline import Pipeline, StepResult
 
 
 LIMIT_FILL_TRIES = 3
+FILL_POLL = 0.25
 
 
 def _subscribed(steps: list[StepResult]) -> bool:
@@ -29,6 +30,13 @@ def _post_only_reject(step: StepResult) -> bool:
         return False
     text = str(step.detail or "").lower()
     return "-5022" in text or "post only" in text or "could not be executed as maker" in text
+
+
+def _order_filled_hint(step: StepResult) -> bool:
+    text = str(step.detail or "")
+    if "已挂未成交" in text:
+        return False
+    return "FILLED" in text or "PARTIALLY_FILLED" in text or ("成交" in text and "未成交" not in text)
 
 
 def margin_use_pct(settings) -> Decimal:
@@ -109,6 +117,19 @@ class HedgeCycle:
         self.leverage_cap = self.settings.leverage_cap
         self.leverage_unlock_at = self.settings.leverage_unlock_at
         self.leverage_cap_changed = False
+
+    def _limit_tries(self) -> int:
+        return max(1, int(getattr(self.settings, "hedge_quote_retries", None) or LIMIT_FILL_TRIES))
+
+    def _wait_until(self, pred, *, timeout: float, interval: float = FILL_POLL) -> bool:
+        """短轮询直到条件成立，避免盲目 sleep。"""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if pred():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(interval)
 
     def run(self, watch: bool = True) -> list[StepResult]:
         steps: list[StepResult] = []
@@ -377,16 +398,29 @@ class HedgeCycle:
 
     def _profit_to_spot(self, realized: Decimal) -> list[StepResult]:
         steps: list[StepResult] = []
-        if not self.settings.dry_run:
-            time.sleep(max(int(self.settings.settle_seconds or 0), 2))
+        # 顺序保持：先转出再补仓。用短轮询等可转出，尽快进入补仓。
         collect = self._mutate("归集统一账户 USDT", lambda: self.futures.collect_to_margin("USDT"))
         steps.append(collect)
+        transferable = Decimal("0")
+        last_err: BinanceAPIError | None = None
+
+        def ready() -> bool:
+            nonlocal transferable, last_err
+            try:
+                transferable = self.futures.max_withdraw("USDT")
+                last_err = None
+                return transferable >= 1
+            except BinanceAPIError as exc:
+                last_err = exc
+                return False
+
         if not self.settings.dry_run:
-            time.sleep(1)
-        try:
-            transferable = self.futures.max_withdraw("USDT")
-        except BinanceAPIError as exc:
-            steps.append(StepResult("查询可转出", False, str(exc)))
+            if not ready():
+                self._wait_until(ready, timeout=2.0, interval=0.3)
+        else:
+            ready()
+        if last_err is not None and transferable < 1:
+            steps.append(StepResult("查询可转出", False, str(last_err)))
             return steps
         if transferable < 1:
             steps.append(
@@ -412,8 +446,9 @@ class HedgeCycle:
 
     def _quote_until_balanced(self, qty: Decimal, reduce_only: bool) -> list[StepResult]:
         steps: list[StepResult] = []
-        wait = max(1, self.settings.quote_refresh_seconds)
-        for i in range(LIMIT_FILL_TRIES):
+        wait = max(0.5, min(2.0, float(self.settings.quote_refresh_seconds or 1)))
+        tries = self._limit_tries()
+        for i in range(tries):
             legs = self.futures.legs(self.symbol)
             if legs.missing_side is None:
                 steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
@@ -424,12 +459,19 @@ class HedgeCycle:
                 steps.append(StepResult("保证金不够", False, "另一边开不出，平掉已成交的单边"))
                 steps.extend(self._flatten_if_naked())
                 return steps
-            time.sleep(wait)
-            legs = self.futures.legs(self.symbol)
-            if legs.missing_side is None:
-                steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
+            if any(_order_filled_hint(item) for item in extra):
+                legs = self.futures.legs(self.symbol)
+                if legs.missing_side is None:
+                    steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
+                    return steps
+            done = self._wait_until(
+                lambda: self.futures.legs(self.symbol).missing_side is None,
+                timeout=wait,
+            )
+            if done:
+                steps.append(StepResult("对冲平衡", True, self._legs_text(self.futures.legs(self.symbol))))
                 return steps
-        steps.append(StepResult("挂单未齐", True, f"限价挂了 {LIMIT_FILL_TRIES} 次仍有缺口，改市价补另一边"))
+        steps.append(StepResult("挂单未齐", True, f"限价挂了 {tries} 次仍有缺口，改市价补另一边"))
         for _ in range(2):
             extra = self._hedge_pass(qty, reduce_only, market=True, aggressive=True, flatten=False)
             steps.extend(extra)
@@ -437,11 +479,13 @@ class HedgeCycle:
                 steps.append(StepResult("保证金不够", False, "市价也开不出另一边，平掉已成交的单边"))
                 steps.extend(self._flatten_if_naked())
                 return steps
-            legs = self.futures.legs(self.symbol)
-            if legs.missing_side is None:
-                steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
+            done = self._wait_until(
+                lambda: self.futures.legs(self.symbol).missing_side is None,
+                timeout=0.8,
+            )
+            if done:
+                steps.append(StepResult("对冲平衡", True, self._legs_text(self.futures.legs(self.symbol))))
                 return steps
-            time.sleep(1)
         legs = self.futures.legs(self.symbol)
         if legs.long_qty > 0 and legs.short_qty > 0:
             steps.append(StepResult("数量仍不一致", True, "市价补腿后仍不等，平掉多出来的一边"))
@@ -482,7 +526,15 @@ class HedgeCycle:
                 steps.append(self._place("BUY", "SHORT", qty, px, True, market=True))
             else:
                 return steps
-            time.sleep(1)
+            flat = self._wait_until(
+                lambda: (
+                    (lambda legs: legs.long_qty <= 0 and legs.short_qty <= 0)(self.futures.legs(self.symbol))
+                ),
+                timeout=0.8,
+            )
+            if flat:
+                steps.append(StepResult("单边已平", True, self._legs_text(self.futures.legs(self.symbol))))
+                return steps
         steps.append(StepResult("单边未平净", False, self._legs_text(self.futures.legs(self.symbol))))
         return steps
 
@@ -548,35 +600,38 @@ class HedgeCycle:
 
     def _quote_side(self, order_side: str, position_side: str, qty: Decimal, reduce_only: bool) -> list[StepResult]:
         steps: list[StepResult] = []
-        wait = max(1, self.settings.quote_refresh_seconds)
+        # 收利补仓要尽快成交，缩短单边窗口；平仓同样加快
+        wait = 0.8 if reduce_only else max(0.5, min(1.5, float(self.settings.quote_refresh_seconds or 1)))
         done_name = f"已平 {position_side}" if reduce_only else f"已补 {position_side}"
+        tries = self._limit_tries()
 
         def finished(legs: HedgeLegs) -> bool:
             current = legs.long_qty if position_side == "LONG" else legs.short_qty
             return current <= 0 if reduce_only else current > 0
 
-        for i in range(LIMIT_FILL_TRIES):
+        for i in range(tries):
             legs = self.futures.legs(self.symbol)
             if finished(legs):
                 steps.append(StepResult(done_name, True, self._legs_text(legs)))
                 return steps
-            steps.extend(
-                self._side_pass(order_side, position_side, qty, reduce_only, market=False, aggressive=i > 0)
-            )
-            time.sleep(wait)
-            legs = self.futures.legs(self.symbol)
-            if finished(legs):
-                steps.append(StepResult(done_name, True, self._legs_text(legs)))
+            # 从第 1 次就贴近盘口挂，避免三次同价空挂
+            extra = self._side_pass(order_side, position_side, qty, reduce_only, market=False, aggressive=True)
+            steps.extend(extra)
+            if any(_order_filled_hint(item) for item in extra):
+                legs = self.futures.legs(self.symbol)
+                if finished(legs):
+                    steps.append(StepResult(done_name, True, self._legs_text(legs)))
+                    return steps
+            if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=wait):
+                steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
                 return steps
-        steps.append(StepResult("挂单未齐", True, f"{position_side} 挂单 {LIMIT_FILL_TRIES} 次未完成，改市价"))
+        steps.append(StepResult("挂单未齐", True, f"{position_side} 挂单 {tries} 次未完成，改市价"))
         for _ in range(2):
             steps.extend(self._side_pass(order_side, position_side, qty, reduce_only, market=True, aggressive=True))
-            legs = self.futures.legs(self.symbol)
-            if finished(legs):
-                steps.append(StepResult(done_name, True, self._legs_text(legs)))
+            if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=0.8):
+                steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
                 return steps
-            time.sleep(1)
-        steps.append(StepResult(f"{position_side} 未完成", False, self._legs_text(legs)))
+        steps.append(StepResult(f"{position_side} 未完成", False, self._legs_text(self.futures.legs(self.symbol))))
         return steps
 
     def _side_pass(
@@ -615,14 +670,31 @@ class HedgeCycle:
         if qty <= 0:
             return StepResult(f"{action}跳过", False, "数量为 0")
         if market:
-            return self._mutate(
+            step = self._mutate(
                 f"{action} 市价 {side} {position_side} {fmt_amount(qty)}",
                 lambda: self.futures.place_market(self.symbol, side, position_side, qty, reduce_only),
             )
-        return self._mutate(
-            f"{action} 挂单 {side} {position_side} {fmt_amount(qty)} @ {fmt_amount(price)}",
-            lambda: self.futures.place_maker(self.symbol, side, position_side, qty, price, reduce_only),
-        )
+        else:
+            step = self._mutate(
+                f"{action} 挂单 {side} {position_side} {fmt_amount(qty)} @ {fmt_amount(price)}",
+                lambda: self.futures.place_maker(self.symbol, side, position_side, qty, price, reduce_only),
+            )
+        if step.ok and isinstance(step.detail, dict):
+            step.detail = self._order_summary(step.detail)
+        return step
+
+    @staticmethod
+    def _order_summary(data: dict) -> str:
+        status = str(data.get("status") or "")
+        filled = str(data.get("executedQty") or data.get("cumQty") or "0")
+        orig = str(data.get("origQty") or "")
+        px = str(data.get("avgPrice") or data.get("price") or "")
+        tif = str(data.get("timeInForce") or ("MARKET" if data.get("type") == "MARKET" else ""))
+        if status in {"NEW", "NEW_INSURANCE", "NEW_ADL"} and d(filled) <= 0:
+            return f"已挂未成交 {filled}/{orig} @ {px} {tif}"
+        if status in {"FILLED", "PARTIALLY_FILLED"} or d(filled) > 0:
+            return f"{status} 成交 {filled}/{orig} @ {px} {tif}"
+        return f"{status} {filled}/{orig} @ {px} {tif}"
 
     def _collateral_qty(self) -> Decimal:
         if self.settings.hedge_qty > 0:
@@ -719,16 +791,21 @@ class HedgeCycle:
         goal_long = start.long_qty + add
         goal_short = start.short_qty + add
         steps: list[StepResult] = []
-        wait = max(1, self.settings.quote_refresh_seconds)
-        for i in range(LIMIT_FILL_TRIES):
+        wait = max(0.5, min(2.0, float(self.settings.quote_refresh_seconds or 1)))
+        tries = self._limit_tries()
+
+        def goals_met(legs: HedgeLegs) -> bool:
+            return legs.long_qty >= goal_long and legs.short_qty >= goal_short
+
+        for i in range(tries):
             legs = self.futures.legs(self.symbol)
-            if legs.long_qty >= goal_long and legs.short_qty >= goal_short:
+            if goals_met(legs):
                 steps.append(StepResult("加仓完成", True, self._legs_text(legs)))
                 return steps
             self.futures.cancel_open(self.symbol)
             bid, ask = self.futures.book(self.symbol)
             tick, step = self.futures.filters(self.symbol)
-            buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=i > 0)
+            buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=True)
             if legs.long_qty < goal_long:
                 leftover = self.futures.round_qty(goal_long - legs.long_qty, step)
                 if leftover > 0:
@@ -749,8 +826,10 @@ class HedgeCycle:
                         steps.extend(self._hedge_pass(add, True, market=True, aggressive=True, flatten=True))
                         steps.extend(self._flatten_if_naked())
                         return steps
-            time.sleep(wait)
-        steps.append(StepResult("挂单未齐", True, f"加仓限价 {LIMIT_FILL_TRIES} 次未齐，改市价补"))
+            if self._wait_until(lambda: goals_met(self.futures.legs(self.symbol)), timeout=wait):
+                steps.append(StepResult("加仓完成", True, self._legs_text(self.futures.legs(self.symbol))))
+                return steps
+        steps.append(StepResult("挂单未齐", True, f"加仓限价 {tries} 次未齐，改市价补"))
         bid, ask = self.futures.book(self.symbol)
         tick, step = self.futures.filters(self.symbol)
         legs = self.futures.legs(self.symbol)
@@ -772,9 +851,9 @@ class HedgeCycle:
                     steps.extend(self._hedge_pass(add, True, market=True, aggressive=True, flatten=True))
                     steps.extend(self._flatten_if_naked())
                     return steps
-        time.sleep(1)
+        self._wait_until(lambda: goals_met(self.futures.legs(self.symbol)), timeout=0.8)
         legs = self.futures.legs(self.symbol)
-        if legs.long_qty >= goal_long and legs.short_qty >= goal_short:
+        if goals_met(legs):
             steps.append(StepResult("加仓完成", True, self._legs_text(legs)))
             return steps
         if legs.long_qty > 0 and legs.short_qty > 0 and legs.long_qty != legs.short_qty:
