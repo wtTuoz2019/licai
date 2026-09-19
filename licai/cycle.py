@@ -384,7 +384,7 @@ class HedgeCycle:
         steps.extend(self._quote_side(refill_order, refill_pos, refill_qty, reduce_only=False))
         restored = self.futures.legs(self.symbol)
         if restored.missing_side is not None:
-            steps.append(StepResult("补仓未完成", False, "市价后仍缺一边，平掉已开的单边，避免裸仓"))
+            steps.append(StepResult("补仓未完成", False, "挂单+市价后仍缺一边，平掉已开的单边，避免裸仓"))
             steps.extend(self._flatten_if_naked())
             restored = self.futures.legs(self.symbol)
         earn_steps = self._spot_profit_to_earn()
@@ -611,22 +611,35 @@ class HedgeCycle:
         return buy_px, sell_px
 
     def _quote_side(self, order_side: str, position_side: str, qty: Decimal, reduce_only: bool) -> list[StepResult]:
+        """
+        平仓(reduce_only)：只挂 GTX，绝不市价；短间隔追价直到成交或超时失败。
+        补仓：多给挂单空间（多次贴近盘口改价），仍不成交再市价，避免长时间单边。
+        """
         steps: list[StepResult] = []
-        # 收利补仓要尽快成交，缩短单边窗口；平仓同样加快
-        wait = 0.8 if reduce_only else max(0.5, min(1.5, float(self.settings.quote_refresh_seconds or 1)))
         done_name = f"已平 {position_side}" if reduce_only else f"已补 {position_side}"
-        tries = self._limit_tries()
 
         def finished(legs: HedgeLegs) -> bool:
             current = legs.long_qty if position_side == "LONG" else legs.short_qty
             return current <= 0 if reduce_only else current > 0
+
+        if reduce_only:
+            # 平仓：只挂不砸。约 12 次 × 0.6s ≈ 7s 追价窗口
+            tries = max(8, self._limit_tries() * 2)
+            wait = 0.6
+            allow_market = False
+        else:
+            # 补仓：挂单优先，给足改价次数；仍齐不了再市价
+            # 约 6 次 × 1.0s ≈ 6s maker，再市价兜底
+            tries = max(6, self._limit_tries() + 2)
+            wait = max(0.8, min(1.2, float(self.settings.quote_refresh_seconds or 1)))
+            allow_market = True
 
         for i in range(tries):
             legs = self.futures.legs(self.symbol)
             if finished(legs):
                 steps.append(StepResult(done_name, True, self._legs_text(legs)))
                 return steps
-            # 从第 1 次就贴近盘口挂，避免三次同价空挂
+            # 始终贴近盘口挂；越往后同样 improve，靠撤单重挂跟盘
             extra = self._side_pass(order_side, position_side, qty, reduce_only, market=False, aggressive=True)
             steps.extend(extra)
             if any(_order_filled_hint(item) for item in extra):
@@ -637,7 +650,23 @@ class HedgeCycle:
             if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=wait):
                 steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
                 return steps
-        steps.append(StepResult("挂单未齐", True, f"{position_side} 挂单 {tries} 次未完成，改市价"))
+
+        if not allow_market:
+            try:
+                self.futures.cancel_open(self.symbol)
+            except BinanceAPIError:
+                pass
+            steps.append(
+                StepResult(
+                    f"{position_side} 未完成",
+                    False,
+                    f"平仓只允许挂单，已追价 {tries} 次仍未成交，已撤单。请稍后重试或等盘口更稳。"
+                    f" {self._legs_text(self.futures.legs(self.symbol))}",
+                )
+            )
+            return steps
+
+        steps.append(StepResult("挂单未齐", True, f"{position_side} 挂单 {tries} 次未完成，改市价补仓"))
         for _ in range(2):
             steps.extend(self._side_pass(order_side, position_side, qty, reduce_only, market=True, aggressive=True))
             if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=0.8):

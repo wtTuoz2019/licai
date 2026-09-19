@@ -52,9 +52,9 @@ min_uni_mmr: 2               # uniMMR=权益/维持保证金，越大越安全�
 scale_min_add_pct: 0.03      # 目标仓位比当前大 3% 以上才两边一起加
 # 收利门槛按单边仓位名义本金算，不再固定 5 USDT。账号里保存过自定义值才锁定
 take_profit_usdt: 0
-maker_only: false            # 先中间价限价，不成交改价；最后市价补齐，保证多空数量一致
-quote_refresh_seconds: 3
-hedge_quote_retries: 4       # 限价重试几次后再市价
+maker_only: false            # 入场/加仓仍可市价兜底；收利平仓固定只挂 GTX
+quote_refresh_seconds: 3     # 补仓每次挂单等待上限参考（秒），实际约 0.8–1.2s 一轮改价
+hedge_quote_retries: 4       # 入场限价重试基数；平仓约×2、补仓+2 次挂单后再市价
 watch_seconds: 60            # 命令行盯盘间隔
 live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
 auto_harvest_seconds: 45     # 开启「自动收利」后后台检查间隔

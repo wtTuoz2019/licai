@@ -20,28 +20,74 @@ def _apr(value: object) -> Decimal:
 SubscribeKind = Literal["flexible", "bfusd"]
 
 _YDAY_REWARD_CACHE: dict[str, tuple[float, dict]] = {}
-_YDAY_REWARD_TTL = 1800.0
+_YDAY_REWARD_TTL = 600.0
 
 
-def _yesterday_utc_ms() -> tuple[int, int]:
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    yday = today - timedelta(days=1)
-    return int(yday.timestamp() * 1000), int(today.timestamp() * 1000) - 1
+def _reward_query_window_ms(now_ms: int | None = None) -> tuple[int, int]:
+    """覆盖最近一次发放：BFUSD 约 UTC 09:00（北京 17:00）入账，time 多为发放时刻。
+
+    now_ms 应用币安校准后的时间（client.timestamp()），不要用本机裸时钟，
+    否则本机快/慢一天就会查到空窗口。
+    """
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    now = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
+    start = (now - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(start.timestamp() * 1000), int(now_ms)
 
 
-def _sum_reward_rows(rows: list) -> Decimal:
-    total = Decimal("0")
+def _row_reward_amount(row: dict) -> Decimal:
+    return d(
+        row.get("rewardsAmount")  # BFUSD rewardsHistory
+        or row.get("rewards")
+        or row.get("amount")
+        or row.get("reward")
+        or row.get("interest")
+        or row.get("assetReward")
+    )
+
+
+def _rewards_by_day(rows: list) -> dict[str, Decimal]:
+    by_day: dict[str, Decimal] = {}
     for row in rows or []:
         if not isinstance(row, dict):
             continue
-        total += d(
-            row.get("rewards")
-            or row.get("amount")
-            or row.get("reward")
-            or row.get("interest")
-            or row.get("assetReward")
-        )
-    return total
+        amt = _row_reward_amount(row)
+        if amt <= 0:
+            continue
+        raw = row.get("time") or row.get("timestamp") or row.get("createTime")
+        try:
+            ts = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            day = "unknown"
+        else:
+            if ts > 10_000_000_000:
+                ts //= 1000
+            day = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        by_day[day] = by_day.get(day, Decimal("0")) + amt
+    return by_day
+
+
+def _latest_day_totals(flex_rows: list, bfusd_rows: list) -> tuple[Decimal, Decimal, Decimal]:
+    flex_days = _rewards_by_day(flex_rows)
+    bfusd_days = _rewards_by_day(bfusd_rows)
+    days = set(flex_days) | set(bfusd_days)
+    if not days:
+        return Decimal("0"), Decimal("0"), Decimal("0")
+    latest = max(days)
+    flex = flex_days.get(latest, Decimal("0"))
+    bfusd = bfusd_days.get(latest, Decimal("0"))
+    return flex, bfusd, flex + bfusd
+
+
+def _debug_rows(raw: object, rows: list) -> dict:
+    sample = rows[0] if rows else None
+    return {
+        "n": len(rows or []),
+        "total": (raw.get("total") if isinstance(raw, dict) else None),
+        "keys": sorted(sample.keys()) if isinstance(sample, dict) else None,
+        "sample": sample,
+    }
 
 
 @dataclass
@@ -284,42 +330,124 @@ class EarnAPI:
         hit = _YDAY_REWARD_CACHE.get(key)
         if hit and now - hit[0] < _YDAY_REWARD_TTL:
             return hit[1]
-        start_ms, end_ms = _yesterday_utc_ms()
-        flex = Decimal("0")
-        bfusd = Decimal("0")
-        for typ in ("BONUS", "REALTIME"):
+        start_ms, end_ms = _reward_query_window_ms(self.client.timestamp())
+        # 再扩一档：最近 30 天，避免刚申购后窗口太窄 / 发放日对不齐
+        start30 = end_ms - 30 * 86400 * 1000
+        flex_rows: list = []
+        bfusd_rows: list = []
+        errors: list[str] = []
+        debug: dict[str, object] = {
+            "window": [start_ms, end_ms],
+            "window30": [start30, end_ms],
+        }
+
+        def _pull_flex(start: int, end: int) -> list:
+            out_rows: list = []
+            for typ in ("BONUS", "REALTIME"):
+                try:
+                    data = self.client.signed(
+                        "GET",
+                        "/sapi/v1/simple-earn/flexible/history/rewardsRecord",
+                        {
+                            "type": typ,
+                            "asset": "USDT",
+                            "startTime": start,
+                            "endTime": end,
+                            "size": 100,
+                            "current": 1,
+                        },
+                    )
+                    rows = data.get("rows") if isinstance(data, dict) else []
+                    if isinstance(rows, list):
+                        out_rows.extend(rows)
+                except BinanceAPIError as exc:
+                    errors.append(f"flex/{typ}: {exc}")
+            return out_rows
+
+        def _pull_bfusd(start: int, end: int) -> tuple[list, object]:
             try:
                 data = self.client.signed(
                     "GET",
-                    "/sapi/v1/simple-earn/flexible/history/rewardsRecord",
-                    {
-                        "type": typ,
-                        "asset": "USDT",
-                        "startTime": start_ms,
-                        "endTime": end_ms,
-                        "size": 100,
-                        "current": 1,
-                    },
+                    "/sapi/v1/bfusd/history/rewardsHistory",
+                    {"startTime": start, "endTime": end, "size": 100, "current": 1},
                 )
-                flex += _sum_reward_rows(data.get("rows") if isinstance(data, dict) else [])
-            except BinanceAPIError:
-                pass
-        try:
-            data = self.client.signed(
-                "GET",
-                "/sapi/v1/bfusd/history/rewardsHistory",
-                {"startTime": start_ms, "endTime": end_ms, "size": 100, "current": 1},
-            )
-            bfusd += _sum_reward_rows(data.get("rows") if isinstance(data, dict) else [])
-        except BinanceAPIError:
-            pass
-        total = flex + bfusd
+                rows = data.get("rows") if isinstance(data, dict) else []
+                return (rows if isinstance(rows, list) else []), data
+            except BinanceAPIError as exc:
+                errors.append(f"bfusd: {exc}")
+                return [], {"error": str(exc)}
+
+        flex_rows = _pull_flex(start_ms, end_ms)
+        bfusd_rows, bfusd_raw = _pull_bfusd(start_ms, end_ms)
+        debug["bfusd_3d"] = _debug_rows(bfusd_raw, bfusd_rows)
+        debug["flex_3d_n"] = len(flex_rows)
+
+        if not flex_rows and not bfusd_rows:
+            flex_rows = _pull_flex(start30, end_ms)
+            bfusd_rows, bfusd_raw = _pull_bfusd(start30, end_ms)
+            debug["bfusd_30d"] = _debug_rows(bfusd_raw, bfusd_rows)
+            debug["flex_30d_n"] = len(flex_rows)
+
+        # 兜底：资金分红里可能有 BFUSD/USDT 利息入账
+        dividend_rows: list = []
+        for asset in ("USDT", "BFUSD"):
+            try:
+                data = self.client.signed(
+                    "GET",
+                    "/sapi/v1/asset/assetDividend",
+                    {"asset": asset, "startTime": start30, "endTime": end_ms, "limit": 50},
+                )
+                rows = data.get("rows") if isinstance(data, dict) else []
+                if isinstance(rows, list):
+                    dividend_rows.extend(rows)
+                debug[f"dividend_{asset}"] = _debug_rows(data, rows if isinstance(rows, list) else [])
+            except BinanceAPIError as exc:
+                errors.append(f"dividend/{asset}: {exc}")
+
+        flex, bfusd, total = _latest_day_totals(flex_rows, bfusd_rows)
+        if total <= 0 and dividend_rows:
+            # 分红记录字段多为 amount；按最近一天汇总
+            div_amt = _rewards_by_day(dividend_rows)
+            if div_amt:
+                latest = max(div_amt)
+                total = div_amt[latest]
+                bfusd = total
+                debug["dividend_used_day"] = latest
+
+        source = "records" if total > 0 else ("error" if errors and not flex_rows and not bfusd_rows else "none")
         out = {
             "amount": total,
             "flex": flex,
             "bfusd": bfusd,
-            "source": "records" if total > 0 else "none",
+            "source": source,
             "text": fmt_amount(total, 4) if total > 0 else "0",
+            "errors": errors[:6],
+            "debug": debug,
         }
+        try:
+            from pathlib import Path
+
+            path = Path("logs/earn_reward_debug.json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                __import__("json").dumps(
+                    {
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "amount": str(total),
+                        "source": source,
+                        "errors": errors,
+                        "debug": debug,
+                        "sample_bfusd": (bfusd_rows[:2] if bfusd_rows else []),
+                        "sample_flex": (flex_rows[:2] if flex_rows else []),
+                        "sample_div": (dividend_rows[:2] if dividend_rows else []),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
         _YDAY_REWARD_CACHE[key] = (now, out)
         return out

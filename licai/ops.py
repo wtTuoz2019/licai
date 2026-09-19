@@ -288,6 +288,8 @@ class OpsService:
             "usdt_flexible": wallet.get("usdt_flexible") or "0",
             "bfusd": wallet.get("bfusd") or "0",
             "earn_yesterday": wallet.get("earn_yesterday") or "0",
+            "earn_yesterday_source": wallet.get("earn_yesterday_source") or "none",
+            "earn_yesterday_error": wallet.get("earn_yesterday_error") or "",
             "price": stability.as_dict().get("mid") or "0",
             "wallet_status": wallet.get("status") or "",
             "next_buy": wallet.get("next_buy"),
