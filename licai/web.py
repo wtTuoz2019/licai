@@ -49,6 +49,7 @@ class AccountPatch(BaseModel):
     take_profit_usdt: float | None = None
     take_profit_custom: bool | None = None
     auto_harvest: bool | None = None
+    hedge_leverage: int | None = Field(default=None, ge=1, le=125)
 
 
 class ActionIn(BaseModel):
@@ -136,6 +137,8 @@ def create_app() -> FastAPI:
                 take_profit_usdt=body.take_profit_usdt,
                 take_profit_custom=body.take_profit_custom,
                 auto_harvest=body.auto_harvest,
+                hedge_leverage=body.hedge_leverage,
+                hedge_leverage_set="hedge_leverage" in body.model_fields_set,
             )
         except KeyError:
             raise HTTPException(404, "账号不存在") from None

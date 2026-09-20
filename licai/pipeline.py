@@ -318,7 +318,7 @@ class Pipeline:
             "status": status,
         }
 
-    def margin_status(self) -> dict:
+    def margin_status(self, *, equity: Decimal | None = None) -> dict:
         spot = self.earn.spot_free("USDT")
         holdings = self.earn_holdings()
         usdt_flex = sum((amt for p, amt in holdings if p.kind != "bfusd"), Decimal("0"))
@@ -331,10 +331,11 @@ class Pipeline:
             pm = self.futures.papi_balances()
         except BinanceAPIError:
             pm = {}
-        try:
-            equity = self.futures.account_equity() if self.settings.unified_account else Decimal("0")
-        except BinanceAPIError:
-            equity = Decimal("0")
+        if equity is None:
+            try:
+                equity = self.futures.account_equity() if self.settings.unified_account else Decimal("0")
+            except BinanceAPIError:
+                equity = Decimal("0")
         try:
             ld_free = self.futures.earn_to_pm_balance("LDUSDT")
         except BinanceAPIError:
@@ -546,19 +547,24 @@ class Pipeline:
         text = str(step.detail or "").lower()
         return "-1002" in text or "not authorized" in text
 
-    def switch_advice(self) -> dict:
+    def switch_advice(self, *, mmr: Decimal | None = None, equity: Decimal | None = None) -> dict:
         try:
             target = self.pick()
         except Exception as exc:
             return {"needed": False, "can_click": False, "reason": str(exc)}
-        sources = [(p, amt) for p, amt in self.earn_holdings() if not self._same_product(p, target)]
-        try:
-            mmr, equity = self._mmr_equity() if self.settings.unified_account else (Decimal("0"), Decimal("0"))
-        except BinanceAPIError as exc:
-            return {"needed": False, "can_click": False, "reason": str(exc)}
+        holdings = self.earn_holdings()
+        sources = [(p, amt) for p, amt in holdings if not self._same_product(p, target)]
+        if mmr is None or equity is None:
+            try:
+                got_mmr, got_equity = self._mmr_equity() if self.settings.unified_account else (Decimal("0"), Decimal("0"))
+            except BinanceAPIError as exc:
+                return {"needed": False, "can_click": False, "reason": str(exc)}
+            if mmr is None:
+                mmr = got_mmr
+            if equity is None:
+                equity = got_equity
         safe = self.settings.switch_safe_uni_mmr
         leftover = sum((amt for _, amt in sources), Decimal("0"))
-        holdings = self.earn_holdings()
         if leftover <= 0:
             if not holdings:
                 return {

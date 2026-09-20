@@ -78,18 +78,21 @@ _IP_TTL = 6 * 3600.0
 _ip_cache: dict[str, tuple[float, str]] = {}
 
 
-def exit_ip(client: BinanceClient) -> str:
+def exit_ip(client: BinanceClient, *, force: bool = False) -> str:
+    """出口 IP。默认只用缓存（过期也复用），不拖慢刷新；force=True 才重查。"""
     key = client.proxy or ""
     now = time.monotonic()
     hit = _ip_cache.get(key)
-    if hit and now - hit[0] < _IP_TTL:
+    if hit and (not force) and now - hit[0] < _IP_TTL:
+        return hit[1]
+    if hit and not force:
         return hit[1]
     try:
         response = client.session.get("https://api.ipify.org", timeout=4)
         response.raise_for_status()
         ip = response.text.strip() or "未知"
     except Exception:
-        ip = "未知"
+        ip = hit[1] if hit else "未知"
     _ip_cache[key] = (now, ip)
     return ip
 

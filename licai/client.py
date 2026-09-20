@@ -40,11 +40,7 @@ class BinanceClient:
         self.recv_window = recv_window
         self.timeout = timeout
         self.proxy = (proxy or "").strip() or None
-        self.session = requests.Session()
-        self.session.trust_env = False
-        self.session.headers.update({"X-MBX-APIKEY": api_key, "Accept": "application/json"})
-        if self.proxy:
-            self.session.proxies.update({"http": self.proxy, "https": self.proxy})
+        self._tls = threading.local()
         self._time_offset_ms = BinanceClient._shared_offset_ms
         if api_key:
             try:
@@ -66,6 +62,27 @@ class BinanceClient:
             BinanceClient._shared_offset_ms = int(data["serverTime"]) - int(time.time() * 1000)
             BinanceClient._shared_offset_at = time.monotonic()
             self._time_offset_ms = BinanceClient._shared_offset_ms
+
+    def _http(self) -> requests.Session:
+        """每个线程自己的连接，刷新时资金和仓位可以同时打。"""
+        sess = getattr(self._tls, "session", None)
+        if sess is not None:
+            return sess
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.headers.update({"X-MBX-APIKEY": self.api_key, "Accept": "application/json"})
+        if self.proxy:
+            sess.proxies.update({"http": self.proxy, "https": self.proxy})
+        self._tls.session = sess
+        return sess
+
+    @property
+    def session(self) -> requests.Session:
+        return self._http()
+
+    @session.setter
+    def session(self, value: requests.Session) -> None:
+        self._tls.session = value
 
     def timestamp(self) -> int:
         return int(time.time() * 1000) + self._time_offset_ms

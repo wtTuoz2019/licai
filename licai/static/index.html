@@ -86,6 +86,7 @@
       color: #8a7a58;
     }
     .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    #lev-edit { width: 72px; flex: 0 0 72px; padding: 8px; }
     .row[hidden], #modal-spin[hidden], #modal-actions[hidden] { display: none !important; }
     .edit-box { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
     .accounts { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
@@ -337,7 +338,7 @@
         </div>
         <div class="funds">
           <div class="kpi"><span>现货 USDT</span><b id="spot">-</b></div>
-          <div class="kpi"><span>USDT 活期</span><b id="usdt-flex">-</b></div>
+          <div class="kpi" id="usdt-flex-box"><span>USDT 活期</span><b id="usdt-flex">-</b></div>
           <div class="kpi"><span>BFUSD</span><b id="bfusd">-</b></div>
           <div class="kpi"><span>理财合计</span><b id="earn-total">-</b></div>
         </div>
@@ -380,8 +381,10 @@
         </div>
         <div id="settings-box" class="edit-box" hidden>
           <p class="muted">出口 IP <b id="ip">-</b> · <span id="proxy-mode"></span> · 代理 <b id="proxy-now">默认</b> · <span id="snap-age"></span></p>
+          <p class="muted">杠杆 目标 <b id="lev-target">-</b> · 实际 <b id="lev-actual">-</b></p>
           <div class="row">
             <button type="button" id="btn-set-leverage">设置杠杆</button>
+            <input id="lev-edit" type="number" min="1" max="125" step="1" placeholder="100" title="目标杠杆：尝试提到这个倍数；算仓用实际倍数" />
             <button type="button" id="btn-edit-symbol">修改币对</button>
             <button type="button" id="btn-edit-proxy">修改代理</button>
             <button type="button" id="btn-delete">解绑</button>
@@ -446,7 +449,7 @@
       scale: { title: "加仓", hint: "在 uniMMR 安全线内，两边一起放大仓位。" },
       harvest: { title: "一键收利", hint: "平掉盈利腿并补仓。" },
       switch: { title: "换更高年化", hint: "分批换成更高年化产品。" },
-      leverage: { title: "设置杠杆", hint: "按账号允许的最高倍数设置，100x 不行就 20x、5x。" },
+      leverage: { title: "设置杠杆", hint: "先按输入倍数去交易所设置；算仓始终用实际落地的倍数。100 不行会落到允许的最高档。" },
     };
 
     function hideModal() {
@@ -698,6 +701,13 @@
     function applyLive(s) {
       if (s.uni_mmr != null) setMmr(s.uni_mmr || "-");
       if (s.leverage != null) $("lev").textContent = s.leverage;
+      const levAct = $("lev-actual");
+      if (levAct && s.leverage != null) levAct.textContent = s.leverage || "-";
+      const levTgt = $("lev-target");
+      if (levTgt) {
+        const tgt = (s.account && s.account.hedge_leverage) || s.leverage_target || "";
+        if (tgt) levTgt.textContent = tgt;
+      }
       const price = s.price || (s.stability && s.stability.mid) || "";
       if (price) $("mid-price").textContent = price;
       const legs = s.legs || {};
@@ -833,7 +843,10 @@
       $("ip").textContent = s.exit_ip || "-";
       $("proxy-mode").textContent = s.proxy_mode || "";
       $("spot").textContent = s.spot_usdt || "-";
+      const flexAmt = toNum(s.usdt_flexible);
       $("usdt-flex").textContent = s.usdt_flexible || "0";
+      const flexBox = $("usdt-flex-box");
+      if (flexBox) flexBox.hidden = !(Number.isFinite(flexAmt) && flexAmt > 0);
       $("bfusd").textContent = s.bfusd || "0";
       $("earn-total").textContent = s.earn_total || "0";
       $("equity").textContent = s.account_total || s.pm_equity || "-";
@@ -842,6 +855,16 @@
       setMmr(s.uni_mmr || "-");
       $("symbol-now").textContent = s.symbol || "-";
       $("lev").textContent = s.leverage || "-";
+      const levAct = $("lev-actual");
+      if (levAct) levAct.textContent = s.leverage || "-";
+      const levTgt = $("lev-target");
+      const levInput = $("lev-edit");
+      const target = (s.account && s.account.hedge_leverage) || s.leverage_target || "";
+      if (levTgt) levTgt.textContent = target || "-";
+      if (levInput && document.activeElement !== levInput) {
+        levInput.value = target || "";
+        levInput.placeholder = s.leverage_target ? String(s.leverage_target) : "100";
+      }
       const proxyVal = (s.account && s.account.proxy) || "";
       $("proxy-now").textContent = proxyVal || "默认";
       hideEditBoxes();
@@ -1224,7 +1247,33 @@
         busy = false;
       }
     };
-    $("btn-set-leverage").onclick = () => act("leverage");
+    $("btn-set-leverage").onclick = async () => {
+      if (!selected || busy) return;
+      const n = Math.round(Number($("lev-edit") && $("lev-edit").value));
+      if (!Number.isFinite(n) || n < 1 || n > 125) {
+        setActionMsg("杠杆填 1 到 125");
+        return;
+      }
+      busy = true;
+      try {
+        const acc = await api(`/api/accounts/${selected}`, {
+          method: "PATCH",
+          body: JSON.stringify({ hedge_leverage: n }),
+        });
+        if (snapHit(selected) && snapHit(selected).data) {
+          snapHit(selected).data.account = Object.assign(snapHit(selected).data.account || {}, acc);
+          snapHit(selected).data.leverage_target = n;
+          persistFunds();
+        }
+        if ($("lev-target")) $("lev-target").textContent = String(n);
+      } catch (err) {
+        setActionMsg(err.message);
+        busy = false;
+        return;
+      }
+      busy = false;
+      act("leverage");
+    };
     $("btn-enter").onclick = () => act("enter");
     $("btn-scale").onclick = () => act("scale");
     $("btn-harvest").onclick = () => act("harvest");

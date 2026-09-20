@@ -255,33 +255,51 @@ class HedgeCycle:
         except BinanceAPIError as exc:
             return [StepResult("设置杠杆", False, str(exc))]
         applied = int(data.get("leverage") or target)
+        # 以交易所回报 / 再读一遍仓位杠杆为准，算仓不按目标虚高
+        try:
+            live = int(self.futures.current_leverage(self.symbol) or 0)
+        except Exception:
+            live = 0
+        if live > 0:
+            applied = live
         self.settings.hedge_leverage = applied
         self.leverage_cap = applied
         self.leverage_unlock_at = data.get("unlock_at")
         self.leverage_cap_changed = True
         return [StepResult("设置杠杆", True, data.get("note") or f"已设置 {applied}x")]
 
+    def _use_actual_leverage(self, legs: HedgeLegs | None = None) -> int:
+        """算仓只用交易所实际杠杆；目标倍数只用于尝试上调。"""
+        actual = int(legs.leverage) if legs and legs.leverage > 0 else 0
+        if actual <= 0:
+            try:
+                actual = int(self.futures.current_leverage(self.symbol) or 0)
+            except Exception:
+                actual = 0
+        if actual > 0:
+            self.settings.hedge_leverage = actual
+        return int(self.settings.hedge_leverage)
+
     def _prepare_account(self) -> list[StepResult]:
         steps = [self._mutate("开启双向持仓", self.futures.enable_hedge_mode)]
-        target = int(self.settings.hedge_leverage_target or self.settings.hedge_leverage)
-        known = int(self.settings.leverage_cap or 0)
-        if known <= 0:
-            try:
-                known = self.futures.current_leverage(self.symbol)
-            except Exception:
-                known = 0
-        if known <= 0:
-            known = 5
-        self.settings.hedge_leverage = min(target, known)
-        if self.settings.hedge_leverage < target:
+        steps.extend(self.apply_leverage())
+        applied = self._use_actual_leverage()
+        target = int(self.settings.hedge_leverage_target or applied)
+        if applied < target:
             steps.append(
                 StepResult(
                     "杠杆",
                     True,
-                    f"入场按 {self.settings.hedge_leverage}x 算仓。要调高请用设置里的「设置杠杆」",
+                    f"实际 {applied}x（目标 {target}x），按实际倍数算仓。解禁后再点「设置杠杆」上调",
                 )
             )
         return steps
+
+    def _open_maker_room(self) -> tuple[int, float]:
+        """入场、加仓、补仓同一套：先挂约 6 秒，不成交再市价。"""
+        tries = max(6, self._limit_tries() + 2)
+        wait = max(0.8, min(1.2, float(self.settings.quote_refresh_seconds or 1)))
+        return tries, wait
 
     def _ensure_hedge(self) -> list[StepResult]:
         if self.settings.dry_run:
@@ -446,8 +464,7 @@ class HedgeCycle:
 
     def _quote_until_balanced(self, qty: Decimal, reduce_only: bool) -> list[StepResult]:
         steps: list[StepResult] = []
-        wait = max(0.5, min(2.0, float(self.settings.quote_refresh_seconds or 1)))
-        tries = self._limit_tries()
+        tries, wait = self._open_maker_room()
         for i in range(tries):
             legs = self.futures.legs(self.symbol)
             if legs.missing_side is None:
@@ -628,10 +645,7 @@ class HedgeCycle:
             wait = 0.6
             allow_market = False
         else:
-            # 补仓：挂单优先，给足改价次数；仍齐不了再市价
-            # 约 6 次 × 1.0s ≈ 6s maker，再市价兜底
-            tries = max(6, self._limit_tries() + 2)
-            wait = max(0.8, min(1.2, float(self.settings.quote_refresh_seconds or 1)))
+            tries, wait = self._open_maker_room()
             allow_market = True
 
         for i in range(tries):
@@ -783,12 +797,16 @@ class HedgeCycle:
             return []
         if self.settings.dry_run:
             return []
+        prep = self.apply_leverage()
+        if any(not step.ok for step in prep):
+            return prep
         legs = self.futures.legs(self.symbol)
+        self._use_actual_leverage(legs)
         if legs.missing_side is not None:
-            return []
+            return prep
         current = min(legs.long_qty, legs.short_qty)
         if current <= 0:
-            return []
+            return prep
         bid, ask = self.futures.book(self.symbol)
         mid = (bid + ask) / 2
         _, step = self.futures.filters(self.symbol)
@@ -800,7 +818,7 @@ class HedgeCycle:
         mmr = risk.get("uni_mmr") or Decimal("0")
         available = risk.get("available")
         if not is_mmr_sentinel(mmr) and mmr < self.settings.min_uni_mmr:
-            return [
+            return prep + [
                 StepResult(
                     "暂不加仓",
                     True,
@@ -821,7 +839,7 @@ class HedgeCycle:
         min_add = max(step, current * self.settings.scale_min_add_pct)
         if add < min_add:
             mmr_text = plan.get("uni_mmr") or fmt_amount(mmr)
-            return [
+            return prep + [
                 StepResult(
                     "仓位已满",
                     True,
@@ -837,15 +855,14 @@ class HedgeCycle:
             )
         ]
         steps.extend(self._add_both(add))
-        return steps
+        return prep + steps
 
     def _add_both(self, add: Decimal) -> list[StepResult]:
         start = self.futures.legs(self.symbol)
         goal_long = start.long_qty + add
         goal_short = start.short_qty + add
         steps: list[StepResult] = []
-        wait = max(0.5, min(2.0, float(self.settings.quote_refresh_seconds or 1)))
-        tries = self._limit_tries()
+        tries, wait = self._open_maker_room()
 
         def goals_met(legs: HedgeLegs) -> bool:
             return legs.long_qty >= goal_long and legs.short_qty >= goal_short

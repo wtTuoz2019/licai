@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from decimal import Decimal
 
 from .config import Settings, d, fmt_amount, is_mmr_sentinel, load_settings, settings_for_account
@@ -16,6 +18,14 @@ def _detail(value) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _sizing_settings(settings: Settings, legs) -> Settings:
+    """加仓/入场预览按仓位实际杠杆算，不按目标倍数虚高。"""
+    actual = int(getattr(legs, "leverage", 0) or 0)
+    if actual > 0 and actual != int(settings.hedge_leverage or 0):
+        return replace(settings, hedge_leverage=actual)
+    return settings
 
 
 def steps_payload(steps: list[StepResult]) -> list[dict]:
@@ -35,6 +45,21 @@ def format_uni_mmr(mmr: Decimal, has_pos: bool) -> str:
     return fmt_amount(mmr, 4)
 
 
+def _gather(jobs: dict) -> tuple[dict, dict]:
+    if not jobs:
+        return {}, {}
+    out: dict = {}
+    errors: dict = {}
+    with ThreadPoolExecutor(max_workers=min(6, len(jobs))) as pool:
+        fut_of = {pool.submit(fn): name for name, fn in jobs.items()}
+        for fut, name in fut_of.items():
+            try:
+                out[name] = fut.result()
+            except Exception as exc:
+                errors[name] = exc
+    return out, errors
+
+
 def pipeline_for(account: Account, base: Settings | None = None, dry_run: bool = True) -> Pipeline:
     settings = settings_for_account(
         base or load_settings(),
@@ -43,6 +68,7 @@ def pipeline_for(account: Account, base: Settings | None = None, dry_run: bool =
         proxy=account.proxy,
         dry_run=dry_run,
         hedge_symbol=account.hedge_symbol,
+        hedge_leverage=account.hedge_leverage,
         leverage_cap=account.leverage_cap,
         leverage_unlock_at=account.leverage_unlock_at,
         take_profit_usdt=account.take_profit_usdt,
@@ -164,7 +190,7 @@ class OpsService:
         mmr_text = format_uni_mmr(mmr, legs.long_qty > 0 or legs.short_qty > 0)
         lev = int(legs.leverage or settings.hedge_leverage)
         plan = position_plan(
-            settings,
+            _sizing_settings(settings, legs),
             stability.mid,
             coll,
             legs,
@@ -176,6 +202,7 @@ class OpsService:
             "ok": True,
             "account": account.public_dict(),
             "leverage": lev,
+            "leverage_target": int(settings.hedge_leverage_target or settings.hedge_leverage),
             "uni_mmr": mmr_text,
             "live_poll_seconds": int(settings.live_poll_seconds),
             "auto_harvest_seconds": int(getattr(settings, "auto_harvest_seconds", 45) or 45),
@@ -218,14 +245,20 @@ class OpsService:
             return {**base, "ok": False, "error": str(exc)}
         settings = pipe.settings
         futures = pipe.futures
-        ip = exit_ip(pipe.client)
-        base["exit_ip"] = ip
+        fetched, errs = _gather(
+            {
+                "wallet": pipe.wallet_view,
+                "legs": lambda: futures.legs(settings.hedge_symbol),
+                "risk": lambda: self._risk_for(account, futures, refresh=True),
+                "stability": lambda: price_stability(futures, settings),
+                "filters": lambda: futures.filters(settings.hedge_symbol),
+            }
+        )
+        base["exit_ip"] = exit_ip(pipe.client, force=False)
         base["schedule"] = schedule_hint(settings)
-        earn_error = ""
-        try:
-            wallet = pipe.wallet_view()
-        except Exception as exc:
-            earn_error = str(exc)
+        earn_error = str(errs["wallet"]) if "wallet" in errs else ""
+        wallet = fetched.get("wallet")
+        if not isinstance(wallet, dict):
             wallet = {
                 "spot_usdt": "0",
                 "usdt_flexible": "0",
@@ -233,29 +266,26 @@ class OpsService:
                 "earn_total": "0",
                 "holdings": [],
                 "next_buy": None,
-                "status": str(exc),
+                "status": earn_error,
             }
+        if "legs" in errs:
+            return {**base, "ok": False, "error": str(errs["legs"])}
+        if "stability" in errs:
+            return {**base, "ok": False, "error": f"价格监控失败: {errs['stability']}"}
+        legs = fetched["legs"]
+        risk = fetched.get("risk") or {"uni_mmr": Decimal("0"), "equity": Decimal("0"), "available": Decimal("0")}
+        stability = fetched["stability"]
         spot_usdt = d(wallet.get("spot_usdt") or "0")
         collateral = d(wallet.get("earn_total") or "0") + spot_usdt
-        try:
-            legs = futures.legs(settings.hedge_symbol)
-        except Exception as exc:
-            return {**base, "ok": False, "error": str(exc)}
-        risk = self._risk_for(account, futures, refresh=True)
         mmr = risk.get("uni_mmr") or Decimal("0")
-        try:
-            stability = price_stability(futures, settings)
-        except Exception as exc:
-            return {**base, "ok": False, "error": f"价格监控失败: {exc}"}
+        equity = risk.get("equity") or Decimal("0")
         last_harvest = self.store.last_ok_action_at(account.id, "harvest")
         fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
         advice = harvest_advice(legs, stability, settings, last_harvest, principal=collateral, fee=fee)
-        try:
-            _, step = futures.filters(settings.hedge_symbol)
-        except Exception:
-            step = Decimal("0.001")
+        filters = fetched.get("filters")
+        step = filters[1] if isinstance(filters, tuple) and len(filters) > 1 else Decimal("0.001")
         plan = position_plan(
-            settings,
+            _sizing_settings(settings, legs),
             stability.mid,
             collateral,
             legs,
@@ -265,11 +295,11 @@ class OpsService:
         )
         enter = enter_advice(legs, stability, spot_usdt, plan)
         try:
-            switch = pipe.switch_advice()
+            switch = pipe.switch_advice(mmr=mmr, equity=equity)
         except Exception as exc:
             switch = {"needed": False, "can_click": False, "reason": str(exc)}
         try:
-            margin = pipe.margin_status()
+            margin = pipe.margin_status(equity=equity)
         except Exception as exc:
             margin = {"equity": "0", "need_move": False, "can_click": False, "summary": str(exc), "rows": []}
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
@@ -281,6 +311,7 @@ class OpsService:
             "error": earn_error,
             "symbol": settings.hedge_symbol,
             "leverage": lev,
+            "leverage_target": int(settings.hedge_leverage_target or settings.hedge_leverage),
             "live_poll_seconds": int(settings.live_poll_seconds),
             "collateral_usdt": fmt_amount(collateral, 4),
             "spot_usdt": wallet.get("spot_usdt") or fmt_amount(spot_usdt, 4),

@@ -20,6 +20,7 @@ class Account:
     proxy: str | None
     hedge_symbol: str
     created_at: str
+    hedge_leverage: int | None = None
     leverage_cap: int | None = None
     leverage_unlock_at: str | None = None
     take_profit_usdt: float | None = None
@@ -34,6 +35,7 @@ class Account:
             "proxy": self.proxy or "",
             "proxy_enabled": bool(self.proxy),
             "hedge_symbol": self.hedge_symbol,
+            "hedge_leverage": self.hedge_leverage,
             "created_at": self.created_at,
             "leverage_cap": self.leverage_cap,
             "leverage_unlock_at": self.leverage_unlock_at or "",
@@ -114,6 +116,8 @@ class AccountStore:
                 conn.execute("ALTER TABLE accounts ADD COLUMN take_profit_custom INTEGER NOT NULL DEFAULT 0")
             if "auto_harvest" not in cols:
                 conn.execute("ALTER TABLE accounts ADD COLUMN auto_harvest INTEGER NOT NULL DEFAULT 0")
+            if "hedge_leverage" not in cols:
+                conn.execute("ALTER TABLE accounts ADD COLUMN hedge_leverage INTEGER")
 
     def list_accounts(self) -> list[Account]:
         with self._connect() as conn:
@@ -150,6 +154,8 @@ class AccountStore:
         take_profit_usdt: float | None = None,
         take_profit_custom: bool | None = None,
         auto_harvest: bool | None = None,
+        hedge_leverage: int | None = None,
+        hedge_leverage_set: bool = False,
     ) -> Account:
         account = self.get(account_id)
         next_name = name.strip() if name is not None else account.name
@@ -175,9 +181,12 @@ class AccountStore:
         elif take_profit_custom is True and account.take_profit_usdt:
             next_custom = True
         next_auto = account.auto_harvest if auto_harvest is None else bool(auto_harvest)
+        next_lev = account.hedge_leverage
+        if hedge_leverage_set:
+            next_lev = int(hedge_leverage) if hedge_leverage and int(hedge_leverage) > 0 else None
         with self._connect() as conn:
             conn.execute(
-                "UPDATE accounts SET name = ?, api_key = ?, api_secret = ?, proxy = ?, hedge_symbol = ?, take_profit_usdt = ?, take_profit_custom = ?, auto_harvest = ? WHERE id = ?",
+                "UPDATE accounts SET name = ?, api_key = ?, api_secret = ?, proxy = ?, hedge_symbol = ?, take_profit_usdt = ?, take_profit_custom = ?, auto_harvest = ?, hedge_leverage = ? WHERE id = ?",
                 (
                     next_name,
                     next_key,
@@ -187,6 +196,7 @@ class AccountStore:
                     str(next_tp) if next_tp else None,
                     1 if next_custom else 0,
                     1 if next_auto else 0,
+                    next_lev,
                     account_id,
                 ),
             )
@@ -255,6 +265,8 @@ class AccountStore:
         if not custom and tp is not None:
             custom = True
         raw_auto = row["auto_harvest"] if "auto_harvest" in keys else None
+        raw_lev = row["hedge_leverage"] if "hedge_leverage" in keys else None
+        lev = int(raw_lev) if raw_lev else None
         return Account(
             id=int(row["id"]),
             name=row["name"],
@@ -263,6 +275,7 @@ class AccountStore:
             proxy=row["proxy"],
             hedge_symbol=str(row["hedge_symbol"] or "ETHUSDT"),
             created_at=row["created_at"],
+            hedge_leverage=lev if lev and lev > 0 else None,
             leverage_cap=int(cap) if cap else None,
             leverage_unlock_at=str(unlock) if unlock else None,
             take_profit_usdt=tp,

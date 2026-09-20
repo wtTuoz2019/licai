@@ -45,7 +45,7 @@ hedge_symbols:
   - BTCUSDT
   - SOLUSDT
   - BNBUSDT
-hedge_leverage: 100
+hedge_leverage: 100          # 目标杠杆。入场/加仓会尝试提到这个倍数；算仓始终以交易所实际杠杆为准。每个账号可在设置里改
 hedge_qty: 0                 # 0 表示按理财保证金自动算仓位，并随理财仓位变大加仓
 hedge_margin_use_pct: 0.85   # 低杠杆最多用到 85% 保证金；100x 仍按 40/杠杆 ≈ 40%，留给平仓补仓的单边窗口
 min_uni_mmr: 2               # uniMMR=权益/维持保证金，越大越安全；爆仓约 1.05，低于 2 不加仓

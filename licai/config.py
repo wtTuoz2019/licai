@@ -225,19 +225,23 @@ def settings_for_account(
     proxy: str | None,
     dry_run: bool,
     hedge_symbol: str | None = None,
+    hedge_leverage: int | None = None,
     leverage_cap: int | None = None,
     leverage_unlock_at: str | None = None,
     take_profit_usdt: float | None = None,
     take_profit_custom: bool = False,
 ) -> Settings:
     symbol = normalize_hedge_symbol(hedge_symbol or base.hedge_symbol, base.hedge_symbols)
-    target = int(base.hedge_leverage_target or base.hedge_leverage)
+    target = int(hedge_leverage or base.hedge_leverage_target or base.hedge_leverage)
+    if target < 1:
+        target = int(base.hedge_leverage_target or base.hedge_leverage or 1)
     effective = target
+    # 目标倍数用于尝试上调；有仓时算仓以交易所实际杠杆为准（ops/cycle 会覆盖）。
+    # 仅在交易所明确限时（有未到期的解禁时间）时，预览按上限压一档。
     cap = int(leverage_cap) if leverage_cap else 0
-    if cap > 0:
-        unlock = _unlock_dt(leverage_unlock_at)
-        if unlock is None or datetime.now(timezone.utc) < unlock:
-            effective = min(target, cap)
+    unlock = _unlock_dt(leverage_unlock_at)
+    if cap > 0 and unlock is not None and datetime.now(timezone.utc) < unlock:
+        effective = min(target, cap)
     custom_tp = Decimal("0")
     if take_profit_custom and take_profit_usdt:
         custom_tp = d(take_profit_usdt)

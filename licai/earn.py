@@ -80,16 +80,6 @@ def _latest_day_totals(flex_rows: list, bfusd_rows: list) -> tuple[Decimal, Deci
     return flex, bfusd, flex + bfusd
 
 
-def _debug_rows(raw: object, rows: list) -> dict:
-    sample = rows[0] if rows else None
-    return {
-        "n": len(rows or []),
-        "total": (raw.get("total") if isinstance(raw, dict) else None),
-        "keys": sorted(sample.keys()) if isinstance(sample, dict) else None,
-        "sample": sample,
-    }
-
-
 @dataclass
 class FlexibleProduct:
     product_id: str
@@ -336,10 +326,6 @@ class EarnAPI:
         flex_rows: list = []
         bfusd_rows: list = []
         errors: list[str] = []
-        debug: dict[str, object] = {
-            "window": [start_ms, end_ms],
-            "window30": [start30, end_ms],
-        }
 
         def _pull_flex(start: int, end: int) -> list:
             out_rows: list = []
@@ -364,7 +350,7 @@ class EarnAPI:
                     errors.append(f"flex/{typ}: {exc}")
             return out_rows
 
-        def _pull_bfusd(start: int, end: int) -> tuple[list, object]:
+        def _pull_bfusd(start: int, end: int) -> list:
             try:
                 data = self.client.signed(
                     "GET",
@@ -372,21 +358,16 @@ class EarnAPI:
                     {"startTime": start, "endTime": end, "size": 100, "current": 1},
                 )
                 rows = data.get("rows") if isinstance(data, dict) else []
-                return (rows if isinstance(rows, list) else []), data
+                return rows if isinstance(rows, list) else []
             except BinanceAPIError as exc:
                 errors.append(f"bfusd: {exc}")
-                return [], {"error": str(exc)}
+                return []
 
         flex_rows = _pull_flex(start_ms, end_ms)
-        bfusd_rows, bfusd_raw = _pull_bfusd(start_ms, end_ms)
-        debug["bfusd_3d"] = _debug_rows(bfusd_raw, bfusd_rows)
-        debug["flex_3d_n"] = len(flex_rows)
-
+        bfusd_rows = _pull_bfusd(start_ms, end_ms)
         if not flex_rows and not bfusd_rows:
             flex_rows = _pull_flex(start30, end_ms)
-            bfusd_rows, bfusd_raw = _pull_bfusd(start30, end_ms)
-            debug["bfusd_30d"] = _debug_rows(bfusd_raw, bfusd_rows)
-            debug["flex_30d_n"] = len(flex_rows)
+            bfusd_rows = _pull_bfusd(start30, end_ms)
 
         # 兜底：资金分红里可能有 BFUSD/USDT 利息入账
         dividend_rows: list = []
@@ -400,19 +381,16 @@ class EarnAPI:
                 rows = data.get("rows") if isinstance(data, dict) else []
                 if isinstance(rows, list):
                     dividend_rows.extend(rows)
-                debug[f"dividend_{asset}"] = _debug_rows(data, rows if isinstance(rows, list) else [])
             except BinanceAPIError as exc:
                 errors.append(f"dividend/{asset}: {exc}")
 
         flex, bfusd, total = _latest_day_totals(flex_rows, bfusd_rows)
         if total <= 0 and dividend_rows:
-            # 分红记录字段多为 amount；按最近一天汇总
             div_amt = _rewards_by_day(dividend_rows)
             if div_amt:
                 latest = max(div_amt)
                 total = div_amt[latest]
                 bfusd = total
-                debug["dividend_used_day"] = latest
 
         source = "records" if total > 0 else ("error" if errors and not flex_rows and not bfusd_rows else "none")
         out = {
@@ -422,32 +400,6 @@ class EarnAPI:
             "source": source,
             "text": fmt_amount(total, 4) if total > 0 else "0",
             "errors": errors[:6],
-            "debug": debug,
         }
-        try:
-            from pathlib import Path
-
-            path = Path("logs/earn_reward_debug.json")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                __import__("json").dumps(
-                    {
-                        "at": datetime.now(timezone.utc).isoformat(),
-                        "amount": str(total),
-                        "source": source,
-                        "errors": errors,
-                        "debug": debug,
-                        "sample_bfusd": (bfusd_rows[:2] if bfusd_rows else []),
-                        "sample_flex": (flex_rows[:2] if flex_rows else []),
-                        "sample_div": (dividend_rows[:2] if dividend_rows else []),
-                    },
-                    ensure_ascii=False,
-                    default=str,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
         _YDAY_REWARD_CACHE[key] = (now, out)
         return out
