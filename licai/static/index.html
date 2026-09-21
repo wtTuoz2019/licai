@@ -1181,10 +1181,14 @@
       const live = (snapHit(selected) && snapHit(selected).data) || {};
       const unstable = !((live.stability || {}).stable);
       const payload = { action, force: false, mode: null };
-      if (action === "enter" && (live.legs || {}).missing) {
+      if (action === "enter" && ["LONG", "SHORT", "IMBALANCE"].includes((live.legs || {}).missing)) {
+        const miss = (live.legs || {}).missing;
         const ok = await confirmAction({
           title: "对冲缺口",
-          body: "现在是单边仓。另一边先挂单 3 次，不成交再市价。",
+          body:
+            miss === "IMBALANCE"
+              ? "多空数量不一致。会先挂单补齐，不成交再市价。"
+              : `现在缺 ${miss === "LONG" ? "多仓" : "空仓"}。会先挂单补齐，不成交再市价。`,
           okText: "补齐对冲",
           danger: true,
         });
