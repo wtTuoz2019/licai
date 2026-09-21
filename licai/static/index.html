@@ -297,13 +297,15 @@
         <input name="api_secret" required type="password" autocomplete="off" />
         <label>代理</label>
         <input name="proxy" placeholder="http://user:pass@ip:port" />
-        <label>套保币对</label>
-        <select name="hedge_symbol" id="add-symbol">
-          <option value="ETHUSDT" selected>ETHUSDT</option>
-          <option value="BTCUSDT">BTCUSDT</option>
-          <option value="SOLUSDT">SOLUSDT</option>
-          <option value="BNBUSDT">BNBUSDT</option>
+        <label>① 结算币（默认 USDT）</label>
+        <select id="add-settle">
+          <option value="USDT" selected>USDT（默认）</option>
+          <option value="USDC">USDC</option>
         </select>
+        <label>② 代币</label>
+        <select id="add-base"></select>
+        <input type="hidden" name="hedge_symbol" id="add-symbol" value="ETHUSDT" />
+        <p class="muted" id="add-symbol-preview">将使用 ETHUSDT</p>
         <div class="row">
           <button type="button" id="btn-cancel-add">取消</button>
           <button class="primary" type="submit">确认添加</button>
@@ -386,13 +388,19 @@
           <div class="row">
             <button type="button" id="btn-set-leverage">设置杠杆</button>
             <input id="lev-edit" type="number" min="1" max="125" step="1" placeholder="100" title="目标杠杆：尝试提到这个倍数；算仓用实际倍数" />
-            <button type="button" id="btn-edit-symbol">修改币对</button>
+            <button type="button" id="btn-edit-symbol">切换套保</button>
             <button type="button" id="btn-edit-proxy">修改代理</button>
             <button type="button" id="btn-delete">解绑</button>
           </div>
           <div id="edit-symbol-box" class="edit-box" hidden>
-            <label>套保币对</label>
-            <select id="symbol-edit"></select>
+            <label>① 结算币（默认 USDT，可切 USDC）</label>
+            <select id="settle-edit">
+              <option value="USDT">USDT（默认）</option>
+              <option value="USDC">USDC</option>
+            </select>
+            <label>② 代币</label>
+            <select id="base-edit"></select>
+            <p class="muted" id="symbol-preview">将使用 ETHUSDT</p>
             <div class="row">
               <button type="button" id="btn-cancel-symbol">取消</button>
               <button type="button" id="btn-save-symbol" class="primary">保存</button>
@@ -433,7 +441,8 @@
     let timer = null;
     let busy = false;
     let lastSymbol = "ETHUSDT";
-    let hedgeSymbols = ["ETHUSDT", "BTCUSDT", "ETHUSDC", "BTCUSDC", "SOLUSDT", "BNBUSDT"];
+    const DEFAULT_HEDGE_SYMBOLS = ["ETHUSDT", "BTCUSDT", "ETHUSDC", "BTCUSDC", "SOLUSDT", "BNBUSDT"];
+    let hedgeSymbols = DEFAULT_HEDGE_SYMBOLS.slice();
     const snapCache = {};
     const SNAP_TTL = 24 * 60 * 60 * 1000;
     const FUNDS_STORE = "licai_funds_cache_v1";
@@ -441,6 +450,15 @@
     let liveAt = 0;
     let lastSeenEventId = 0;
     const $ = (id) => document.getElementById(id);
+
+    function mergeHedgeSymbols(list) {
+      const out = [];
+      [...(list || []), ...DEFAULT_HEDGE_SYMBOLS].forEach((s) => {
+        const u = String(s || "").toUpperCase();
+        if (u && !out.includes(u)) out.push(u);
+      });
+      return out.length ? out : DEFAULT_HEDGE_SYMBOLS.slice();
+    }
 
     function cacheId(id) {
       return String(id);
@@ -580,16 +598,88 @@
       el.textContent = [ageText(hit && hit.at, "资金"), ageText(liveAt, "仓位")].filter(Boolean).join(" · ");
     }
 
-    function fillSymbolSelect(el, current) {
+    function parseHedgeSymbol(sym) {
+      const s = String(sym || "ETHUSDT").toUpperCase();
+      for (const q of ["USDC", "FDUSD", "BUSD", "USDT"]) {
+        if (s.endsWith(q) && s.length > q.length) {
+          return { base: s.slice(0, -q.length), settle: q };
+        }
+      }
+      return { base: "ETH", settle: "USDT" };
+    }
+
+    function composeHedgeSymbol(base, settle) {
+      return String(base || "ETH").toUpperCase() + String(settle || "USDT").toUpperCase();
+    }
+
+    function settlesAvailable() {
+      // 结算币固定两档，不单靠接口列表（旧进程可能还没带上 USDC 币对）
+      return ["USDT", "USDC"];
+    }
+
+    function basesForSettle(settle) {
+      const q = String(settle || "USDT").toUpperCase();
+      const bases = [];
+      hedgeSymbols.forEach((sym) => {
+        const p = parseHedgeSymbol(sym);
+        if (p.settle === q && !bases.includes(p.base)) bases.push(p.base);
+      });
+      if (bases.length) return bases;
+      return q === "USDC" ? ["ETH", "BTC"] : ["ETH"];
+    }
+
+    function fillSelect(el, values, current, labels) {
       if (!el) return;
       el.innerHTML = "";
-      hedgeSymbols.forEach((sym) => {
+      values.forEach((v) => {
         const opt = document.createElement("option");
-        opt.value = sym;
-        opt.textContent = sym;
-        if (sym === current) opt.selected = true;
+        opt.value = v;
+        opt.textContent = (labels && labels[v]) || v;
+        if (v === current) opt.selected = true;
         el.appendChild(opt);
       });
+      if (current && !values.includes(current) && values.length) el.value = values[0];
+    }
+
+    function syncHedgePickers(settleEl, baseEl, previewEl, hiddenEl, currentSym) {
+      const parsed = parseHedgeSymbol(currentSym || "ETHUSDT");
+      const settles = settlesAvailable();
+      let settle = parsed.settle;
+      if (!settles.includes(settle)) settle = settles.includes("USDT") ? "USDT" : settles[0];
+      fillSelect(settleEl, settles, settle, {
+        USDT: "USDT（默认）",
+        USDC: "USDC",
+      });
+      const bases = basesForSettle(settleEl.value);
+      let base = parsed.base;
+      if (!bases.includes(base)) base = bases[0];
+      fillSelect(baseEl, bases, base);
+      const sym = composeHedgeSymbol(baseEl.value, settleEl.value);
+      if (hiddenEl) hiddenEl.value = sym;
+      if (previewEl) previewEl.textContent = "将使用 " + sym;
+      return sym;
+    }
+
+    function bindHedgePickers(settleId, baseId, previewId, hiddenId) {
+      const settleEl = $(settleId);
+      const baseEl = $(baseId);
+      const previewEl = previewId ? $(previewId) : null;
+      const hiddenEl = hiddenId ? $(hiddenId) : null;
+      if (!settleEl || !baseEl) return;
+      const refresh = () => {
+        const bases = basesForSettle(settleEl.value);
+        const keep = bases.includes(baseEl.value) ? baseEl.value : bases[0];
+        fillSelect(baseEl, bases, keep);
+        const sym = composeHedgeSymbol(baseEl.value, settleEl.value);
+        if (hiddenEl) hiddenEl.value = sym;
+        if (previewEl) previewEl.textContent = "将使用 " + sym;
+      };
+      settleEl.onchange = refresh;
+      baseEl.onchange = refresh;
+    }
+
+    function currentEditSymbol() {
+      return composeHedgeSymbol($("base-edit").value, $("settle-edit").value);
     }
 
     function toNum(v) {
@@ -657,15 +747,17 @@
 
     async function loadAccounts() {
       const data = await api("/api/accounts");
-      if (data.hedge_symbols && data.hedge_symbols.length) hedgeSymbols = data.hedge_symbols;
+      if (data.hedge_symbols && data.hedge_symbols.length) hedgeSymbols = mergeHedgeSymbols(data.hedge_symbols);
       if (data.live_poll_seconds) pollMs = Number(data.live_poll_seconds) * 1000;
-      fillSymbolSelect($("add-symbol"), "ETHUSDT");
+      syncHedgePickers($("add-settle"), $("add-base"), $("add-symbol-preview"), $("add-symbol"), $("add-symbol").value || "ETHUSDT");
       const box = $("accounts");
       box.innerHTML = "";
       data.accounts.forEach((a) => {
         const btn = document.createElement("button");
         btn.className = "acct" + (selected === a.id ? " active" : "");
-        btn.innerHTML = `<b>${esc(a.name)}</b><div class="muted">${esc(a.hedge_symbol || "ETHUSDT")}</div>`;
+        const sym = a.hedge_symbol || "ETHUSDT";
+        const p = parseHedgeSymbol(sym);
+        btn.innerHTML = `<b>${esc(a.name)}</b><div class="muted">${esc(p.settle)} · ${esc(p.base)}</div>`;
         btn.onclick = () => selectAccount(a.id);
         box.appendChild(btn);
       });
@@ -858,10 +950,11 @@
       const settleChip = $("settle-chip");
       const settleEl = $("settle-asset");
       if (settleChip && settleEl) {
-        const settle = s.settle_asset || "";
+        const settle = s.settle_asset || parseHedgeSymbol(s.symbol).settle;
         settleEl.textContent = settle || "";
-        settleChip.hidden = !(settle && settle !== "USDT");
-      }      $("lev").textContent = s.leverage || "-";
+        settleChip.hidden = !settle;
+      }
+      $("lev").textContent = s.leverage || "-";
       const levAct = $("lev-actual");
       if (levAct) levAct.textContent = s.leverage || "-";
       const levTgt = $("lev-target");
@@ -892,9 +985,10 @@
       $("btn-switch").disabled = !sw.can_click;
       $("btn-switch").title = sw.reason || "";
       $("proxy-edit").value = (s.account && s.account.proxy) || "";
-      if (s.hedge_symbols && s.hedge_symbols.length) hedgeSymbols = s.hedge_symbols;
-      fillSymbolSelect($("symbol-edit"), (s.account && s.account.hedge_symbol) || s.symbol || "ETHUSDT");
-      lastSymbol = $("symbol-edit").value;
+      if (s.hedge_symbols && s.hedge_symbols.length) hedgeSymbols = mergeHedgeSymbols(s.hedge_symbols);
+      const curSym = (s.account && s.account.hedge_symbol) || s.symbol || "ETHUSDT";
+      syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, curSym);
+      lastSymbol = curSym;
       fillEvents(s.events || []);
       if ((s.events || []).length) {
         lastSeenEventId = Math.max(lastSeenEventId, Number(s.events[0].id) || 0);
@@ -938,7 +1032,15 @@
           $("btn-harvest").disabled = true;
           $("btn-scale").disabled = true;
           $("btn-switch").disabled = true;
-          if (s.account) fillSymbolSelect($("symbol-edit"), s.account.hedge_symbol || "ETHUSDT");
+          if (s.account) {
+            syncHedgePickers(
+              $("settle-edit"),
+              $("base-edit"),
+              $("symbol-preview"),
+              null,
+              s.account.hedge_symbol || "ETHUSDT"
+            );
+          }
           showSnapAge();
           return;
         }
@@ -1085,11 +1187,14 @@
     $("add-form").addEventListener("submit", async (e) => {
       e.preventDefault();
       if (busy) return;
+      const sym = composeHedgeSymbol($("add-base").value, $("add-settle").value);
+      $("add-symbol").value = sym;
       const fd = new FormData(e.target);
       const body = Object.fromEntries(fd.entries());
+      body.hedge_symbol = sym;
       const ok = await confirmAction({
         title: "绑定账号",
-        body: body.name || "",
+        body: `${body.name || ""} · ${$("add-settle").value} 结算 · ${$("add-base").value} → ${sym}`,
         okText: "确认",
       });
       if (!ok) return;
@@ -1097,6 +1202,7 @@
       try {
         const created = await api("/api/accounts", { method: "POST", body: JSON.stringify(body) });
         e.target.reset();
+        syncHedgePickers($("add-settle"), $("add-base"), $("add-symbol-preview"), $("add-symbol"), "ETHUSDT");
         $("add-form").hidden = true;
         await loadAccounts();
         hideModal();
@@ -1117,11 +1223,13 @@
     };
     $("btn-show-add").onclick = () => {
       if (busy) return;
+      syncHedgePickers($("add-settle"), $("add-base"), $("add-symbol-preview"), $("add-symbol"), "ETHUSDT");
       $("add-form").hidden = false;
       $("add-form").querySelector("input[name=name]").focus();
     };
     $("btn-cancel-add").onclick = () => {
       $("add-form").reset();
+      syncHedgePickers($("add-settle"), $("add-base"), $("add-symbol-preview"), $("add-symbol"), "ETHUSDT");
       $("add-form").hidden = true;
     };
     $("btn-settings").onclick = () => {
@@ -1133,10 +1241,11 @@
     $("btn-edit-symbol").onclick = () => {
       if (!selected || busy) return;
       $("edit-proxy-box").hidden = true;
+      syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, lastSymbol);
       $("edit-symbol-box").hidden = false;
     };
     $("btn-cancel-symbol").onclick = () => {
-      $("symbol-edit").value = lastSymbol;
+      syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, lastSymbol);
       $("edit-symbol-box").hidden = true;
     };
     $("btn-edit-proxy").onclick = () => {
@@ -1149,19 +1258,19 @@
     };
     $("btn-save-symbol").onclick = async () => {
       if (!selected || busy) return;
-      const symbol = $("symbol-edit").value;
+      const symbol = currentEditSymbol();
       if (symbol === lastSymbol) {
         $("edit-symbol-box").hidden = true;
         return;
       }
       const ok = await confirmAction({
-        title: "更换币对",
-        body: symbol,
+        title: "更换套保",
+        body: `${parseHedgeSymbol(symbol).settle} 结算 · ${parseHedgeSymbol(symbol).base} → ${symbol}`,
         okText: "确认",
         danger: true,
       });
       if (!ok) {
-        $("symbol-edit").value = lastSymbol;
+        syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, lastSymbol);
         return;
       }
       showLoading("保存中", "请稍候");
@@ -1176,7 +1285,7 @@
         await refresh({ force: true });
         setActionMsg("已保存 " + symbol);
       } catch (err) {
-        $("symbol-edit").value = lastSymbol;
+        syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, lastSymbol);
         setActionMsg(err.message);
       } finally {
         hideModal();
@@ -1338,6 +1447,8 @@
       } catch (err) {}
       location.replace("/");
     };
+    bindHedgePickers("add-settle", "add-base", "add-symbol-preview", "add-symbol");
+    bindHedgePickers("settle-edit", "base-edit", "symbol-preview", null);
     restoreFunds();
     loadAccounts();
   </script>
