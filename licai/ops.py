@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
 
-from .config import Settings, d, fmt_amount, is_mmr_sentinel, load_settings, settings_for_account
+from .config import Settings, d, fmt_amount, is_mmr_sentinel, load_settings, settings_for_account, settle_asset_of
 from .cycle import HedgeCycle, position_plan
 from .monitor import enter_advice, exit_ip, harvest_advice, price_stability, resolve_harvest_fee, schedule_hint
 from .pipeline import Pipeline, StepResult
@@ -310,6 +310,7 @@ class OpsService:
             "ok": True,
             "error": earn_error,
             "symbol": settings.hedge_symbol,
+            "settle_asset": settle_asset_of(settings.hedge_symbol),
             "leverage": lev,
             "leverage_target": int(settings.hedge_leverage_target or settings.hedge_leverage),
             "live_poll_seconds": int(settings.live_poll_seconds),

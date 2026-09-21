@@ -6,7 +6,7 @@ from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable
 
 from .client import BinanceAPIError, BinanceClient
-from .config import Settings, d, fmt_amount, is_mmr_sentinel
+from .config import Settings, d, fmt_amount, is_mmr_sentinel, settle_asset_of
 from .convert import ConvertAPI
 from .earn import EarnAPI, FlexibleProduct
 from .futures import FuturesAPI
@@ -198,23 +198,44 @@ class Pipeline:
         return eligible[0]
 
     def sweep_spot_to_earn(self) -> list[StepResult]:
+        steps: list[StepResult] = []
+        # USDC 本位收利后现货是 USDC：先换成 USDT，再走原来的理财申购
+        settle = settle_asset_of(self.settings.hedge_symbol)
+        if settle != self.settings.source_asset:
+            try:
+                free_settle = self.spot_cash(settle)
+            except BinanceAPIError as exc:
+                return [StepResult("归集理财", False, str(exc))]
+            if free_settle >= SPOT_MIN:
+                converted = self._mutate(
+                    f"兑换 {fmt_amount(free_settle)} {settle} -> {self.settings.source_asset}（再申购理财）",
+                    lambda amt=free_settle: self.convert_api.convert(settle, self.settings.source_asset, amt),
+                )
+                steps.append(converted)
+                if not converted.ok:
+                    return steps
+                if not converted.dry_run:
+                    self.earn.invalidate()
         try:
             free = self.spot_cash()
         except BinanceAPIError as exc:
-            return [StepResult("归集理财", False, str(exc))]
+            return steps + [StepResult("归集理财", False, str(exc))]
         if free < SPOT_MIN:
+            if steps:
+                steps.append(StepResult("归集理财", True, f"已换到 {self.settings.source_asset}，但可申购余额不足，跳过申购"))
+                return steps
             return [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
         product = self.pick()
         amount = self.plan_amount(product, sweep_all=True)
         if amount < SPOT_MIN:
-            return [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
-        steps = [
+            return steps + [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
+        steps.append(
             StepResult(
                 "归集理财",
                 True,
                 f"把现货 {fmt_amount(amount)} {self.settings.source_asset} 申购 {product.asset} 年化 {apr_percent(product.apr)}%",
             )
-        ]
+        )
         steps.extend(self.buy(product, amount))
         if any(not s.ok for s in steps) and product.kind == "bfusd":
             alt = self._best_usdt_flexible()
@@ -449,6 +470,9 @@ class Pipeline:
         spot = self.spot_cash("USDT")
         if spot >= SPOT_MIN:
             steps.extend(self._fund_spot_asset("USDT", spot))
+        usdc_spot = self.spot_cash("USDC")
+        if usdc_spot >= SPOT_MIN:
+            steps.extend(self._fund_spot_asset("USDC", usdc_spot))
         bfusd_spot = self.spot_cash("BFUSD")
         if bfusd_spot >= SPOT_MIN:
             steps.extend(self._fund_spot_asset("BFUSD", bfusd_spot))

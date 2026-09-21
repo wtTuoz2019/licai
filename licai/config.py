@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 
-DEFAULT_HEDGE_SYMBOLS = ["ETHUSDT", "BTCUSDT", "SOLUSDT", "BNBUSDT"]
+DEFAULT_HEDGE_SYMBOLS = ["ETHUSDT", "BTCUSDT", "ETHUSDC", "BTCUSDC", "SOLUSDT", "BNBUSDT"]
 
 
 def normalize_hedge_symbol(value: str, allowed: list[str] | None = None) -> str:
@@ -21,6 +21,15 @@ def normalize_hedge_symbol(value: str, allowed: list[str] | None = None) -> str:
     if raw not in allowed:
         raise ValueError(f"对冲币对只支持 {', '.join(allowed)}，当前是 {value or '(空)'}")
     return raw
+
+
+def settle_asset_of(symbol: str) -> str:
+    """合约结算币：ETHUSDC -> USDC，ETHUSDT -> USDT。"""
+    name = (symbol or "").upper().replace("/", "").replace("-", "").replace("_", "")
+    for quote in ("USDC", "FDUSD", "BUSD", "USDT"):
+        if name.endswith(quote):
+            return quote
+    return "USDT"
 
 
 def d(value: object, default: str = "0") -> Decimal:

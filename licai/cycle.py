@@ -4,7 +4,7 @@ import time
 from decimal import Decimal
 
 from .client import BinanceAPIError
-from .config import d, fmt_amount, is_mmr_sentinel
+from .config import d, fmt_amount, is_mmr_sentinel, settle_asset_of
 from .futures import FuturesAPI, HedgeLegs
 from .monitor import min_harvest_profit, price_stability, resolve_harvest_fee
 from .pipeline import Pipeline, StepResult
@@ -105,8 +105,8 @@ class HedgeCycle:
     """
     理财仓位当保证金，多空对冲。
 
-    一键收利：平掉浮盈腿 → 归集 → 最大可转出 USDT 转到现货 → 立刻补回对冲
-    → 现货 USDT 买理财 → 再转入统一账户当保证金。理财代币本身不抽走。
+    一键收利：平掉浮盈腿 → 归集 → 最大可转出结算币转到现货 → 立刻补回对冲
+    →（USDC 本位则先换成 USDT）现货买理财 → 再转入统一账户当保证金。理财代币本身不抽走。
     """
 
     def __init__(self, pipeline: Pipeline):
@@ -114,6 +114,7 @@ class HedgeCycle:
         self.settings = pipeline.settings
         self.futures: FuturesAPI = pipeline.futures
         self.symbol = self.settings.hedge_symbol
+        self.settle_asset = settle_asset_of(self.symbol)
         self.leverage_cap = self.settings.leverage_cap
         self.leverage_unlock_at = self.settings.leverage_unlock_at
         self.leverage_cap_changed = False
@@ -386,7 +387,7 @@ class HedgeCycle:
             StepResult(
                 "触发止盈",
                 True,
-                f"平掉 {side} 浮盈约 {fmt_amount(pnl)} USDT，归集后转到现货买理财，再补仓",
+                f"平掉 {side} 浮盈约 {fmt_amount(pnl)} {self.settle_asset}，归集后转到现货买理财，再补仓",
             )
         ]
         close_side = "SELL" if side == "LONG" else "BUY"
@@ -416,8 +417,9 @@ class HedgeCycle:
 
     def _profit_to_spot(self, realized: Decimal) -> list[StepResult]:
         steps: list[StepResult] = []
+        asset = self.settle_asset
         # 顺序保持：先转出再补仓。用短轮询等可转出，尽快进入补仓。
-        collect = self._mutate("归集统一账户 USDT", lambda: self.futures.collect_to_margin("USDT"))
+        collect = self._mutate(f"归集统一账户 {asset}", lambda: self.futures.collect_to_margin(asset))
         steps.append(collect)
         transferable = Decimal("0")
         last_err: BinanceAPIError | None = None
@@ -425,7 +427,7 @@ class HedgeCycle:
         def ready() -> bool:
             nonlocal transferable, last_err
             try:
-                transferable = self.futures.max_withdraw("USDT")
+                transferable = self.futures.max_withdraw(asset)
                 last_err = None
                 return transferable >= 1
             except BinanceAPIError as exc:
@@ -445,14 +447,14 @@ class HedgeCycle:
                 StepResult(
                     "转出现货",
                     True,
-                    f"最大可转出 {fmt_amount(transferable)} USDT，不足 1，先补仓",
+                    f"最大可转出 {fmt_amount(transferable)} {asset}，不足 1，先补仓",
                 )
             )
             return steps
         amount = transferable
         moved = self._mutate(
-            f"最大可转出 {fmt_amount(amount)} USDT 转到现货（本次浮盈约 {fmt_amount(realized)}）",
-            lambda: self.futures.unified_to_spot("USDT", amount),
+            f"最大可转出 {fmt_amount(amount)} {asset} 转到现货（本次浮盈约 {fmt_amount(realized)}）",
+            lambda: self.futures.unified_to_spot(asset, amount),
         )
         if moved.ok and not moved.dry_run:
             self.pipeline.earn.invalidate()

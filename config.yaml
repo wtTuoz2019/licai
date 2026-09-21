@@ -38,11 +38,13 @@ asset_denylist: []
 settle_seconds: 3
 
 # ---- 对冲循环 ----
-# 只建议 BTC/ETH 这种深度好的合约。默认 ETHUSDT 套保；每个账号可在操作台改。
+# 只建议 BTC/ETH 这种深度好的合约。默认 ETHUSDT；USDC 本位挂单费率常更低，收利后会先换成 USDT 再买理财。
 hedge_symbol: ETHUSDT
 hedge_symbols:
   - ETHUSDT
   - BTCUSDT
+  - ETHUSDC
+  - BTCUSDC
   - SOLUSDT
   - BNBUSDT
 hedge_leverage: 100          # 目标杠杆。入场/加仓会尝试提到这个倍数；算仓始终以交易所实际杠杆为准。每个账号可在设置里改
