@@ -38,7 +38,7 @@ asset_denylist: []
 settle_seconds: 3
 
 # ---- 对冲循环 ----
-# 只建议 BTC/ETH 这种深度好的合约。默认 ETHUSDT；USDC 本位挂单费率常更低，收利后会先换成 USDT 再买理财。
+# 套保：按百分比/名义配置，BTC/ETH/SOL 等各币对通用（默认 ETHUSDT）
 hedge_symbol: ETHUSDT
 hedge_symbols:
   - ETHUSDT
@@ -52,11 +52,12 @@ hedge_qty: 0                 # 0 表示按理财保证金自动算仓位，并�
 hedge_margin_use_pct: 0.85   # 低杠杆最多用到 85% 保证金；100x 仍按 40/杠杆 ≈ 40%，留给平仓补仓的单边窗口
 min_uni_mmr: 2               # uniMMR=权益/维持保证金，越大越安全；爆仓约 1.05，低于 2 不加仓
 scale_min_add_pct: 0.03      # 目标仓位比当前大 3% 以上才两边一起加
-# 收利门槛按单边仓位名义本金算，不再固定 5 USDT。账号里保存过自定义值才锁定
+# 收利门槛按单边仓位名义本金算，不再固定绝对值。账号里保存过自定义值才锁定
 take_profit_usdt: 0
-maker_only: false            # 入场/加仓仍可市价兜底；收利平仓固定只挂 GTX
-quote_refresh_seconds: 3     # 补仓每次挂单等待上限参考（秒），实际约 0.8–1.2s 一轮改价
-hedge_quote_retries: 4       # 入场限价重试基数；平仓约×2、补仓+2 次挂单后再市价
+maker_only: false            # 入场/加仓仍可市价兜底；收利平仓固定只挂 GTX；补仓先长挂再市价
+quote_refresh_seconds: 2     # 每轮挂单约 1–1.5s 改价
+hedge_quote_retries: 8       # 挂单轮数：入场/补仓约 12+，平仓更长
+maker_improve_bps: 1         # 相对现价最多让利 1bp（各币通用）；再受价差限制，仍留 1 档不吃单
 watch_seconds: 60            # 命令行盯盘间隔
 live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
 auto_harvest_seconds: 45     # 开启「自动收利」后后台检查间隔
@@ -68,11 +69,12 @@ maker_fee_rate: 0.0002
 taker_fee_rate: 0.0005
 min_profit_fee_multiple: 8   # 自动门槛：浮盈至少覆盖约 8 倍手续费
 harvest_principal_pct: 0.01  # 还没仓位时，至少为本金的 1%
-harvest_pos_pct: 0.025       # 有仓位时按单边名义本金的 2.5%：0.081 ETH × 2450 ≈ 5 USDT
+harvest_pos_pct: 0.03        # 单边名义约 3% 再收（少收几次，少磨损）
 harvest_sqrt_coeff: 0.5      # 无仓位时 0.5×√本金兜底
-harvest_min_usdt: 1          # 绝对下限
-cooldown_minutes: 10         # 两次平仓最短间隔
-stable_range_pct: 0.0025     # 15 分钟振幅低于 0.25% 视为价格平稳
+harvest_min_usdt: 1          # 绝对下限（结算币，USDT/USDC 都适用）
+cooldown_minutes: 15         # 两次平仓最短间隔
+stable_range_pct: 0.0025     # 15 分钟振幅 ≤ 0.25%（各币通用）；近 5/2 分钟按比例更严
+stable_spread_pct: 0.00025   # 盘口价差 ≤ 0.025%
 
 # 换产品：分批赎回旧仓、立刻申购更高年化。按赎回瞬间这块保证金暂时失效来估
 switch_safe_uni_mmr: 2.5     # 换产品时 uniMMR 不得低于这个（比开仓安全线更严）

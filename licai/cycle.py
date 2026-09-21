@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from .client import BinanceAPIError
 from .config import d, fmt_amount, is_mmr_sentinel, settle_asset_of
@@ -297,9 +297,21 @@ class HedgeCycle:
         return steps
 
     def _open_maker_room(self) -> tuple[int, float]:
-        """入场、加仓、补仓同一套：先挂约 6 秒，不成交再市价。"""
-        tries = max(6, self._limit_tries() + 2)
-        wait = max(0.8, min(1.2, float(self.settings.quote_refresh_seconds or 1)))
+        """入场、加仓、补仓：先挂够久，尽量 maker；不成交再市价。"""
+        tries = max(12, self._limit_tries() + 4)
+        wait = max(1.0, min(1.5, float(self.settings.quote_refresh_seconds or 1) * 0.75))
+        return tries, wait
+
+    def _close_maker_room(self) -> tuple[int, float]:
+        """平仓：只挂 GTX，追价窗口更长，绝不市价。"""
+        tries = max(20, self._limit_tries() * 3)
+        wait = 0.7
+        return tries, wait
+
+    def _refill_maker_room(self) -> tuple[int, float]:
+        """收利补仓：比普通开仓再多挂一会儿，减少吃单。"""
+        tries = max(16, self._limit_tries() + 8)
+        wait = max(1.0, min(1.6, float(self.settings.quote_refresh_seconds or 1) * 0.8))
         return tries, wait
 
     def _ensure_hedge(self) -> list[StepResult]:
@@ -577,7 +589,7 @@ class HedgeCycle:
             return steps
         bid, ask = self.futures.book(self.symbol)
         tick, step = self.futures.filters(self.symbol)
-        buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=aggressive)
+        buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=aggressive, pass_n=1 if aggressive else 0)
         qty = self.futures.round_qty(qty, step)
         if legs.long_qty > 0 and legs.short_qty > 0:
             extra = self.futures.round_qty(abs(legs.long_qty - legs.short_qty), step)
@@ -607,32 +619,75 @@ class HedgeCycle:
             )
         return steps
 
-    def _maker_prices(self, bid: Decimal, ask: Decimal, tick: Decimal, *, improve: bool = False) -> tuple[Decimal, Decimal]:
-        """挂单价必须站在盘口内侧，GTX 才不会变成吃单。"""
+    def _maker_prices(
+        self,
+        bid: Decimal,
+        ask: Decimal,
+        tick: Decimal,
+        *,
+        improve: bool = False,
+        pass_n: int = 0,
+    ) -> tuple[Decimal, Decimal]:
+        """
+        挂单价必须站在盘口内侧（买 < 卖一、卖 > 买一），GTX 才不会吃单。
+
+        让利按「现价的 bps」算，BTC/ETH/SOL 等各币对同一套比例；
+        再受价差限制（最多约 40%、且留 1 档），追价轮次越高越靠近对手价。
+        """
+        if tick <= 0:
+            tick = Decimal("0.01")
         if bid <= 0 or ask <= 0 or ask <= bid:
             mid = self.futures.round_price(max(bid, ask), tick)
             return mid, mid
-        mid = self.futures.round_price((bid + ask) / 2, tick)
-        if improve:
-            buy_px = self.futures.round_price(min(mid, ask - tick), tick)
-            sell_px = self.futures.round_price(max(mid, bid + tick), tick)
+
+        bid = self.futures.round_price(bid, tick)
+        ask = self.futures.round_price(ask, tick)
+        if ask <= bid:
+            ask = self.futures.round_price(bid + tick, tick)
+
+        mid = (bid + ask) / 2
+        spread_ticks = int(((ask - bid) / tick).to_integral_value(rounding=ROUND_DOWN))
+        room = max(0, spread_ticks - 1)
+
+        bps = d(getattr(self.settings, "maker_improve_bps", None) or "1")
+        if bps < 0:
+            bps = Decimal("0")
+        # 相对现价最多让利 bps；换算成档位，各币 tick/价格不同也能对齐
+        max_by_bps = int(((mid * bps) / Decimal("10000") / tick).to_integral_value(rounding=ROUND_DOWN))
+        max_by_spread = max(0, (spread_ticks * 2) // 5)
+        max_improve = min(max(0, max_by_bps), max_by_spread, room)
+
+        if improve or pass_n > 0:
+            if max_improve <= 0:
+                n = 0
+            else:
+                # 分约 4 步从轻到重靠拢，第一轮至少 1 档（有空间时）
+                step = max(1, (max_improve + 3) // 4)
+                n = min(max_improve, room, step * (max(0, int(pass_n)) + 1))
+                if improve and n < 1 and room >= 1:
+                    n = 1
         else:
-            buy_px = self.futures.round_price(bid, tick)
-            sell_px = self.futures.round_price(ask, tick)
-        if buy_px >= ask:
-            buy_px = self.futures.round_price(ask - tick, tick)
-        if sell_px <= bid:
-            sell_px = self.futures.round_price(bid + tick, tick)
-        if buy_px <= 0:
-            buy_px = self.futures.round_price(bid, tick)
-        if sell_px <= 0:
-            sell_px = self.futures.round_price(ask, tick)
+            n = 0
+
+        buy_px = self.futures.round_price(bid + (tick * n), tick)
+        sell_px = self.futures.round_price(ask - (tick * n), tick)
+
+        buy_ceil = self.futures.round_price(ask - tick, tick)
+        sell_floor = self.futures.round_price(bid + tick, tick)
+        if buy_px > buy_ceil:
+            buy_px = buy_ceil
+        if sell_px < sell_floor:
+            sell_px = sell_floor
+        if buy_px <= 0 or buy_px >= ask:
+            buy_px = buy_ceil if buy_ceil > 0 else bid
+        if sell_px <= 0 or sell_px <= bid:
+            sell_px = sell_floor if sell_floor > 0 else ask
         return buy_px, sell_px
 
     def _quote_side(self, order_side: str, position_side: str, qty: Decimal, reduce_only: bool) -> list[StepResult]:
         """
-        平仓(reduce_only)：只挂 GTX，绝不市价；短间隔追价直到成交或超时失败。
-        补仓：多给挂单空间（多次贴近盘口改价），仍不成交再市价，避免长时间单边。
+        平仓(reduce_only)：只挂 GTX，绝不市价；长窗口追价直到成交或超时失败。
+        补仓：更长挂单追价，仍不成交再市价，避免长时间单边。
         """
         steps: list[StepResult] = []
         done_name = f"已平 {position_side}" if reduce_only else f"已补 {position_side}"
@@ -642,12 +697,10 @@ class HedgeCycle:
             return current <= 0 if reduce_only else current > 0
 
         if reduce_only:
-            # 平仓：只挂不砸。约 12 次 × 0.6s ≈ 7s 追价窗口
-            tries = max(8, self._limit_tries() * 2)
-            wait = 0.6
+            tries, wait = self._close_maker_room()
             allow_market = False
         else:
-            tries, wait = self._open_maker_room()
+            tries, wait = self._refill_maker_room()
             allow_market = True
 
         for i in range(tries):
@@ -655,8 +708,10 @@ class HedgeCycle:
             if finished(legs):
                 steps.append(StepResult(done_name, True, self._legs_text(legs)))
                 return steps
-            # 始终贴近盘口挂；越往后同样 improve，靠撤单重挂跟盘
-            extra = self._side_pass(order_side, position_side, qty, reduce_only, market=False, aggressive=True)
+            # 始终往盘口内侧松一点挂；轮次越高越靠近对手价，仍保持 GTX
+            extra = self._side_pass(
+                order_side, position_side, qty, reduce_only, market=False, aggressive=True, pass_n=i
+            )
             steps.extend(extra)
             if any(_order_filled_hint(item) for item in extra):
                 legs = self.futures.legs(self.symbol)
@@ -676,13 +731,13 @@ class HedgeCycle:
                 StepResult(
                     f"{position_side} 未完成",
                     False,
-                    f"平仓只允许挂单，已追价 {tries} 次仍未成交，已撤单。请稍后重试或等盘口更稳。"
+                    f"平仓只允许挂单，已追价 {tries} 次仍未成交，已撤单。请等盘口更稳后再收。"
                     f" {self._legs_text(self.futures.legs(self.symbol))}",
                 )
             )
             return steps
 
-        steps.append(StepResult("挂单未齐", True, f"{position_side} 挂单 {tries} 次未完成，改市价补仓"))
+        steps.append(StepResult("挂单未齐", True, f"{position_side} 已挂单 {tries} 次未完成，改市价补仓（尽量少用）"))
         for _ in range(2):
             steps.extend(self._side_pass(order_side, position_side, qty, reduce_only, market=True, aggressive=True))
             if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=0.8):
@@ -700,19 +755,41 @@ class HedgeCycle:
         *,
         market: bool,
         aggressive: bool,
+        pass_n: int = 0,
     ) -> list[StepResult]:
-        try:
-            self.futures.cancel_open(self.symbol)
-        except BinanceAPIError:
-            pass
         bid, ask = self.futures.book(self.symbol)
         tick, step = self.futures.filters(self.symbol)
         qty = self.futures.round_qty(qty, step)
         if qty <= 0:
             return [StepResult("下单跳过", False, "数量为 0")]
-        buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=aggressive)
+        buy_px, sell_px = self._maker_prices(
+            bid, ask, tick, improve=aggressive or pass_n > 0, pass_n=pass_n
+        )
         price = buy_px if order_side == "BUY" else sell_px
-        placed = self._place(order_side, position_side, qty, price, reduce_only, market=market)
+        # 价差只有 1 档、无需让利时：用 QUEUE 贴买一/卖一（Binance 官方 BBO），心理价位更稳
+        use_queue = (not market) and buy_px == bid and sell_px == ask and (
+            (order_side == "BUY" and price == bid) or (order_side == "SELL" and price == ask)
+        )
+
+        if not market:
+            kept = self._keep_resting_maker(order_side, position_side, price, bid, ask, tick)
+            if kept is not None:
+                return [kept]
+
+        try:
+            self.futures.cancel_open(self.symbol)
+        except BinanceAPIError:
+            pass
+
+        placed = self._place(
+            order_side,
+            position_side,
+            qty,
+            price,
+            reduce_only,
+            market=market,
+            price_match="QUEUE" if use_queue else None,
+        )
         # GTX 被盘口吃掉（-5022）时立刻按新价再挂，避免空等一整轮
         if (not market) and _post_only_reject(placed):
             try:
@@ -720,11 +797,50 @@ class HedgeCycle:
             except BinanceAPIError:
                 pass
             bid, ask = self.futures.book(self.symbol)
-            buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=True)
+            buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=True, pass_n=max(pass_n, 1))
             price = buy_px if order_side == "BUY" else sell_px
             retry = self._place(order_side, position_side, qty, price, reduce_only, market=False)
             return [placed, retry]
         return [placed]
+
+    def _keep_resting_maker(
+        self,
+        order_side: str,
+        position_side: str,
+        target: Decimal,
+        bid: Decimal,
+        ask: Decimal,
+        tick: Decimal,
+    ) -> StepResult | None:
+        """盘口目标价未变时保留挂单，保住排队位置（反复撤挂会掉队）。"""
+        try:
+            opens = self.futures.um_open_orders(self.symbol)
+        except BinanceAPIError:
+            return None
+        for row in opens:
+            if str(row.get("side") or "").upper() != order_side:
+                continue
+            if str(row.get("positionSide") or "").upper() != position_side:
+                continue
+            status = str(row.get("status") or "").upper()
+            if status and status not in {"NEW", "PARTIALLY_FILLED"}:
+                continue
+            opx = d(row.get("price"))
+            if opx <= 0:
+                continue
+            # 仍必须是 maker：买价 < 卖一，卖价 > 买一
+            if order_side == "BUY" and opx >= ask:
+                continue
+            if order_side == "SELL" and opx <= bid:
+                continue
+            # 与本轮心理目标价相差不超过 1 档，继续排队
+            if abs(opx - target) <= tick:
+                return StepResult(
+                    "挂单排队",
+                    True,
+                    f"已挂未成交 {row.get('executedQty') or 0}/{row.get('origQty') or '?'} @ {fmt_amount(opx)} GTX 保留排队",
+                )
+        return None
 
     def _place(
         self,
@@ -734,6 +850,7 @@ class HedgeCycle:
         price: Decimal,
         reduce_only: bool,
         market: bool = False,
+        price_match: str | None = None,
     ) -> StepResult:
         action = "平仓" if reduce_only else "开仓"
         if qty <= 0:
@@ -742,6 +859,13 @@ class HedgeCycle:
             step = self._mutate(
                 f"{action} 市价 {side} {position_side} {fmt_amount(qty)}",
                 lambda: self.futures.place_market(self.symbol, side, position_side, qty, reduce_only),
+            )
+        elif price_match:
+            step = self._mutate(
+                f"{action} 挂单 {side} {position_side} {fmt_amount(qty)} @ {price_match}",
+                lambda: self.futures.place_maker(
+                    self.symbol, side, position_side, qty, None, reduce_only, price_match=price_match
+                ),
             )
         else:
             step = self._mutate(
@@ -877,7 +1001,7 @@ class HedgeCycle:
             self.futures.cancel_open(self.symbol)
             bid, ask = self.futures.book(self.symbol)
             tick, step = self.futures.filters(self.symbol)
-            buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=True)
+            buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=True, pass_n=i)
             if legs.long_qty < goal_long:
                 leftover = self.futures.round_qty(goal_long - legs.long_qty, step)
                 if leftover > 0:

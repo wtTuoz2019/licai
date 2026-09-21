@@ -98,29 +98,51 @@ def exit_ip(client: BinanceClient, *, force: bool = False) -> str:
 
 
 def price_stability(futures: FuturesAPI, settings: Settings) -> Stability:
+    """更严的平稳：15/5/2 分钟振幅 + 盘口价差都过，才适合挂单平仓/开仓。"""
     symbol = settings.hedge_symbol
     bid, ask = futures.book(symbol)
     mid = (bid + ask) / 2 if bid + ask > 0 else Decimal("0")
     spread_pct = (ask - bid) / mid if mid > 0 else Decimal("1")
-    rows = futures.klines(symbol, "1m", 20)
+    rows = futures.klines(symbol, "1m", 30)
     if not rows:
         return Stability(symbol, mid, spread_pct, Decimal("1"), Decimal("1"), False, "拉不到 K 线，暂不入场、也不平仓")
-    highs = [d(row[2]) for row in rows]
-    lows = [d(row[3]) for row in rows]
     last = d(rows[-1][4]) or mid
-    range_15m = (max(highs) - min(lows)) / last if last > 0 else Decimal("1")
-    last5 = rows[-5:]
-    range_5m = (max(d(row[2]) for row in last5) - min(d(row[3]) for row in last5)) / last if last > 0 else Decimal("1")
+    if last <= 0:
+        return Stability(symbol, mid, spread_pct, Decimal("1"), Decimal("1"), False, "现价异常，暂不入场、也不平仓")
+
+    def _range(slice_rows) -> Decimal:
+        if not slice_rows:
+            return Decimal("1")
+        hi = max(d(row[2]) for row in slice_rows)
+        lo = min(d(row[3]) for row in slice_rows)
+        return (hi - lo) / last
+
+    range_15m = _range(rows[-15:])
+    range_5m = _range(rows[-5:])
+    range_2m = _range(rows[-2:])
     limit = settings.stable_range_pct
-    stable = range_15m <= limit and range_5m <= (limit / 2) and spread_pct <= Decimal("0.0004")
+    limit_5m = limit * Decimal("0.45")
+    limit_2m = limit * Decimal("0.28")
+    spread_limit = getattr(settings, "stable_spread_pct", None) or Decimal("0.0003")
+    stable = (
+        range_15m <= limit
+        and range_5m <= limit_5m
+        and range_2m <= limit_2m
+        and spread_pct <= spread_limit
+    )
     if stable:
-        hint = f"价格较稳：15 分钟振幅 {_pct(range_15m)}%，盘口价差 {_pct(spread_pct)}%，适合入场或平仓"
+        hint = (
+            f"价格较稳：15 分 {_pct(range_15m)}% / 5 分 {_pct(range_5m)}% / 近 2 分 {_pct(range_2m)}%，"
+            f"价差 {_pct(spread_pct)}%，适合挂单入场或平仓"
+        )
     elif range_15m > limit:
-        hint = f"波动偏大：15 分钟振幅 {_pct(range_15m)}%，超过 {_pct(limit)}%，现在入场/平仓容易滑点、两边难一起成交"
-    elif range_5m > limit / 2:
-        hint = f"近 5 分钟还在晃：振幅 {_pct(range_5m)}%，建议再等一会儿再入场或平仓"
+        hint = f"波动偏大：15 分钟振幅 {_pct(range_15m)}%，超过 {_pct(limit)}%，挂单难成交、易滑点"
+    elif range_5m > limit_5m:
+        hint = f"近 5 分钟还在晃：振幅 {_pct(range_5m)}%，超过 {_pct(limit_5m)}%，再等一会再挂单"
+    elif range_2m > limit_2m:
+        hint = f"刚有跳动：近 2 分钟振幅 {_pct(range_2m)}%，等盘口稳住再挂单平/开"
     else:
-        hint = f"盘口偏宽：价差 {_pct(spread_pct)}%，限价不容易两边一起成交"
+        hint = f"盘口偏宽：价差 {_pct(spread_pct)}%，超过 {_pct(spread_limit)}%，限价不易两边一起成交"
     return Stability(symbol, mid, spread_pct, range_15m, range_5m, stable, hint)
 
 
@@ -318,7 +340,7 @@ def harvest_advice(
     elif not cooldown_ok:
         reason = f"距上次平仓还差 {left} 秒冷却，先别连点"
     elif not stable_ok:
-        reason = "价格不稳，可以点「一键收利」后选择强行收利"
+        reason = "价格还不够稳（近几分钟或盘口），等「平稳」再收，挂单更容易成交；也可强行收利（易吃单）"
     else:
         reason = (
             f"{winner} 浮盈 {fmt_amount(pnl, 4)}，扣完约 {fmt_amount(fee, 4)} 手续费后净利约 {fmt_amount(net, 4)}。"
@@ -347,7 +369,7 @@ def schedule_hint(settings: Settings) -> str:
     return (
         f"资金/理财一天拉一次，点「刷新」才重拉。"
         f"仓位浮盈大约每 {int(settings.live_poll_seconds)} 秒更新。"
-        f"价格 15 分钟振幅 ≤ {_pct(settings.stable_range_pct)}%、"
-        f"收利门槛按仓位名义和约 {fmt_amount(settings.min_profit_fee_multiple, 0)} 倍手续费计算、"
-        f"且距上次平仓超过 {settings.cooldown_minutes} 分钟时，再点「一键收利」。"
+        f"价格要够稳（15 分振幅 ≤ {_pct(settings.stable_range_pct)}%，近几分钟也小、盘口不宽）才挂单收利；"
+        f"收利门槛按仓位名义和约 {fmt_amount(settings.min_profit_fee_multiple, 0)} 倍手续费、"
+        f"距上次平仓超过 {settings.cooldown_minutes} 分钟。"
     )

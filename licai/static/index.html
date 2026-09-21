@@ -438,6 +438,7 @@
   </div>
   <script>
     let selected = null;
+    let loadGen = 0;
     let timer = null;
     let busy = false;
     let lastSymbol = "ETHUSDT";
@@ -462,6 +463,85 @@
 
     function cacheId(id) {
       return String(id);
+    }
+
+    function sameAccount(id) {
+      return selected != null && Number(selected) === Number(id);
+    }
+
+    function resetPanelSkeleton(account) {
+      $("empty").hidden = true;
+      $("panel").hidden = false;
+      $("error").hidden = true;
+      $("error").textContent = "";
+      $("symbol-now").textContent = (account && account.hedge_symbol) || "-";
+      const settleChip = $("settle-chip");
+      const settleEl = $("settle-asset");
+      if (settleChip && settleEl && account && account.hedge_symbol) {
+        const settle = parseHedgeSymbol(account.hedge_symbol).settle;
+        settleEl.textContent = settle;
+        settleChip.hidden = !settle;
+      } else if (settleChip) {
+        settleChip.hidden = true;
+      }
+      $("lev").textContent = "-";
+      $("mid-price").textContent = "-";
+      $("equity").textContent = "-";
+      $("earn-yesterday").textContent = "-";
+      setMmr("-");
+      $("spot").textContent = "-";
+      $("usdt-flex").textContent = "-";
+      const flexBox = $("usdt-flex-box");
+      if (flexBox) flexBox.hidden = true;
+      $("bfusd").textContent = "-";
+      $("earn-total").textContent = "-";
+      $("long-qty").textContent = "-";
+      $("short-qty").textContent = "-";
+      $("long-entry").textContent = "仓位价 -";
+      $("short-entry").textContent = "仓位价 -";
+      setPnl($("long-pnl"), NaN);
+      setPnl($("short-pnl"), NaN);
+      $("best-pnl").textContent = "-";
+      $("min-profit").textContent = "-";
+      $("fee").textContent = "-";
+      $("harvest-fill").style.width = "0%";
+      $("harvest-why").textContent = "加载中…";
+      $("btn-enter").disabled = true;
+      $("btn-harvest").disabled = true;
+      $("btn-scale").disabled = true;
+      $("btn-switch").disabled = true;
+      const pill = $("stable-pill");
+      if (pill) {
+        pill.textContent = "-";
+        pill.className = "pill wait";
+      }
+      const box = $("collateral");
+      if (box) {
+        box.hidden = true;
+        box.innerHTML = "";
+      }
+      const tbody = $("events");
+      if (tbody) tbody.innerHTML = "";
+      if (account) {
+        lastSymbol = account.hedge_symbol || lastSymbol;
+        syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, lastSymbol);
+        $("proxy-edit").value = account.proxy || "";
+        $("proxy-now").textContent = account.proxy || "默认";
+      }
+    }
+
+    function showAccountError(s, accountMeta) {
+      const acc = (s && s.account) || accountMeta || {};
+      resetPanelSkeleton(acc);
+      $("error").hidden = false;
+      let msg = (s && s.error) || "加载失败";
+      if (/Invalid API-key|IP|permissions|-2015/i.test(msg)) {
+        msg += "。此账号未放行当前出口 IP，请在币安 API 白名单加入该 IP，或给本账号绑定可用代理后再刷新。";
+      }
+      $("error").textContent = msg;
+      $("ip").textContent = (s && s.exit_ip) || "-";
+      $("proxy-mode").textContent = (s && s.proxy_mode) || (acc.proxy ? "账号代理" : "默认出口 IP");
+      $("harvest-why").textContent = "账号未就绪，仓位不会与其他账号共用";
     }
     const ACTIONS = {
       enter: { title: "一键入场", hint: "申购理财、转入保证金并开对冲。" },
@@ -754,37 +834,48 @@
       box.innerHTML = "";
       data.accounts.forEach((a) => {
         const btn = document.createElement("button");
-        btn.className = "acct" + (selected === a.id ? " active" : "");
+        btn.className = "acct" + (sameAccount(a.id) ? " active" : "");
         const sym = a.hedge_symbol || "ETHUSDT";
         const p = parseHedgeSymbol(sym);
         btn.innerHTML = `<b>${esc(a.name)}</b><div class="muted">${esc(p.settle)} · ${esc(p.base)}</div>`;
         btn.onclick = () => selectAccount(a.id);
         box.appendChild(btn);
       });
+      return data;
     }
 
     async function selectAccount(id) {
       if (busy) return;
-      selected = id;
+      const gen = ++loadGen;
+      selected = Number(id);
       lastSeenEventId = 0;
+      liveAt = 0;
       $("settings-box").hidden = true;
       hideEditBoxes();
-      await loadAccounts();
+      const list = await loadAccounts();
+      if (gen !== loadGen || !sameAccount(id)) return;
+      const meta = (list.accounts || []).find((a) => Number(a.id) === Number(id)) || null;
+
       const hit = snapHit(id);
-      if (hit) {
+      const usable = !!(hit && hit.data && hit.data.ok && hit.data.legs);
+      if (usable) {
         render(hit.data);
         showSnapAge();
+      } else {
+        resetPanelSkeleton(meta || { id: Number(id), hedge_symbol: "ETHUSDT" });
       }
+
       if (timer) clearInterval(timer);
       timer = setInterval(() => { if (!busy) pollLive(); }, pollMs);
       pollLive();
-      if (snapFresh(id)) return;
-      if (!hit) {
+      if (usable && snapFresh(id)) return;
+      if (!usable) {
         showLoading("加载资金", "请稍候");
         try {
-          await refresh({ force: false });
+          if (gen !== loadGen || !sameAccount(id)) return;
+          await refresh({ force: true });
         } finally {
-          hideModal();
+          if (gen === loadGen) hideModal();
         }
         return;
       }
@@ -792,6 +883,8 @@
     }
 
     function applyLive(s) {
+      if (!s || !sameAccount(s.account && s.account.id)) return;
+      if (s.ok === false) return;
       if (s.uni_mmr != null) setMmr(s.uni_mmr || "-");
       if (s.leverage != null) $("lev").textContent = s.leverage;
       const levAct = $("lev-actual");
@@ -909,9 +1002,17 @@
     async function pollLive() {
       if (!selected) return;
       const id = selected;
+      const gen = loadGen;
       try {
         const s = await api(`/api/accounts/${id}/monitor`);
-        if (selected !== id || !s.ok) return;
+        if (gen !== loadGen || !sameAccount(id)) return;
+        if (!s.ok) {
+          // 监控失败时不要沿用上一账号画面
+          if (!snapHit(id) || !(snapHit(id).data && snapHit(id).data.ok)) {
+            showAccountError(s, s.account);
+          }
+          return;
+        }
         liveAt = Date.now();
         applyLive(s);
         // 开了自动收利时加快轮询，便于收利后尽快刷资金
@@ -919,16 +1020,21 @@
         const nextMs = autoOn
           ? Math.max(15000, Math.min(pollMs, Number(s.auto_harvest_seconds || 45) * 1000))
           : pollMs;
-        if (timer) {
+        if (timer && gen === loadGen) {
           clearInterval(timer);
           timer = setInterval(() => { if (!busy) pollLive(); }, nextMs);
         }
       } catch (err) {
-        showSnapAge();
+        if (gen === loadGen && sameAccount(id)) showSnapAge();
       }
     }
 
     function render(s) {
+      if (!s || !sameAccount(s.account && s.account.id)) return;
+      if (s.ok === false || (s.error && !s.legs)) {
+        showAccountError(s, s.account);
+        return;
+      }
       $("empty").hidden = true;
       $("panel").hidden = false;
       $("error").hidden = !s.error;
@@ -1012,49 +1118,37 @@
     async function refresh({ force = false, silent = false } = {}) {
       if (!selected) return;
       const id = selected;
+      const gen = loadGen;
       if (!force && snapFresh(id)) {
-        render(snapHit(id).data);
-        showSnapAge();
-        return;
+        const hit = snapHit(id);
+        if (hit && hit.data && hit.data.ok !== false) {
+          render(hit.data);
+          showSnapAge();
+          return;
+        }
       }
       try {
         const s = await api(`/api/accounts/${id}/snapshot${force ? "?force=true" : ""}`);
-        if (selected !== id) return;
-        rememberSnap(id, s);
-        if (!s.ok && s.error) {
-          $("empty").hidden = true;
-          $("panel").hidden = false;
-          $("error").hidden = false;
-          $("error").textContent = s.error;
-          $("ip").textContent = s.exit_ip || "-";
-          $("proxy-mode").textContent = s.proxy_mode || "";
-          $("btn-enter").disabled = true;
-          $("btn-harvest").disabled = true;
-          $("btn-scale").disabled = true;
-          $("btn-switch").disabled = true;
-          if (s.account) {
-            syncHedgePickers(
-              $("settle-edit"),
-              $("base-edit"),
-              $("symbol-preview"),
-              null,
-              s.account.hedge_symbol || "ETHUSDT"
-            );
-          }
-          showSnapAge();
+        if (gen !== loadGen || !sameAccount(id)) return;
+        if (s.ok) {
+          rememberSnap(id, s);
+          render(s);
           return;
         }
-        render(s);
+        // 失败快照不要污染该账号缓存里的成功数据
+        const prev = snapHit(id);
+        if (!(prev && prev.data && prev.data.ok)) {
+          rememberSnap(id, s);
+        }
+        showAccountError(s, s.account);
+        showSnapAge();
       } catch (err) {
-        if (selected !== id) return;
-        if (snapHit(id) && silent) {
+        if (gen !== loadGen || !sameAccount(id)) return;
+        if (snapHit(id) && snapHit(id).data && snapHit(id).data.ok && silent) {
           showSnapAge();
           return;
         }
-        $("empty").hidden = true;
-        $("panel").hidden = false;
-        $("error").hidden = false;
-        $("error").textContent = err.message;
+        showAccountError({ error: err.message, account: { id: Number(id) } });
       }
     }
 

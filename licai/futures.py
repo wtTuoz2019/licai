@@ -538,15 +538,25 @@ class FuturesAPI:
         _ROUND_TRIP_FEE_CACHE[fee_key] = (now, out)
         return out
 
+    def um_open_orders(self, symbol: str) -> list[dict]:
+        data = self._um_signed(
+            "GET",
+            "/fapi/v1/openOrders",
+            "/papi/v1/um/openOrders",
+            {"symbol": symbol},
+        )
+        return data if isinstance(data, list) else []
+
     def place_limit(
         self,
         symbol: str,
         side: str,
         position_side: str,
         qty: Decimal,
-        price: Decimal,
+        price: Decimal | None = None,
         reduce_only: bool = False,
         time_in_force: str = "GTC",
+        price_match: str | None = None,
     ) -> dict:
         params = {
             "symbol": symbol,
@@ -555,8 +565,15 @@ class FuturesAPI:
             "type": "LIMIT",
             "timeInForce": time_in_force,
             "quantity": fmt_amount(qty),
-            "price": fmt_amount(price),
         }
+        # priceMatch（QUEUE 等）与 price 互斥；QUEUE=贴买一/卖一排队，心理价位且仍可 GTX
+        pm = (price_match or "").strip().upper() or None
+        if pm:
+            params["priceMatch"] = pm
+        else:
+            if price is None or price <= 0:
+                raise ValueError("limit order needs price or priceMatch")
+            params["price"] = fmt_amount(price)
         if reduce_only and not self.unified:
             params["reduceOnly"] = "true"
         self._clear_risk()
@@ -568,10 +585,20 @@ class FuturesAPI:
         side: str,
         position_side: str,
         qty: Decimal,
-        price: Decimal,
+        price: Decimal | None = None,
         reduce_only: bool = False,
+        price_match: str | None = None,
     ) -> dict:
-        return self.place_limit(symbol, side, position_side, qty, price, reduce_only, "GTX")
+        return self.place_limit(
+            symbol,
+            side,
+            position_side,
+            qty,
+            price,
+            reduce_only,
+            "GTX",
+            price_match=price_match,
+        )
 
     def place_market(
         self,
