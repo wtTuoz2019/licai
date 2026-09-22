@@ -1087,6 +1087,11 @@
       });
       applyLive(s);
       liveAt = Date.now();
+      const others = s.other_positions || [];
+      if (others.length) {
+        const tip = others.map((r) => `${r.symbol} ${r.side} ${r.qty}`).join("，");
+        setActionMsg(`当前套保币对无仓，但账户还有持仓：${tip}。请在设置里把套保改成对应币对。`);
+      }
       const sw = s.switch || {};
       $("btn-switch").disabled = !sw.can_click;
       $("btn-switch").title = sw.reason || "";

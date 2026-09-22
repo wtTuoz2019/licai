@@ -408,6 +408,7 @@ class HedgeCycle:
         if after.missing_side is None:
             steps.append(StepResult("平仓异常", False, "平仓后两侧仍在，没有实现盈利可转出"))
             return steps
+        # 顺序固定：先转出再补仓（不可改成先补后转）
         steps.extend(self._profit_to_spot(pnl))
         refill_qty = after.short_qty if side == "LONG" else after.long_qty
         refill_pos = "LONG" if side == "LONG" else "SHORT"

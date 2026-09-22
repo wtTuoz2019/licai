@@ -20,6 +20,73 @@ def _detail(value) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+# 收利/补仓诊断必须留住的步骤名关键词（不能只存末尾 4 步）
+_KEEP_STEP_KEYS = (
+    "触发止盈",
+    "平仓",
+    "补仓",
+    "保证金",
+    "转出",
+    "可转",
+    "归集统一",
+    "单边",
+    "市价仍单边",
+    "挂单未齐",
+    "收利完成",
+    "平仓异常",
+    "平仓跳过",
+)
+
+
+def _event_summary(steps: list[StepResult], *, limit: int = 2000) -> str:
+    """失败步骤 + 关键节点优先入事件，避免只留末 4 步把补仓原因裁掉。"""
+    if not steps:
+        return "无步骤"
+
+    def line(step: StepResult) -> str:
+        flag = "ok" if step.ok else "FAIL"
+        return f"{step.name}[{flag}]: {_detail(step.detail)}"
+
+    keep_idx: list[int] = []
+    seen: set[int] = set()
+
+    def add(i: int) -> None:
+        if i not in seen:
+            seen.add(i)
+            keep_idx.append(i)
+
+    for i, step in enumerate(steps):
+        if not step.ok:
+            add(i)
+    for i, step in enumerate(steps):
+        if any(k in step.name for k in _KEEP_STEP_KEYS):
+            add(i)
+    # 再按时间顺序补全，直到接近上限
+    for i in range(len(steps)):
+        add(i)
+        draft = "；".join(line(steps[j]) for j in sorted(seen))
+        if len(draft) >= limit:
+            break
+
+    ordered = sorted(seen)
+    text = "；".join(line(steps[i]) for i in ordered)
+    if len(text) <= limit:
+        return text
+    # 超长时：失败优先，再关键，再截断
+    failed = [i for i in ordered if not steps[i].ok]
+    key = [i for i in ordered if i not in failed and any(k in steps[i].name for k in _KEEP_STEP_KEYS)]
+    rest = [i for i in ordered if i not in failed and i not in key]
+    picked: list[int] = []
+    for group in (failed, key, rest):
+        for i in group:
+            trial = "；".join(line(steps[j]) for j in sorted(picked + [i]))
+            if trial and len(trial) > limit and picked:
+                continue
+            picked.append(i)
+    out = "；".join(line(steps[i]) for i in sorted(picked))
+    return out[:limit]
+
+
 def _sizing_settings(settings: Settings, legs) -> Settings:
     """加仓/入场预览按仓位实际杠杆算，不按目标倍数虚高。"""
     actual = int(getattr(legs, "leverage", 0) or 0)
@@ -142,12 +209,83 @@ class OpsService:
             return (hit[1] if hit else empty)
         return self._remember_risk(account.id, risk)
 
+    def _legs_payload(self, legs) -> dict:
+        return {
+            "long_qty": fmt_amount(legs.long_qty),
+            "short_qty": fmt_amount(legs.short_qty),
+            "long_pnl": fmt_amount(legs.long_pnl, 4),
+            "short_pnl": fmt_amount(legs.short_pnl, 4),
+            "long_entry": fmt_amount(legs.long_entry) if legs.long_entry > 0 else "",
+            "short_entry": fmt_amount(legs.short_entry) if legs.short_entry > 0 else "",
+            "missing": legs.missing_side,
+        }
+
+    def _other_positions(self, futures, symbol: str, legs) -> list[dict]:
+        if legs.long_qty > 0 or legs.short_qty > 0:
+            return []
+        try:
+            rows = futures.open_um_symbols()
+        except Exception:
+            return []
+        sym = (symbol or "").upper()
+        return [r for r in rows if r.get("symbol") != sym]
+
+    def _refresh_cached_legs(self, account: Account, data: dict) -> dict:
+        """资金可沿用缓存，仓位/浮盈必须现拉，避免线上一直显示无仓。"""
+        try:
+            pipe = pipeline_for(account, self.base, dry_run=True)
+            settings = pipe.settings
+            futures = pipe.futures
+            legs = futures.legs(settings.hedge_symbol)
+            risk = self._risk_for(account, futures, refresh=False)
+            mmr = risk.get("uni_mmr") or Decimal("0")
+            try:
+                stability = price_stability(futures, settings)
+            except Exception:
+                from .monitor import Stability
+
+                mid = d(data.get("price") or "0")
+                stability = Stability(
+                    settings.hedge_symbol, mid, Decimal("1"), Decimal("1"), Decimal("1"), False, "价格未刷新"
+                )
+            coll = d(data.get("collateral_usdt") or data.get("bfusd") or "0")
+            if coll <= 0:
+                coll = risk.get("equity") or Decimal("0")
+            fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
+            last_harvest = self.store.last_ok_action_at(account.id, "harvest")
+            advice = harvest_advice(legs, stability, settings, last_harvest, principal=coll, fee=fee)
+            plan = position_plan(
+                _sizing_settings(settings, legs),
+                stability.mid,
+                coll,
+                legs,
+                mmr,
+                lambda q: futures.round_qty(q, Decimal("0.001")),
+                available=risk.get("available"),
+            )
+            has_pos = legs.long_qty > 0 or legs.short_qty > 0
+            data["symbol"] = settings.hedge_symbol
+            data["settle_asset"] = settle_asset_of(settings.hedge_symbol)
+            data["leverage"] = int(legs.leverage or settings.hedge_leverage or 0) or int(settings.hedge_leverage)
+            data["uni_mmr"] = format_uni_mmr(mmr, has_pos)
+            data["price"] = stability.as_dict().get("mid") or data.get("price") or "0"
+            data["legs"] = self._legs_payload(legs)
+            data["other_positions"] = self._other_positions(futures, settings.hedge_symbol, legs)
+            data["stability"] = stability.as_dict()
+            data["enter"] = enter_advice(legs, stability, d(data.get("spot_usdt") or "0"), plan)
+            data["harvest"] = advice.as_dict()
+            data["account"] = account.public_dict()
+        except Exception as exc:
+            data["legs_refresh_error"] = str(exc)
+        return data
+
     def snapshot(self, account: Account, *, force: bool = False) -> dict:
         now = time.monotonic()
         if not force:
             hit = self._snap_cache.get(account.id)
             if hit and now - hit[0] < self._snap_ttl:
                 data = dict(hit[1])
+                data = self._refresh_cached_legs(account, data)
                 data["from_cache"] = True
                 data["cache_age"] = int(now - hit[0])
                 return data
@@ -201,21 +339,15 @@ class OpsService:
         return {
             "ok": True,
             "account": account.public_dict(),
+            "symbol": settings.hedge_symbol,
             "leverage": lev,
             "leverage_target": int(settings.hedge_leverage_target or settings.hedge_leverage),
             "uni_mmr": mmr_text,
             "live_poll_seconds": int(settings.live_poll_seconds),
             "auto_harvest_seconds": int(getattr(settings, "auto_harvest_seconds", 45) or 45),
             "price": stability.as_dict().get("mid") or "0",
-            "legs": {
-                "long_qty": fmt_amount(legs.long_qty),
-                "short_qty": fmt_amount(legs.short_qty),
-                "long_pnl": fmt_amount(legs.long_pnl, 4),
-                "short_pnl": fmt_amount(legs.short_pnl, 4),
-                "long_entry": fmt_amount(legs.long_entry) if legs.long_entry > 0 else "",
-                "short_entry": fmt_amount(legs.short_entry) if legs.short_entry > 0 else "",
-                "missing": legs.missing_side,
-            },
+            "legs": self._legs_payload(legs),
+            "other_positions": self._other_positions(futures, settings.hedge_symbol, legs),
             "stability": stability.as_dict(),
             "enter": enter_advice(legs, stability, self._idle_spot(account), plan),
             "harvest": advice.as_dict(),
@@ -329,15 +461,8 @@ class OpsService:
             "pm_equity": margin.get("equity") or "0",
             "account_total": margin.get("equity") or fmt_amount(collateral, 4),
             "margin": margin,
-            "legs": {
-                "long_qty": fmt_amount(legs.long_qty),
-                "short_qty": fmt_amount(legs.short_qty),
-                "long_pnl": fmt_amount(legs.long_pnl, 4),
-                "short_pnl": fmt_amount(legs.short_pnl, 4),
-                "long_entry": fmt_amount(legs.long_entry) if legs.long_entry > 0 else "",
-                "short_entry": fmt_amount(legs.short_entry) if legs.short_entry > 0 else "",
-                "missing": legs.missing_side,
-            },
+            "legs": self._legs_payload(legs),
+            "other_positions": self._other_positions(futures, settings.hedge_symbol, legs),
             "stability": stability.as_dict(),
             "enter": enter,
             "harvest": advice.as_dict(),
@@ -469,10 +594,14 @@ class OpsService:
                 getattr(cycle, "leverage_unlock_at", None),
             )
         ok = all(step.ok for step in steps) if steps else True
-        summary = "；".join(f"{step.name}: {_detail(step.detail)}" for step in steps[-4:]) or "无步骤"
+        summary = _event_summary(steps, limit=1900)
         if auto:
             summary = "自动收利：" + summary
         self.store.add_event(account.id, action, ok, summary[:2000])
+        if not ok:
+            fails = [f"{s.name}: {_detail(s.detail)}" for s in steps if not s.ok]
+            if fails:
+                print(f"动作失败 account={account.id} action={action} " + " | ".join(fails)[:800])
         self.invalidate_snapshot(account.id)
         return {
             "ok": ok,

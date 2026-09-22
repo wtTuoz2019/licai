@@ -79,10 +79,11 @@ class AutoHarvestWorker:
             result = self.ops.run_action(account, "harvest", force=False, mode=None, _locked=True, auto=True)
             ok = bool(result.get("ok"))
             detail = result.get("reason") or ""
-            if result.get("steps"):
-                detail = "；".join(
-                    f"{s.get('name')}: {s.get('detail')}" for s in (result.get("steps") or [])[-3:]
-                )
-            _print(f"自动收利结束 account={account.id} ok={ok} {detail[:240]}")
+            steps = result.get("steps") or []
+            if steps:
+                fails = [s for s in steps if not s.get("ok")]
+                pick = fails or steps[-4:]
+                detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+            _print(f"自动收利结束 account={account.id} ok={ok} {detail[:500]}")
         finally:
             self.ops.end_action(account.id)

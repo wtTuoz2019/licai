@@ -256,6 +256,47 @@ class FuturesAPI:
         rows = self._um_signed("GET", "/fapi/v2/positionRisk", "/papi/v1/um/positionRisk", {"symbol": symbol})
         if isinstance(rows, dict):
             rows = [rows]
+        # 带 symbol 偶发空回包时，再拉全量按币对过滤（线上常见）
+        if not rows:
+            try:
+                all_rows = self._um_signed("GET", "/fapi/v2/positionRisk", "/papi/v1/um/positionRisk")
+                if isinstance(all_rows, dict):
+                    all_rows = [all_rows]
+                rows = [r for r in (all_rows or []) if str(r.get("symbol") or "").upper() == symbol]
+            except BinanceAPIError:
+                rows = []
+        return self._legs_from_rows(symbol, rows or [])
+
+    def open_um_symbols(self) -> list[dict]:
+        """当前有仓的 U 本位合约（用于发现套保币对设错）。"""
+        try:
+            rows = self._um_signed("GET", "/fapi/v2/positionRisk", "/papi/v1/um/positionRisk")
+        except BinanceAPIError:
+            return []
+        if isinstance(rows, dict):
+            rows = [rows]
+        out: list[dict] = []
+        seen: set[str] = set()
+        for row in rows or []:
+            sym = str(row.get("symbol") or "").upper()
+            if not sym or sym in seen:
+                continue
+            amt = abs(d(row.get("positionAmt")))
+            if amt <= 0:
+                continue
+            seen.add(sym)
+            side = str(row.get("positionSide") or "").upper()
+            out.append(
+                {
+                    "symbol": sym,
+                    "side": side or ("LONG" if d(row.get("positionAmt")) > 0 else "SHORT"),
+                    "qty": fmt_amount(amt),
+                }
+            )
+        return out
+
+    def _legs_from_rows(self, symbol: str, rows: list) -> HedgeLegs:
+        symbol = symbol.upper()
         long_qty = short_qty = long_pnl = short_pnl = long_entry = short_entry = Decimal("0")
         leverage = 0
         for row in rows or []:
@@ -278,7 +319,6 @@ class FuturesAPI:
                 long_qty = qty
                 long_pnl = pnl
                 if entry <= 0 and qty > 0 and mark > 0:
-                    # 接口偶发缺 entryPrice 时，用标记价与浮盈反推
                     entry = mark - (pnl / qty)
                 long_entry = entry if entry > 0 else long_entry
             elif side == "SHORT" or (side in {"BOTH", ""} and amt < 0):
