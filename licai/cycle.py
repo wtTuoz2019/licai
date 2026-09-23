@@ -703,12 +703,55 @@ class HedgeCycle:
     def _quote_until_balanced(self, qty: Decimal, reduce_only: bool) -> list[StepResult]:
         steps: list[StepResult] = []
         tries, wait = self._open_maker_room()
+        # 一边已成交后，最多再挂几轮就市价补齐，缩短单边暴露
+        naked_limit = max(3, min(5, tries // 3))
+        naked_rounds = 0
         for i in range(tries):
             legs = self.futures.legs(self.symbol)
             if legs.missing_side is None:
                 steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
                 return steps
-            extra = self._hedge_pass(qty, reduce_only, market=False, aggressive=i > 0, flatten=False)
+            naked = (legs.long_qty > 0) != (legs.short_qty > 0)
+            if naked:
+                naked_rounds += 1
+            else:
+                naked_rounds = 0
+            # 单边过久：直接市价补缺口，少吃浮亏
+            if (not reduce_only) and naked and naked_rounds >= naked_limit:
+                miss = "多仓" if legs.long_qty <= 0 else "空仓"
+                steps.append(
+                    StepResult(
+                        "单边加快",
+                        True,
+                        f"已有一边成交，{miss}挂单 {naked_rounds} 轮未齐，改市价补齐避免裸奔",
+                    )
+                )
+                for _ in range(2):
+                    extra = self._hedge_pass(
+                        qty, reduce_only, market=True, aggressive=True, flatten=False, pass_n=i
+                    )
+                    steps.extend(extra)
+                    if any(_no_margin(item) for item in extra):
+                        steps.append(StepResult("保证金不够", False, "市价也开不出另一边，平掉已成交的单边"))
+                        steps.extend(self._flatten_if_naked())
+                        return steps
+                    if self._wait_until(
+                        lambda: self.futures.legs(self.symbol).missing_side is None,
+                        timeout=0.8,
+                    ):
+                        steps.append(
+                            StepResult("对冲平衡", True, self._legs_text(self.futures.legs(self.symbol)))
+                        )
+                        return steps
+                break
+            extra = self._hedge_pass(
+                qty,
+                reduce_only,
+                market=False,
+                aggressive=i > 0 or naked,
+                flatten=False,
+                pass_n=i + (2 if naked else 0),
+            )
             steps.extend(extra)
             if (not reduce_only) and any(_no_margin(item) for item in extra):
                 steps.append(StepResult("保证金不够", False, "另一边开不出，平掉已成交的单边"))
@@ -719,9 +762,11 @@ class HedgeCycle:
                 if legs.missing_side is None:
                     steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
                     return steps
+            # 单边时缩短等待，更快改价
+            round_wait = min(wait, 0.7) if naked else wait
             done = self._wait_until(
                 lambda: self.futures.legs(self.symbol).missing_side is None,
-                timeout=wait,
+                timeout=round_wait,
             )
             if done:
                 steps.append(StepResult("对冲平衡", True, self._legs_text(self.futures.legs(self.symbol))))
@@ -802,8 +847,35 @@ class HedgeCycle:
         aggressive: bool,
         flatten: bool,
         _retried: bool = False,
+        pass_n: int = 0,
     ) -> list[StepResult]:
         steps: list[StepResult] = []
+        legs = self.futures.legs(self.symbol)
+        if legs.missing_side is None:
+            return steps
+        bid, ask = self.futures.book(self.symbol)
+        tick, step = self.futures.filters(self.symbol)
+        naked = (legs.long_qty > 0) != (legs.short_qty > 0)
+        buy_px, sell_px = self._maker_prices(
+            bid,
+            ask,
+            tick,
+            improve=aggressive or naked or pass_n > 0,
+            pass_n=max(int(pass_n), 2 if naked else 0),
+        )
+        qty = self.futures.round_qty(qty, step)
+
+        # 单边补缺：目标价未变则保留挂单排队，避免每轮撤挂掉队
+        if (not market) and naked and not reduce_only:
+            if legs.long_qty <= 0:
+                kept = self._keep_resting_maker("BUY", "LONG", buy_px, bid, ask, tick)
+                if kept is not None:
+                    return [kept]
+            if legs.short_qty <= 0:
+                kept = self._keep_resting_maker("SELL", "SHORT", sell_px, bid, ask, tick)
+                if kept is not None:
+                    return [kept]
+
         try:
             self.futures.cancel_open(self.symbol)
         except BinanceAPIError:
@@ -811,10 +883,6 @@ class HedgeCycle:
         legs = self.futures.legs(self.symbol)
         if legs.missing_side is None:
             return steps
-        bid, ask = self.futures.book(self.symbol)
-        tick, step = self.futures.filters(self.symbol)
-        buy_px, sell_px = self._maker_prices(bid, ask, tick, improve=aggressive, pass_n=1 if aggressive else 0)
-        qty = self.futures.round_qty(qty, step)
         if legs.long_qty > 0 and legs.short_qty > 0:
             extra = self.futures.round_qty(abs(legs.long_qty - legs.short_qty), step)
             if extra <= 0:
@@ -839,7 +907,15 @@ class HedgeCycle:
                 steps.append(self._place("SELL", "SHORT", target, sell_px, reduce_only, market=market))
         if (not market) and (not _retried) and any(_post_only_reject(item) for item in steps):
             steps.extend(
-                self._hedge_pass(qty, reduce_only, market=False, aggressive=True, flatten=flatten, _retried=True)
+                self._hedge_pass(
+                    qty,
+                    reduce_only,
+                    market=False,
+                    aggressive=True,
+                    flatten=flatten,
+                    _retried=True,
+                    pass_n=max(pass_n, 1),
+                )
             )
         return steps
 
@@ -1105,10 +1181,14 @@ class HedgeCycle:
         status = str(data.get("status") or "")
         filled = str(data.get("executedQty") or data.get("cumQty") or "0")
         orig = str(data.get("origQty") or "")
+        avg = d(data.get("avgPrice"))
         px = str(data.get("avgPrice") or data.get("price") or "")
-        tif = str(data.get("timeInForce") or ("MARKET" if data.get("type") == "MARKET" else ""))
+        otype = str(data.get("type") or "").upper()
+        tif = str(data.get("timeInForce") or "")
+        if otype == "MARKET" or (not tif and avg > 0 and d(filled) > 0):
+            return f"{status or 'FILLED'} 市价成交 {filled}/{orig or filled} @ {px or fmt_amount(avg)}"
         if status in {"NEW", "NEW_INSURANCE", "NEW_ADL"} and d(filled) <= 0:
-            return f"已挂未成交 {filled}/{orig} @ {px} {tif}"
+            return f"已挂未成交 {filled}/{orig} @ {px} {tif or 'GTX'}"
         if status in {"FILLED", "PARTIALLY_FILLED"} or d(filled) > 0:
             return f"{status} 成交 {filled}/{orig} @ {px} {tif}"
         return f"{status} {filled}/{orig} @ {px} {tif}"
