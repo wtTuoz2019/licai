@@ -672,12 +672,49 @@ class Pipeline:
                     break
                 mmr, equity = self._mmr_equity()
                 batch = self._next_switch_batch(remaining, mmr, equity, full=full)
-                if batch <= 0 or ((not full) and batch < min(self.settings.switch_min_batch, remaining)):
+                if batch <= 0:
+                    if full and remaining > 0:
+                        # 尾数被 0.01 取整抹掉：入场用 redeemAll 清干净
+                        steps.append(
+                            StepResult(
+                                "清尾数",
+                                True,
+                                f"{product.asset} 还剩 {fmt_amount(remaining)}，整笔赎回清掉",
+                            )
+                        )
+                        steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                        if any(not s.ok for s in steps[-3:]):
+                            # 交易所可能低于最小赎回额，记一下不阻断入场
+                            fail = next((s for s in reversed(steps) if not s.ok), None)
+                            steps.append(
+                                StepResult(
+                                    "尾数跳过",
+                                    True,
+                                    f"剩余 {fmt_amount(remaining)} 可能低于兑换最小额，留待下次"
+                                    + (f"（{fail.detail}）" if fail else ""),
+                                )
+                            )
+                            # 把失败步骤改成可继续，避免整次入场失败
+                            for s in steps:
+                                if not s.ok and "赎回" in s.name:
+                                    s.ok = True
+                                    s.detail = f"尾数赎回未成（可忽略）：{s.detail}"
+                        remaining = Decimal("0")
+                        break
                     steps.append(
                         StepResult(
                             "暂停换产品",
                             True,
-                            f"uniMMR={fmt_amount(mmr, 4)}，这批只能赎 {fmt_amount(batch, 2)}，先停在安全线内。剩下 {fmt_amount(remaining, 2)} 下次再点",
+                            f"uniMMR={fmt_amount(mmr, 4)}，这批只能赎 {fmt_amount(batch, 2)}，先停在安全线内。剩下 {fmt_amount(remaining, 4)} 下次再点",
+                        )
+                    )
+                    return steps
+                if (not full) and batch < min(self.settings.switch_min_batch, remaining):
+                    steps.append(
+                        StepResult(
+                            "暂停换产品",
+                            True,
+                            f"uniMMR={fmt_amount(mmr, 4)}，这批只能赎 {fmt_amount(batch, 2)}，先停在安全线内。剩下 {fmt_amount(remaining, 4)} 下次再点",
                         )
                     )
                     return steps
@@ -694,7 +731,7 @@ class Pipeline:
                             StepResult(
                                 "暂停换产品",
                                 True,
-                                f"申购后 uniMMR={fmt_amount(mmr_after, 4)} 碰到安全线，剩下 {fmt_amount(remaining, 2)} 下次再点",
+                                f"申购后 uniMMR={fmt_amount(mmr_after, 4)} 碰到安全线，剩下 {fmt_amount(remaining, 4)} 下次再点",
                             )
                         )
                         return steps
@@ -705,15 +742,39 @@ class Pipeline:
                     StepResult(
                         "本轮结束",
                         True,
-                        f"已换 {batches} 批，还剩 {fmt_amount(remaining, 2)} {product.asset}，再点一次继续",
+                        f"已换 {batches} 批，还剩 {fmt_amount(remaining, 4)} {product.asset}，再点一次继续",
                     )
                 )
                 return steps
-            if 0 < remaining < self.settings.switch_min_batch:
+            if full and remaining > 0:
+                steps.append(
+                    StepResult("清尾数", True, f"{product.asset} 循环后仍剩 {fmt_amount(remaining)}，整笔赎回")
+                )
+                steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                remaining = Decimal("0")
+            elif 0 < remaining < self.settings.switch_min_batch:
                 mmr, equity = self._mmr_equity()
                 if self._next_switch_batch(remaining, mmr, equity, full=full) >= remaining:
                     steps.extend(self._redeem_then_subscribe(product, target, remaining))
                     remaining = Decimal("0")
+        if full:
+            # 再扫一遍持仓，清掉交易所账面尘埃（如 0.0065）
+            self.earn.invalidate()
+            leftovers = [(p, amt) for p, amt in self.earn_holdings() if not self._same_product(p, target) and amt > 0]
+            for product, amount in leftovers:
+                steps.append(
+                    StepResult(
+                        "清尾数",
+                        True,
+                        f"复查仍有 {product.asset} {fmt_amount(amount)}，整笔赎回",
+                    )
+                )
+                steps.extend(self._redeem_then_subscribe(product, target, amount, redeem_all=True))
+                if any(not s.ok for s in steps[-2:]):
+                    for s in steps:
+                        if not s.ok and "赎回" in s.name:
+                            s.ok = True
+                            s.detail = f"尾数赎回未成（可能低于最小额）：{s.detail}"
         if batches == 0 and all(s.ok for s in steps):
             steps.append(StepResult("换产品", True, "没有达到最小批次，先不动"))
         return steps
@@ -749,7 +810,11 @@ class Pipeline:
             if remaining - batch > 0 and remaining - batch < self.settings.switch_min_batch:
                 if remaining <= cap:
                     batch = remaining
-            return batch.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            q = batch.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            # 不到 0.01 的尾数：仍返回原值，后续走 redeemAll 清掉
+            if q <= 0 and remaining > 0:
+                return remaining
+            return q
         hard = self.settings.switch_batch_usdt
         pct = remaining * self.settings.switch_batch_pct
         raw = min(remaining, cap, pct if pct > 0 else remaining, hard)
@@ -760,12 +825,24 @@ class Pipeline:
                 batch = remaining
         return batch.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-    def _redeem_then_subscribe(self, source: FlexibleProduct, target: FlexibleProduct, amount: Decimal) -> list[StepResult]:
+    def _redeem_then_subscribe(
+        self,
+        source: FlexibleProduct,
+        target: FlexibleProduct,
+        amount: Decimal,
+        *,
+        redeem_all: bool = False,
+    ) -> list[StepResult]:
         steps: list[StepResult] = []
         if source.kind == "bfusd":
             redeem = self._mutate(
                 f"赎回 BFUSD {fmt_amount(amount)}（FAST，回现货 USDT）",
                 lambda: self.earn.redeem_bfusd(amount, "FAST"),
+            )
+        elif redeem_all:
+            redeem = self._mutate(
+                f"赎回活期 {source.asset} 全部 productId={source.product_id}",
+                lambda: self.earn.redeem(source.product_id, redeem_all=True),
             )
         else:
             redeem = self._mutate(
@@ -778,11 +855,24 @@ class Pipeline:
         if not self.settings.dry_run and self.settings.settle_seconds > 0:
             time.sleep(self.settings.settle_seconds)
         free = amount if self.settings.dry_run else self.earn.spot_free("USDT")
-        buy_amount = min(amount, free) if free > 0 else amount
+        buy_amount = min(amount, free) if free > 0 else (free if redeem_all else amount)
+        if redeem_all and not self.settings.dry_run:
+            free = self.earn.spot_free("USDT")
+            buy_amount = free
         if buy_amount <= 0:
+            if redeem_all:
+                steps.append(StepResult("申购跳过", True, "尾数赎回后现货可申购额为 0（可能低于最小申购）"))
+                return steps
             steps.append(StepResult("申购跳过", False, "赎回后现货没有 USDT"))
             return steps
+        # 尘埃可能低于 BFUSD 最小申购，失败则改记跳过
+        before = len(steps)
         steps.extend(self.buy(target, buy_amount))
+        if any(not s.ok for s in steps[before:]) and buy_amount < SPOT_MIN:
+            for s in steps[before:]:
+                if not s.ok:
+                    s.ok = True
+                    s.detail = f"尾数过小未申购：{s.detail}"
         return steps
 
     @staticmethod
