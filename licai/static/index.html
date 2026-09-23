@@ -1127,9 +1127,9 @@
       const curSym = (s.account && s.account.hedge_symbol) || s.symbol || "ETHUSDT";
       syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, curSym);
       lastSymbol = curSym;
-      const rows = eventsForAccount(s.events || [], selected);
-      fillEvents(rows);
-      if (rows.length) setSeenEventId(selected, rows[0].id);
+      const eventRows = eventsForAccount(s.events || [], selected);
+      fillEvents(eventRows);
+      if (eventRows.length) setSeenEventId(selected, eventRows[0].id);
       showSnapAge();
     }
 
