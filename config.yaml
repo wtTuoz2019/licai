@@ -83,3 +83,9 @@ switch_batch_usdt: 200       # 每批硬顶 USDT
 switch_min_batch: 10         # 小于这个就并进本批或留到下次
 switch_max_batches: 5        # 点一次最多换几批，剩下再点
 
+# ---- Webshare 代理（秘钥优先放 .env 的 WEBSHARE_API_TOKEN）----
+# webshare_api_token: ""     # 一般不要写进 yaml，用环境变量
+webshare_mode: direct        # direct | backbone（住宅池用 backbone）
+webshare_country: ""         # 如 US,HK；空=不限
+webshare_auto_assign: true   # 添加账号未填代理时自动分配
+

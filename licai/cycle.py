@@ -212,8 +212,15 @@ class HedgeCycle:
         return steps
 
     def _bootstrap_funds(self) -> list[StepResult]:
-        steps = list(self.pipeline.sweep_spot_to_earn())
+        # 先把其它活期（如 USDT 活期）赎成当前最高年化产品，再扫现货申购并入金
+        legs = self.futures.legs(self.symbol)
+        has_pos = legs.long_qty > 0 or legs.short_qty > 0
+        steps = list(self.pipeline.switch_to_best(full=not has_pos))
         if any(not s.ok for s in steps):
+            return steps
+        sweep = self.pipeline.sweep_spot_to_earn()
+        steps.extend(sweep)
+        if any(not s.ok for s in sweep):
             return steps
         bought = _subscribed(steps)
         if bought and not self.settings.dry_run:

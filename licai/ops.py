@@ -12,6 +12,8 @@ from .cycle import HedgeCycle, position_plan
 from .monitor import enter_advice, exit_ip, harvest_advice, price_stability, resolve_harvest_fee, schedule_hint
 from .pipeline import Pipeline, StepResult
 from .store import Account, AccountStore
+from .webshare import WebshareClient, WebshareError, proxy_endpoint
+
 
 
 def _detail(value) -> str:
@@ -127,7 +129,13 @@ def _gather(jobs: dict) -> tuple[dict, dict]:
     return out, errors
 
 
-def pipeline_for(account: Account, base: Settings | None = None, dry_run: bool = True) -> Pipeline:
+def pipeline_for(
+    account: Account,
+    base: Settings | None = None,
+    dry_run: bool = True,
+    *,
+    ops: "OpsService | None" = None,
+) -> Pipeline:
     settings = settings_for_account(
         base or load_settings(),
         api_key=account.api_key,
@@ -141,7 +149,15 @@ def pipeline_for(account: Account, base: Settings | None = None, dry_run: bool =
         take_profit_usdt=account.take_profit_usdt,
         take_profit_custom=account.take_profit_custom,
     )
-    return Pipeline(settings)
+    pipe = Pipeline(settings)
+    if ops is not None and account.proxy:
+        account_id = account.id
+
+        def _rotate(bad: str, exc: BaseException) -> str | None:
+            return ops.rotate_dead_proxy(account_id, bad, exc)
+
+        pipe.client.bind_proxy_rotator(_rotate)
+    return pipe
 
 
 class OpsService:
@@ -155,6 +171,123 @@ class OpsService:
         self._action_locks: dict[int, threading.Lock] = {}
         self._action_guard = threading.Lock()
         self._busy: set[int] = set()
+        self._webshare = WebshareClient(
+            self.base.webshare_api_token,
+            mode=self.base.webshare_mode,
+            country=self.base.webshare_country or None,
+        )
+        self._bad_proxy_endpoints: set[str] = set()
+        self._proxy_rotate_lock = threading.Lock()
+
+    def webshare_status(self) -> dict:
+        ok = self._webshare.configured
+        count = 0
+        error = ""
+        if ok:
+            try:
+                count = len(self._webshare.list_proxies())
+            except WebshareError as exc:
+                error = str(exc)
+        return {
+            "configured": ok,
+            "mode": self.base.webshare_mode,
+            "country": self.base.webshare_country or "",
+            "auto_assign": bool(self.base.webshare_auto_assign),
+            "proxy_count": count,
+            "bad_marked": len(self._bad_proxy_endpoints),
+            "error": error,
+        }
+
+    def assign_webshare_proxy(self, account: Account, *, verify: bool = True, force_refresh: bool = True) -> Account:
+        if not self._webshare.configured:
+            raise WebshareError("未配置 WEBSHARE_API_TOKEN，请在 .env 里填写")
+        used_urls, used_endpoints = self._used_proxies(exclude_id=account.id)
+        used_endpoints |= set(self._bad_proxy_endpoints)
+        picked = self._webshare.pick(
+            used_urls=used_urls,
+            used_endpoints=used_endpoints,
+            force=force_refresh,
+            verify=verify,
+        )
+        updated = self.store.update(account.id, proxy=picked.url)
+        self.invalidate_snapshot(account.id)
+        self.store.add_event(
+            account.id,
+            "proxy",
+            True,
+            f"Webshare 分配 {picked.endpoint}"
+            + (f" {picked.country}/{picked.city}" if picked.country or picked.city else ""),
+        )
+        return updated
+
+    def _used_proxies(self, *, exclude_id: int | None = None) -> tuple[set[str], set[str]]:
+        used_urls: set[str] = set()
+        used_endpoints: set[str] = set()
+        for other in self.store.list_accounts():
+            if exclude_id is not None and other.id == exclude_id:
+                continue
+            if other.proxy:
+                used_urls.add(other.proxy.strip())
+                ep = proxy_endpoint(other.proxy)
+                if ep:
+                    used_endpoints.add(ep)
+        return used_urls, used_endpoints
+
+    def rotate_dead_proxy(self, account_id: int, bad_proxy: str, exc: BaseException) -> str | None:
+        """代理失效：拉 Webshare 换一条；都试不通则清空代理走直连。"""
+        with self._proxy_rotate_lock:
+            bad_ep = proxy_endpoint(bad_proxy)
+            if bad_ep:
+                self._bad_proxy_endpoints.add(bad_ep)
+            detail_err = str(exc)[:160]
+            if not self._webshare.configured:
+                try:
+                    self.store.update(account_id, proxy="")
+                    self.invalidate_snapshot(account_id)
+                    self.store.add_event(
+                        account_id,
+                        "proxy",
+                        False,
+                        f"代理失效改直连（未配 Webshare）：{bad_ep or bad_proxy} · {detail_err}",
+                    )
+                except Exception:
+                    pass
+                return None
+            used_urls, used_endpoints = self._used_proxies(exclude_id=account_id)
+            used_endpoints |= set(self._bad_proxy_endpoints)
+            if bad_proxy:
+                used_urls.add(bad_proxy.strip())
+            try:
+                picked = self._webshare.pick(
+                    used_urls=used_urls,
+                    used_endpoints=used_endpoints,
+                    force=True,
+                    verify=True,
+                )
+            except WebshareError as web_exc:
+                try:
+                    self.store.update(account_id, proxy="")
+                    self.invalidate_snapshot(account_id)
+                    self.store.add_event(
+                        account_id,
+                        "proxy",
+                        False,
+                        f"代理均无效，已改直连。失效 {bad_ep or bad_proxy} · {detail_err} · {web_exc}",
+                    )
+                except Exception:
+                    pass
+                print(f"代理轮换失败 account={account_id} 改直连: {web_exc}")
+                return None
+            updated = self.store.update(account_id, proxy=picked.url)
+            self.invalidate_snapshot(account_id)
+            self.store.add_event(
+                account_id,
+                "proxy",
+                True,
+                f"代理失效已更换 {bad_ep or '?'} → {picked.endpoint} · {detail_err}",
+            )
+            print(f"代理已更换 account={account_id} {bad_ep} -> {picked.endpoint}")
+            return updated.proxy
 
     def try_begin_action(self, account_id: int) -> bool:
         with self._action_guard:
@@ -233,7 +366,7 @@ class OpsService:
     def _refresh_cached_legs(self, account: Account, data: dict) -> dict:
         """资金可沿用缓存，仓位/浮盈必须现拉，避免线上一直显示无仓。"""
         try:
-            pipe = pipeline_for(account, self.base, dry_run=True)
+            pipe = pipeline_for(account, self.base, dry_run=True, ops=self)
             settings = pipe.settings
             futures = pipe.futures
             legs = futures.legs(settings.hedge_symbol)
@@ -301,7 +434,7 @@ class OpsService:
 
     def monitor(self, account: Account) -> dict:
         try:
-            pipe = pipeline_for(account, self.base, dry_run=True)
+            pipe = pipeline_for(account, self.base, dry_run=True, ops=self)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         settings = pipe.settings
@@ -372,7 +505,7 @@ class OpsService:
             "hedge_symbols": list(self.base.hedge_symbols),
         }
         try:
-            pipe = pipeline_for(account, self.base, dry_run=True)
+            pipe = pipeline_for(account, self.base, dry_run=True, ops=self)
         except Exception as exc:
             return {**base, "ok": False, "error": str(exc)}
         settings = pipe.settings
@@ -519,7 +652,7 @@ class OpsService:
         if action not in {"enter", "harvest", "switch", "sweep", "hedge", "recycle", "fund", "leverage", "scale"}:
             raise ValueError(f"未知动作: {action}")
         try:
-            pipe = pipeline_for(account, self.base, dry_run=False)
+            pipe = pipeline_for(account, self.base, dry_run=False, ops=self)
         except Exception as exc:
             return {
                 "ok": False,

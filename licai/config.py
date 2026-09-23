@@ -134,6 +134,10 @@ class Settings:
     switch_batch_usdt: Decimal = Decimal("200")
     switch_min_batch: Decimal = Decimal("10")
     switch_max_batches: int = 5
+    webshare_api_token: str = ""
+    webshare_mode: str = "direct"
+    webshare_country: str = ""
+    webshare_auto_assign: bool = True
 
     @property
     def target_margin_assets(self) -> list[str]:
@@ -227,6 +231,20 @@ def load_settings(config_path: str | Path | None = None, dry_run_override: bool 
         switch_batch_usdt=d(raw.get("switch_batch_usdt", "200")),
         switch_min_batch=d(raw.get("switch_min_batch", "10")),
         switch_max_batches=int(raw.get("switch_max_batches", 5)),
+        webshare_api_token=(
+            os.getenv("WEBSHARE_API_TOKEN", "").strip()
+            or str(raw.get("webshare_api_token") or "").strip()
+        ),
+        webshare_mode=str(raw.get("webshare_mode") or os.getenv("WEBSHARE_MODE") or "direct").strip() or "direct",
+        webshare_country=(
+            str(raw.get("webshare_country") or os.getenv("WEBSHARE_COUNTRY") or "").strip().upper()
+        ),
+        webshare_auto_assign=bool(
+            raw.get(
+                "webshare_auto_assign",
+                os.getenv("WEBSHARE_AUTO_ASSIGN", "true").strip().lower() in {"1", "true", "yes", "on"},
+            )
+        ),
     )
 
 

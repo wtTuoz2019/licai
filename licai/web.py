@@ -24,6 +24,7 @@ from .auth import (
 from .autoharvest import AutoHarvestWorker
 from .config import normalize_hedge_symbol
 from .ops import OpsService
+from .webshare import WebshareError
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 NO_STORE = {"Cache-Control": "no-store"}
@@ -119,6 +120,28 @@ def create_app() -> FastAPI:
             account = store.add(body.name, body.api_key, body.api_secret, body.proxy, symbol)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        # 未填代理且配置了 Webshare：自动分配一个未占用的出口
+        if not (account.proxy or "").strip() and ops.base.webshare_auto_assign and bool(ops.base.webshare_api_token):
+            try:
+                account = ops.assign_webshare_proxy(account, verify=True)
+            except WebshareError as exc:
+                return {**account.public_dict(), "proxy_warning": str(exc)}
+        return account.public_dict()
+
+    @app.get("/api/webshare")
+    def webshare_status():
+        return ops.webshare_status()
+
+    @app.post("/api/accounts/{account_id}/proxy/webshare")
+    def assign_webshare(account_id: int, verify: bool = True):
+        try:
+            account = store.get(account_id)
+        except KeyError:
+            raise HTTPException(404, "账号不存在") from None
+        try:
+            account = ops.assign_webshare_proxy(account, verify=verify)
+        except WebshareError as exc:
+            raise HTTPException(400, str(exc)) from exc
         return account.public_dict()
 
     @app.patch("/api/accounts/{account_id}")
@@ -127,12 +150,17 @@ def create_app() -> FastAPI:
             symbol = None
             if body.hedge_symbol is not None:
                 symbol = normalize_hedge_symbol(body.hedge_symbol, ops.base.hedge_symbols)
+            proxy_val = body.proxy
+            assign = False
+            if proxy_val is not None and proxy_val.strip().lower() in {"webshare", "auto", "webshare:auto"}:
+                assign = True
+                proxy_val = None  # 先不改库里的代理，分配成功后再写入
             account = store.update(
                 account_id,
                 name=body.name,
                 api_key=body.api_key,
                 api_secret=body.api_secret,
-                proxy=body.proxy,
+                proxy=proxy_val,
                 hedge_symbol=symbol,
                 take_profit_usdt=body.take_profit_usdt,
                 take_profit_custom=body.take_profit_custom,
@@ -140,8 +168,12 @@ def create_app() -> FastAPI:
                 hedge_leverage=body.hedge_leverage,
                 hedge_leverage_set="hedge_leverage" in body.model_fields_set,
             )
+            if assign:
+                account = ops.assign_webshare_proxy(account, verify=True)
         except KeyError:
             raise HTTPException(404, "账号不存在") from None
+        except WebshareError as exc:
+            raise HTTPException(400, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         ops.invalidate_snapshot(account_id)

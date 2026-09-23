@@ -295,7 +295,7 @@
         <input name="api_key" required autocomplete="off" />
         <label>API Secret</label>
         <input name="api_secret" required type="password" autocomplete="off" />
-        <label>代理</label>
+        <label>代理（可留空，已配 Webshare 时自动分配）</label>
         <input name="proxy" placeholder="http://user:pass@ip:port" />
         <label>① 结算币（默认 USDT）</label>
         <select id="add-settle">
@@ -408,9 +408,11 @@
           </div>
           <div id="edit-proxy-box" class="edit-box" hidden>
             <label>代理</label>
-            <input id="proxy-edit" placeholder="http://user:pass@ip:port" />
+            <input id="proxy-edit" placeholder="http://user:pass@ip:port 或留空后点 Webshare" />
+            <p class="muted" id="webshare-hint" hidden></p>
             <div class="row">
               <button type="button" id="btn-cancel-proxy">取消</button>
+              <button type="button" id="btn-webshare-proxy">Webshare 分配</button>
               <button type="button" id="btn-proxy" class="primary">保存</button>
             </div>
           </div>
@@ -544,7 +546,7 @@
       $("harvest-why").textContent = "账号未就绪，仓位不会与其他账号共用";
     }
     const ACTIONS = {
-      enter: { title: "一键入场", hint: "申购理财、转入保证金并开对冲。" },
+      enter: { title: "一键入场", hint: "其它活期先换成最高年化，再申购、入金并开对冲。" },
       scale: { title: "加仓", hint: "在 uniMMR 安全线内，两边一起放大仓位。" },
       harvest: { title: "一键收利", hint: "平掉盈利腿并补仓。USDC 本位会先换成 USDT 再买理财。" },
       switch: { title: "换更高年化", hint: "分批换成更高年化产品。" },
@@ -1355,9 +1357,45 @@
       if (!selected || busy) return;
       $("edit-symbol-box").hidden = true;
       $("edit-proxy-box").hidden = false;
+      api("/api/webshare").then((st) => {
+        const el = $("webshare-hint");
+        if (!el) return;
+        if (!st.configured) {
+          el.hidden = false;
+          el.textContent = "未配置 WEBSHARE_API_TOKEN，请在服务器 .env 填写后重启";
+        } else if (st.error) {
+          el.hidden = false;
+          el.textContent = "Webshare: " + st.error;
+        } else {
+          el.hidden = false;
+          el.textContent = `Webshare 已就绪 · ${st.proxy_count} 条` + (st.country ? ` · ${st.country}` : "");
+        }
+      }).catch(() => {});
     };
     $("btn-cancel-proxy").onclick = () => {
       $("edit-proxy-box").hidden = true;
+    };
+    $("btn-webshare-proxy").onclick = async () => {
+      if (!selected || busy) return;
+      const ok = await confirmAction({
+        title: "Webshare 分配代理",
+        body: "从 Webshare 拉取一条未占用的代理，写入本账号并探测连通。",
+        okText: "分配",
+      });
+      if (!ok) return;
+      showLoading("分配中", "正在从 Webshare 获取并探测…");
+      try {
+        const acc = await api(`/api/accounts/${selected}/proxy/webshare`, { method: "POST" });
+        $("proxy-edit").value = acc.proxy || "";
+        $("edit-proxy-box").hidden = true;
+        await loadAccounts();
+        await refresh({ force: true });
+        setActionMsg("已分配 Webshare 代理：" + (acc.proxy || ""));
+      } catch (err) {
+        setActionMsg(err.message);
+      } finally {
+        hideModal();
+      }
     };
     $("btn-save-symbol").onclick = async () => {
       if (!selected || busy) return;

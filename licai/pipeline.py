@@ -641,7 +641,11 @@ class Pipeline:
             "reason": reason,
         }
 
-    def switch_to_best(self) -> list[StepResult]:
+    def switch_to_best(self, *, full: bool = False) -> list[StepResult]:
+        """把非目标活期换成当前最高年化产品。
+
+        full=True：一键入场用。无仓时尽量一次赎完；有仓时仍守 uniMMR 安全线，但放宽批次数。
+        """
         try:
             target = self.pick()
         except RuntimeError as exc:
@@ -649,22 +653,26 @@ class Pipeline:
         sources = [(p, amt) for p, amt in self.earn_holdings() if not self._same_product(p, target)]
         if not sources:
             return [StepResult("换产品", True, f"已经在 {target.asset}，不用换")]
+        max_batches = 50 if full else self.settings.switch_max_batches
         steps = [
             StepResult(
                 "开始分批换产品",
                 True,
                 f"目标 {target.asset} 年化 {apr_percent(target.apr):.2f}%；"
+                f"{'入场归集其它活期，' if full else ''}"
                 f"每批按 uniMMR≥{fmt_amount(self.settings.switch_safe_uni_mmr, 4)} 估赎回量，"
-                f"最多 {self.settings.switch_max_batches} 批",
+                f"最多 {max_batches} 批",
             )
         ]
         batches = 0
         for product, amount in sources:
             remaining = amount
-            while remaining >= self.settings.switch_min_batch and batches < self.settings.switch_max_batches:
+            while remaining > 0 and batches < max_batches:
+                if (not full) and remaining < self.settings.switch_min_batch:
+                    break
                 mmr, equity = self._mmr_equity()
-                batch = self._next_switch_batch(remaining, mmr, equity)
-                if batch < min(self.settings.switch_min_batch, remaining):
+                batch = self._next_switch_batch(remaining, mmr, equity, full=full)
+                if batch <= 0 or ((not full) and batch < min(self.settings.switch_min_batch, remaining)):
                     steps.append(
                         StepResult(
                             "暂停换产品",
@@ -692,7 +700,7 @@ class Pipeline:
                         return steps
                 elif self.settings.dry_run:
                     continue
-            if remaining > 0 and batches >= self.settings.switch_max_batches:
+            if remaining > 0 and batches >= max_batches:
                 steps.append(
                     StepResult(
                         "本轮结束",
@@ -703,8 +711,9 @@ class Pipeline:
                 return steps
             if 0 < remaining < self.settings.switch_min_batch:
                 mmr, equity = self._mmr_equity()
-                if self._next_switch_batch(remaining, mmr, equity) >= remaining:
+                if self._next_switch_batch(remaining, mmr, equity, full=full) >= remaining:
                     steps.extend(self._redeem_then_subscribe(product, target, remaining))
+                    remaining = Decimal("0")
         if batches == 0 and all(s.ok for s in steps):
             steps.append(StepResult("换产品", True, "没有达到最小批次，先不动"))
         return steps
@@ -718,18 +727,29 @@ class Pipeline:
         except BinanceAPIError:
             return Decimal("1"), Decimal("0")
 
-    def _next_switch_batch(self, remaining: Decimal, mmr: Decimal, equity: Decimal) -> Decimal:
+    def _next_switch_batch(
+        self, remaining: Decimal, mmr: Decimal, equity: Decimal, *, full: bool = False
+    ) -> Decimal:
         if remaining <= 0:
             return Decimal("0")
         safe = self.settings.switch_safe_uni_mmr
         if not is_mmr_sentinel(mmr) and mmr < safe:
             return Decimal("0")
         if equity > 0 and mmr > 0 and not is_mmr_sentinel(mmr):
-            cap = equity * (Decimal("1") - safe / mmr) * Decimal("0.8")
+            cap = equity * (Decimal("1") - safe / mmr) * (Decimal("0.9") if full else Decimal("0.8"))
         else:
+            # 无权益/无仓：其它活期多半还不在保证金里，允许一次赎完
             cap = remaining
         if cap <= 0:
             return Decimal("0")
+        if full:
+            # 入场归集：在安全线内尽量整笔换到最高年化；单笔仍封顶，避免一次过大
+            hard = max(self.settings.switch_batch_usdt, Decimal("2000"))
+            batch = min(remaining, cap, hard)
+            if remaining - batch > 0 and remaining - batch < self.settings.switch_min_batch:
+                if remaining <= cap:
+                    batch = remaining
+            return batch.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         hard = self.settings.switch_batch_usdt
         pct = remaining * self.settings.switch_batch_pct
         raw = min(remaining, cap, pct if pct > 0 else remaining, hard)
