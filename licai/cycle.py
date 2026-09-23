@@ -106,7 +106,8 @@ class HedgeCycle:
     理财仓位当保证金，多空对冲。
 
     一键收利（顺序固定，不可改成先补后转）：
-    平掉浮盈腿 → 最大可转出转到现货 → 立刻补回对冲
+    平掉浮盈腿（半平则继续平净，必要时市价扫尾）→ 最大可转出转到现货 → 补回对冲
+    → 缺口/数量不等则继续补齐或削平，最终双腿等量（实在不行双平）
     →（USDC 则先换成 USDT）买理财 → 划入统一账户。
     平仓后可转额度本身已扣手续费等，约等于本次实现盈利。
     """
@@ -408,40 +409,40 @@ class HedgeCycle:
             StepResult(
                 "触发止盈",
                 True,
-                f"平掉 {side} 浮盈约 {fmt_amount(pnl)} {self.settle_asset}，归集后转到现货买理财，再补仓",
+                f"平掉 {side} 浮盈约 {fmt_amount(pnl)} {self.settle_asset}，"
+                f"半平则继续平净，再转出补仓，最终保持对冲平衡",
             )
         ]
-        close_side = "SELL" if side == "LONG" else "BUY"
-        close_steps = self._quote_side(close_side, side, qty, reduce_only=True)
-        steps.extend(close_steps)
+        steps.extend(self._close_winner_for_harvest(side, qty))
         after = self.futures.legs(self.symbol)
-        # 平仓必须真正缺一边；否则绝不转出、绝不补仓
-        if after.missing_side is None:
-            if all(s.ok for s in close_steps):
-                steps.append(StepResult("平仓异常", False, "平仓后两侧仍在，没有实现盈利可转出"))
-            return steps
         still = after.long_qty if side == "LONG" else after.short_qty
+        # 盈利腿必须归零才转出；否则先把仓位拉回平衡再停
         if still > 0:
             steps.append(
                 StepResult(
                     "平仓未净",
                     False,
-                    f"{side} 仍剩 {fmt_amount(still)}，已撤继续收利，避免半平半转",
+                    f"{side} 仍剩 {fmt_amount(still)}，无法安全转出，先恢复对冲平衡",
                 )
             )
+            steps.extend(self._restore_harvest_balance())
+            return steps
+        if after.missing_side is None:
+            steps.append(StepResult("平仓异常", False, "平仓后两侧仍在，没有实现盈利可转出"))
+            steps.extend(self._restore_harvest_balance())
             return steps
 
-        # 顺序固定：先转出再补仓。转出最大可转出（平仓后可转额度≈浮盈扣费后，抽干无妨）
+        # 顺序固定：先转出再补仓
         steps.extend(self._profit_to_spot(pnl))
         refill_qty = after.short_qty if side == "LONG" else after.long_qty
         refill_pos = "LONG" if side == "LONG" else "SHORT"
         refill_order = "BUY" if refill_pos == "LONG" else "SELL"
-        steps.extend(self._quote_side(refill_order, refill_pos, refill_qty, reduce_only=False))
+        if refill_qty > 0:
+            steps.extend(self._quote_side(refill_order, refill_pos, refill_qty, reduce_only=False))
+        # 补不齐或数量不一致：再补一轮 / 削平多余，最终必须平衡或双平
+        steps.extend(self._restore_harvest_balance())
         restored = self.futures.legs(self.symbol)
-        if restored.missing_side is not None:
-            steps.append(StepResult("补仓未完成", False, "挂单+市价后仍缺一边，平掉已开的单边，避免裸仓"))
-            steps.extend(self._flatten_if_naked())
-            restored = self.futures.legs(self.symbol)
+
         earn_steps = self._spot_profit_to_earn()
         steps.extend(earn_steps)
         if not self.settings.dry_run:
@@ -449,6 +450,141 @@ class HedgeCycle:
         steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
         if restored.missing_side is None:
             steps.append(StepResult("收利完成", True, "对冲已齐。要放大仓位请点「加仓」"))
+        elif restored.long_qty <= 0 and restored.short_qty <= 0:
+            steps.append(StepResult("收利完成", True, "仓位已清零（未能补回对冲）。要重开请点「一键入场」"))
+        else:
+            steps.append(
+                StepResult(
+                    "收利未齐",
+                    False,
+                    f"结束后仍不平衡：{self._legs_text(restored)}",
+                )
+            )
+        return steps
+
+    def _close_winner_for_harvest(self, side: str, qty: Decimal) -> list[StepResult]:
+        """平盈利腿：挂单为主；半平则继续平剩余；仍不净则市价扫尾。"""
+        steps: list[StepResult] = []
+        close_side = "SELL" if side == "LONG" else "BUY"
+        remain = qty
+        for i in range(5):
+            legs = self.futures.legs(self.symbol)
+            remain = legs.long_qty if side == "LONG" else legs.short_qty
+            if remain <= 0:
+                steps.append(StepResult(f"已平 {side}", True, self._legs_text(legs)))
+                return steps
+            if i == 0:
+                label = f"平仓 {side}"
+            else:
+                label = "继续平剩余"
+                steps.append(
+                    StepResult(label, True, f"{side} 还剩 {fmt_amount(remain)}，继续挂单平净")
+                )
+            steps.extend(self._quote_side(close_side, side, remain, reduce_only=True))
+            legs = self.futures.legs(self.symbol)
+            remain = legs.long_qty if side == "LONG" else legs.short_qty
+            if remain <= 0:
+                steps.append(StepResult(f"已平 {side}", True, self._legs_text(legs)))
+                return steps
+
+        # 挂单仍不净：市价扫尾，保证后续能转出+补仓回到平衡
+        legs = self.futures.legs(self.symbol)
+        remain = legs.long_qty if side == "LONG" else legs.short_qty
+        if remain <= 0:
+            return steps
+        steps.append(
+            StepResult(
+                "半平市价扫尾",
+                True,
+                f"{side} 挂单后仍剩 {fmt_amount(remain)}，市价平净以便补仓平衡",
+            )
+        )
+        for _ in range(3):
+            legs = self.futures.legs(self.symbol)
+            remain = legs.long_qty if side == "LONG" else legs.short_qty
+            if remain <= 0:
+                break
+            steps.extend(
+                self._side_pass(close_side, side, remain, True, market=True, aggressive=True)
+            )
+            if self._wait_until(
+                lambda: (
+                    self.futures.legs(self.symbol).long_qty
+                    if side == "LONG"
+                    else self.futures.legs(self.symbol).short_qty
+                )
+                <= 0,
+                timeout=1.0,
+            ):
+                break
+        legs = self.futures.legs(self.symbol)
+        remain = legs.long_qty if side == "LONG" else legs.short_qty
+        if remain <= 0:
+            steps.append(StepResult(f"已平 {side}", True, self._legs_text(legs)))
+        else:
+            steps.append(
+                StepResult(
+                    f"{side} 未完成",
+                    False,
+                    f"市价扫尾后仍剩 {fmt_amount(remain)}：{self._legs_text(legs)}",
+                )
+            )
+        return steps
+
+    def _restore_harvest_balance(self) -> list[StepResult]:
+        """收利后强制回到双腿等量，或双平。半边/数量不一致都处理。"""
+        steps: list[StepResult] = []
+        for round_i in range(3):
+            legs = self.futures.legs(self.symbol)
+            miss = legs.missing_side
+            if miss is None:
+                if round_i > 0:
+                    steps.append(StepResult("对冲已齐", True, self._legs_text(legs)))
+                return steps
+            if legs.long_qty <= 0 and legs.short_qty <= 0:
+                steps.append(StepResult("仓位已清", True, self._legs_text(legs)))
+                return steps
+            if miss in {"LONG", "SHORT"}:
+                # 缺一边：按另一边数量补
+                target = legs.short_qty if miss == "LONG" else legs.long_qty
+                order = "BUY" if miss == "LONG" else "SELL"
+                if target > 0:
+                    steps.append(
+                        StepResult(
+                            "补齐缺口",
+                            True,
+                            f"缺 {miss}，按 {fmt_amount(target)} 补仓（第 {round_i + 1} 轮）",
+                        )
+                    )
+                    steps.extend(self._quote_side(order, miss, target, reduce_only=False))
+                continue
+            if miss == "IMBALANCE":
+                # 数量不一致：市价削平多的一边
+                steps.append(
+                    StepResult(
+                        "数量拉平",
+                        True,
+                        f"多空不等，削平多余：{self._legs_text(legs)}",
+                    )
+                )
+                target = max(legs.long_qty, legs.short_qty)
+                steps.extend(
+                    self._hedge_pass(target, True, market=True, aggressive=True, flatten=True)
+                )
+                continue
+            if miss == "BOTH":
+                return steps
+        legs = self.futures.legs(self.symbol)
+        if legs.missing_side is None:
+            steps.append(StepResult("对冲已齐", True, self._legs_text(legs)))
+            return steps
+        # 仍单边：平掉避免裸仓
+        if (legs.long_qty > 0) != (legs.short_qty > 0):
+            steps.append(StepResult("补仓未完成", False, "仍缺一边，平掉单边避免裸仓"))
+            steps.extend(self._flatten_if_naked())
+        elif legs.missing_side == "IMBALANCE":
+            steps.append(StepResult("数量仍不一致", False, self._legs_text(legs)))
+            steps.extend(self._hedge_pass(max(legs.long_qty, legs.short_qty), True, market=True, aggressive=True, flatten=True))
         return steps
 
     def _profit_to_spot(self, realized: Decimal) -> list[StepResult]:
