@@ -665,8 +665,20 @@ class Pipeline:
             )
         ]
         batches = 0
+        dust_cut = Decimal("1")  # 入场：小于 1 的非目标活期直接 redeemAll，避免 0.01 取整漏尾
         for product, amount in sources:
             remaining = amount
+            if full and remaining > 0 and remaining < dust_cut:
+                steps.append(
+                    StepResult(
+                        "清尾数",
+                        True,
+                        f"{product.asset} 仅剩 {fmt_amount(remaining)}，整笔赎回并入 {target.asset}",
+                    )
+                )
+                steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                self._soften_dust_failures(steps)
+                continue
             while remaining > 0 and batches < max_batches:
                 if (not full) and remaining < self.settings.switch_min_batch:
                     break
@@ -674,7 +686,6 @@ class Pipeline:
                 batch = self._next_switch_batch(remaining, mmr, equity, full=full)
                 if batch <= 0:
                     if full and remaining > 0:
-                        # 尾数被 0.01 取整抹掉：入场用 redeemAll 清干净
                         steps.append(
                             StepResult(
                                 "清尾数",
@@ -683,22 +694,7 @@ class Pipeline:
                             )
                         )
                         steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
-                        if any(not s.ok for s in steps[-3:]):
-                            # 交易所可能低于最小赎回额，记一下不阻断入场
-                            fail = next((s for s in reversed(steps) if not s.ok), None)
-                            steps.append(
-                                StepResult(
-                                    "尾数跳过",
-                                    True,
-                                    f"剩余 {fmt_amount(remaining)} 可能低于兑换最小额，留待下次"
-                                    + (f"（{fail.detail}）" if fail else ""),
-                                )
-                            )
-                            # 把失败步骤改成可继续，避免整次入场失败
-                            for s in steps:
-                                if not s.ok and "赎回" in s.name:
-                                    s.ok = True
-                                    s.detail = f"尾数赎回未成（可忽略）：{s.detail}"
+                        self._soften_dust_failures(steps)
                         remaining = Decimal("0")
                         break
                     steps.append(
@@ -718,6 +714,12 @@ class Pipeline:
                         )
                     )
                     return steps
+                # 本批若本身已是尘埃，改整笔赎，避免按金额被拒
+                if full and batch < dust_cut:
+                    steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                    self._soften_dust_failures(steps)
+                    remaining = Decimal("0")
+                    break
                 steps.extend(self._redeem_then_subscribe(product, target, batch))
                 if any(not s.ok for s in steps):
                     return steps
@@ -751,6 +753,7 @@ class Pipeline:
                     StepResult("清尾数", True, f"{product.asset} 循环后仍剩 {fmt_amount(remaining)}，整笔赎回")
                 )
                 steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                self._soften_dust_failures(steps)
                 remaining = Decimal("0")
             elif 0 < remaining < self.settings.switch_min_batch:
                 mmr, equity = self._mmr_equity()
@@ -770,14 +773,22 @@ class Pipeline:
                     )
                 )
                 steps.extend(self._redeem_then_subscribe(product, target, amount, redeem_all=True))
-                if any(not s.ok for s in steps[-2:]):
-                    for s in steps:
-                        if not s.ok and "赎回" in s.name:
-                            s.ok = True
-                            s.detail = f"尾数赎回未成（可能低于最小额）：{s.detail}"
-        if batches == 0 and all(s.ok for s in steps):
-            steps.append(StepResult("换产品", True, "没有达到最小批次，先不动"))
+                self._soften_dust_failures(steps)
+        if batches == 0 and all(s.ok for s in steps) and not any("清尾数" in s.name for s in steps):
+            # 若已有清尾数步骤，不要盖成「没有达到最小批次」
+            if len(steps) <= 1:
+                steps.append(StepResult("换产品", True, "没有达到最小批次，先不动"))
         return steps
+
+    @staticmethod
+    def _soften_dust_failures(steps: list[StepResult]) -> None:
+        """尾数赎回/申购失败不阻断入场；币安常有最小赎回额。"""
+        for s in steps:
+            if s.ok:
+                continue
+            if any(k in s.name for k in ("赎回", "申购", "subscribe")):
+                s.ok = True
+                s.detail = f"尾数未成（可忽略，可能低于交易所最小额）：{s.detail}"
 
     def _mmr_equity(self) -> tuple[Decimal, Decimal]:
         if not self.settings.unified_account:

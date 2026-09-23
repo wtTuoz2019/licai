@@ -171,11 +171,20 @@ class HedgeCycle:
             return steps
 
         if hedged:
+            # 已有对冲：仍归集其它活期/现货尘埃；现货闲置或非目标活期都要处理
             try:
                 idle = self.pipeline.spot_cash()
             except Exception:
                 idle = Decimal("0")
-            if idle >= 1:
+            try:
+                target = self.pipeline.pick()
+                other_earn = any(
+                    not self.pipeline._same_product(p, target) and amt > 0
+                    for p, amt in self.pipeline.earn_holdings()
+                )
+            except Exception:
+                other_earn = False
+            if idle >= Decimal("0.01") or other_earn:
                 steps.extend(self._bootstrap_funds())
                 if any(not s.ok for s in steps):
                     return steps
