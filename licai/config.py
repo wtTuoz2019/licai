@@ -129,6 +129,7 @@ class Settings:
     cooldown_minutes: int = 15
     stable_range_pct: Decimal = Decimal("0.0025")
     stable_spread_pct: Decimal = Decimal("0.00025")
+    harvest_stable_wait_seconds: int = 90
     switch_safe_uni_mmr: Decimal = Decimal("2.5")
     switch_batch_pct: Decimal = Decimal("0.15")
     switch_batch_usdt: Decimal = Decimal("200")
@@ -226,6 +227,7 @@ def load_settings(config_path: str | Path | None = None, dry_run_override: bool 
         cooldown_minutes=int(raw.get("cooldown_minutes", 15)),
         stable_range_pct=d(raw.get("stable_range_pct", "0.0025")),
         stable_spread_pct=d(raw.get("stable_spread_pct", "0.00025")),
+        harvest_stable_wait_seconds=int(raw.get("harvest_stable_wait_seconds", 90)),
         switch_safe_uni_mmr=load_uni_mmr_floor(raw, "switch_safe_uni_mmr", "2.5"),
         switch_batch_pct=d(raw.get("switch_batch_pct", "0.15")),
         switch_batch_usdt=d(raw.get("switch_batch_usdt", "200")),

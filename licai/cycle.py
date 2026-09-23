@@ -239,7 +239,7 @@ class HedgeCycle:
             return self.pipeline.fund_unified(check_ldusdt=check_ld)
         return []
 
-    def harvest_once(self) -> list[StepResult]:
+    def harvest_once(self, *, wait_stable: bool = True) -> list[StepResult]:
         legs = self.futures.legs(self.symbol)
         if legs.missing_side is not None:
             return [StepResult("平仓跳过", False, f"对冲不平衡，先补仓：{self._legs_text(legs)}")]
@@ -247,7 +247,50 @@ class HedgeCycle:
         pnl = legs.long_pnl if winner == "LONG" else legs.short_pnl
         if pnl <= 0:
             return [StepResult("平仓跳过", False, "两边都没有浮盈")]
-        return self._harvest(winner, legs)
+        return self._harvest(winner, legs, wait_stable=wait_stable)
+
+    def _wait_until_stable(self, purpose: str, *, timeout: float | None = None) -> list[StepResult]:
+        """尽可能等到价格平稳再下单；超时不阻断，继续用挂单路径。"""
+        if self.settings.dry_run:
+            return [StepResult("等待平稳", True, f"dry-run 跳过（{purpose}）", dry_run=True)]
+        limit = timeout
+        if limit is None:
+            limit = float(getattr(self.settings, "harvest_stable_wait_seconds", 90) or 90)
+        limit = max(0.0, float(limit))
+        if limit <= 0:
+            return []
+        try:
+            first = price_stability(self.futures, self.settings)
+            if first.stable:
+                return [StepResult("价格已平稳", True, f"{purpose}：{first.hint}")]
+        except Exception as exc:
+            return [StepResult("平稳检测", True, f"{purpose}：检测失败仍继续（{exc}）")]
+
+        deadline = time.monotonic() + limit
+        steps = [
+            StepResult(
+                "等待平稳",
+                True,
+                f"{purpose}：当前不稳，最多等 {int(limit)}s 再操作",
+            )
+        ]
+        while time.monotonic() < deadline:
+            time.sleep(2.0)
+            try:
+                st = price_stability(self.futures, self.settings)
+            except Exception:
+                continue
+            if st.stable:
+                steps.append(StepResult("价格已平稳", True, f"{purpose}：{st.hint}"))
+                return steps
+        steps.append(
+            StepResult(
+                "等待平稳超时",
+                True,
+                f"{purpose}：已等 {int(limit)}s 仍不够稳，继续挂单（尽量少吃单）",
+            )
+        )
+        return steps
 
     def _mutate(self, name: str, fn) -> StepResult:
         if self.settings.dry_run:
@@ -402,7 +445,7 @@ class HedgeCycle:
             steps.append(StepResult("停止", True, "已手动停止盯盘"))
         return steps
 
-    def _harvest(self, side: str, legs: HedgeLegs) -> list[StepResult]:
+    def _harvest(self, side: str, legs: HedgeLegs, *, wait_stable: bool = True) -> list[StepResult]:
         qty = legs.long_qty if side == "LONG" else legs.short_qty
         pnl = legs.long_pnl if side == "LONG" else legs.short_pnl
         steps = [
@@ -410,10 +453,12 @@ class HedgeCycle:
                 "触发止盈",
                 True,
                 f"平掉 {side} 浮盈约 {fmt_amount(pnl)} {self.settle_asset}，"
-                f"半平则继续平净，再转出补仓，最终保持对冲平衡",
+                f"半平则继续平净，再转出补仓；尽量等平稳后挂单，最终保持对冲平衡",
             )
         ]
-        steps.extend(self._close_winner_for_harvest(side, qty))
+        if wait_stable:
+            steps.extend(self._wait_until_stable("平仓前"))
+        steps.extend(self._close_winner_for_harvest(side, qty, wait_stable=wait_stable))
         after = self.futures.legs(self.symbol)
         still = after.long_qty if side == "LONG" else after.short_qty
         # 盈利腿必须归零才转出；否则先把仓位拉回平衡再停
@@ -425,11 +470,11 @@ class HedgeCycle:
                     f"{side} 仍剩 {fmt_amount(still)}，无法安全转出，先恢复对冲平衡",
                 )
             )
-            steps.extend(self._restore_harvest_balance())
+            steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
             return steps
         if after.missing_side is None:
             steps.append(StepResult("平仓异常", False, "平仓后两侧仍在，没有实现盈利可转出"))
-            steps.extend(self._restore_harvest_balance())
+            steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
             return steps
 
         # 顺序固定：先转出再补仓
@@ -438,9 +483,11 @@ class HedgeCycle:
         refill_pos = "LONG" if side == "LONG" else "SHORT"
         refill_order = "BUY" if refill_pos == "LONG" else "SELL"
         if refill_qty > 0:
+            if wait_stable:
+                steps.extend(self._wait_until_stable("补仓前"))
             steps.extend(self._quote_side(refill_order, refill_pos, refill_qty, reduce_only=False))
         # 补不齐或数量不一致：再补一轮 / 削平多余，最终必须平衡或双平
-        steps.extend(self._restore_harvest_balance())
+        steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
         restored = self.futures.legs(self.symbol)
 
         earn_steps = self._spot_profit_to_earn()
@@ -462,8 +509,10 @@ class HedgeCycle:
             )
         return steps
 
-    def _close_winner_for_harvest(self, side: str, qty: Decimal) -> list[StepResult]:
-        """平盈利腿：挂单为主；半平则继续平剩余；仍不净则市价扫尾。"""
+    def _close_winner_for_harvest(
+        self, side: str, qty: Decimal, *, wait_stable: bool = True
+    ) -> list[StepResult]:
+        """平盈利腿：挂单为主；半平则继续平剩余；仍不净则等平稳后市价扫尾。"""
         steps: list[StepResult] = []
         close_side = "SELL" if side == "LONG" else "BUY"
         remain = qty
@@ -473,12 +522,11 @@ class HedgeCycle:
             if remain <= 0:
                 steps.append(StepResult(f"已平 {side}", True, self._legs_text(legs)))
                 return steps
-            if i == 0:
-                label = f"平仓 {side}"
-            else:
-                label = "继续平剩余"
+            if i > 0:
+                if wait_stable:
+                    steps.extend(self._wait_until_stable("继续平剩余前", timeout=45))
                 steps.append(
-                    StepResult(label, True, f"{side} 还剩 {fmt_amount(remain)}，继续挂单平净")
+                    StepResult("继续平剩余", True, f"{side} 还剩 {fmt_amount(remain)}，继续挂单平净")
                 )
             steps.extend(self._quote_side(close_side, side, remain, reduce_only=True))
             legs = self.futures.legs(self.symbol)
@@ -487,11 +535,13 @@ class HedgeCycle:
                 steps.append(StepResult(f"已平 {side}", True, self._legs_text(legs)))
                 return steps
 
-        # 挂单仍不净：市价扫尾，保证后续能转出+补仓回到平衡
+        # 挂单仍不净：尽量等平稳再市价扫尾
         legs = self.futures.legs(self.symbol)
         remain = legs.long_qty if side == "LONG" else legs.short_qty
         if remain <= 0:
             return steps
+        if wait_stable:
+            steps.extend(self._wait_until_stable("市价扫尾前", timeout=60))
         steps.append(
             StepResult(
                 "半平市价扫尾",
@@ -531,7 +581,7 @@ class HedgeCycle:
             )
         return steps
 
-    def _restore_harvest_balance(self) -> list[StepResult]:
+    def _restore_harvest_balance(self, *, wait_stable: bool = True) -> list[StepResult]:
         """收利后强制回到双腿等量，或双平。半边/数量不一致都处理。"""
         steps: list[StepResult] = []
         for round_i in range(3):
@@ -545,10 +595,11 @@ class HedgeCycle:
                 steps.append(StepResult("仓位已清", True, self._legs_text(legs)))
                 return steps
             if miss in {"LONG", "SHORT"}:
-                # 缺一边：按另一边数量补
                 target = legs.short_qty if miss == "LONG" else legs.long_qty
                 order = "BUY" if miss == "LONG" else "SELL"
                 if target > 0:
+                    if wait_stable:
+                        steps.extend(self._wait_until_stable(f"补齐 {miss} 前", timeout=60))
                     steps.append(
                         StepResult(
                             "补齐缺口",
@@ -559,7 +610,8 @@ class HedgeCycle:
                     steps.extend(self._quote_side(order, miss, target, reduce_only=False))
                 continue
             if miss == "IMBALANCE":
-                # 数量不一致：市价削平多的一边
+                if wait_stable:
+                    steps.extend(self._wait_until_stable("数量拉平前", timeout=45))
                 steps.append(
                     StepResult(
                         "数量拉平",
@@ -578,13 +630,16 @@ class HedgeCycle:
         if legs.missing_side is None:
             steps.append(StepResult("对冲已齐", True, self._legs_text(legs)))
             return steps
-        # 仍单边：平掉避免裸仓
         if (legs.long_qty > 0) != (legs.short_qty > 0):
             steps.append(StepResult("补仓未完成", False, "仍缺一边，平掉单边避免裸仓"))
             steps.extend(self._flatten_if_naked())
         elif legs.missing_side == "IMBALANCE":
             steps.append(StepResult("数量仍不一致", False, self._legs_text(legs)))
-            steps.extend(self._hedge_pass(max(legs.long_qty, legs.short_qty), True, market=True, aggressive=True, flatten=True))
+            steps.extend(
+                self._hedge_pass(
+                    max(legs.long_qty, legs.short_qty), True, market=True, aggressive=True, flatten=True
+                )
+            )
         return steps
 
     def _profit_to_spot(self, realized: Decimal) -> list[StepResult]:

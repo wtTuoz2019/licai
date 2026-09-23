@@ -717,7 +717,7 @@ class OpsService:
                     "steps": [],
                 }
         if action == "harvest":
-            steps = cycle.harvest_once()
+            steps = cycle.harvest_once(wait_stable=not force)
         elif action == "scale":
             steps = cycle.scale_once(force=force or mode == "force")
         elif action == "switch":

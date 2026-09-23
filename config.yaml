@@ -75,6 +75,7 @@ harvest_min_usdt: 1          # 绝对下限（结算币，USDT/USDC 都适用）
 cooldown_minutes: 15         # 两次平仓最短间隔
 stable_range_pct: 0.0025     # 15 分钟振幅 ≤ 0.25%（各币通用）；近 5/2 分钟按比例更严
 stable_spread_pct: 0.00025   # 盘口价差 ≤ 0.025%
+harvest_stable_wait_seconds: 90  # 收利中平仓/补仓前最多等多久变平稳；超时仍继续
 
 # 换产品：分批赎回旧仓、立刻申购更高年化。按赎回瞬间这块保证金暂时失效来估
 switch_safe_uni_mmr: 2.5     # 换产品时 uniMMR 不得低于这个（比开仓安全线更严）
