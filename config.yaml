@@ -65,7 +65,7 @@ hedge_max_slippage_bps: 3.5  # 相对第一腿成交价，BBO 不利偏离超过
 watch_seconds: 60            # 命令行盯盘间隔
 live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
 auto_harvest_seconds: 60     # 开启「自动收利」后后台检查间隔（与 MACD 1 分钟对齐）
-# 自动收利额外过滤（手动一键收利不受影响）：c7 MACD 金叉收空、死叉收多
+# 自动收利开关：无仓且平稳时自动双边开仓；有仓时再按 MACD 金叉收空/死叉收多（手动不受影响）
 # 接口示例 https://c7.pro/capi/indicator
 macd_auto_harvest: true
 macd_indicator_url: "https://c7.pro/capi/indicator"

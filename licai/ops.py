@@ -854,7 +854,8 @@ class OpsService:
         ok = all(step.ok for step in steps) if steps else True
         summary = _event_summary(steps, limit=1900)
         if auto:
-            summary = "自动收利：" + summary
+            prefix = "自动开仓：" if action == "enter" else "自动收利："
+            summary = prefix + summary
         self.store.add_event(account.id, action, ok, summary[:2000])
         if not ok:
             fails = [f"{s.name}: {_detail(s.detail)}" for s in steps if not s.ok]

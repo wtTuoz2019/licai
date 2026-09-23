@@ -373,7 +373,7 @@
             <span class="muted">USDT</span>
             <button type="button" id="btn-save-tp">保存</button>
             <button type="button" id="btn-tp-auto" hidden>恢复自动</button>
-            <label class="auto-toggle" title="浮盈达标、冷却结束、价格平稳，且 c7 MACD 金叉收空/死叉收多时，后台自动收利；手动一键收利不受影响">
+            <label class="auto-toggle" title="无仓且价格平稳时自动双边开仓；有仓时浮盈达标后再按 MACD 金叉收空/死叉收多。手动入场/收利不受影响">
               <input type="checkbox" id="auto-harvest" />
               自动收利
             </label>
@@ -963,7 +963,14 @@
         ? (h.reason || "可以收利")
         : (need > 0 ? `还差 ${gap.toFixed(2)} 到收利门槛` : (h.reason || ""));
       if (accLive.auto_harvest) {
-        why = (h.can_click ? "自动收利待命：条件已满足（还需 MACD 金叉收空/死叉收多）。 " : "自动收利已开：达标且平稳后，再等 MACD 金叉收空或死叉收多。 ") + why;
+        const flat = toNum(legs.long_qty) <= 0 && toNum(legs.short_qty) <= 0;
+        if (flat) {
+          why = ((s.stability && s.stability.stable)
+            ? "自动开仓待命：无仓且已平稳，后台会双边入场。 "
+            : "自动开仓已开：无仓，等价格平稳后自动双边开仓。 ") + why;
+        } else {
+          why = (h.can_click ? "自动收利待命：条件已满足（还需 MACD 金叉收空/死叉收多）。 " : "自动收利已开：达标且平稳后，再等 MACD 金叉收空或死叉收多。 ") + why;
+        }
       }
       $("harvest-why").textContent = why;
       $("btn-harvest").title = h.reason || "";
@@ -1519,7 +1526,9 @@
           snapHit(selected).data.account = Object.assign(snapHit(selected).data.account || {}, acc);
           persistFunds();
         }
-        setActionMsg(on ? "已开启自动收利：达标且价格平稳时后台会执行" : "已关闭自动收利");
+        setActionMsg(on
+          ? "已开启自动：无仓平稳时自动开仓；有仓达标后按 MACD 金叉收空/死叉收多"
+          : "已关闭自动收利");
         await pollLive();
       } catch (err) {
         $("auto-harvest").checked = !on;
