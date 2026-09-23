@@ -373,7 +373,7 @@
             <span class="muted">USDT</span>
             <button type="button" id="btn-save-tp">保存</button>
             <button type="button" id="btn-tp-auto" hidden>恢复自动</button>
-            <label class="auto-toggle" title="浮盈达标、冷却结束且价格平稳时，后台自动收利">
+            <label class="auto-toggle" title="浮盈达标、冷却结束、价格平稳，且 c7 MACD 金叉收空/死叉收多时，后台自动收利；手动一键收利不受影响">
               <input type="checkbox" id="auto-harvest" />
               自动收利
             </label>
@@ -963,7 +963,7 @@
         ? (h.reason || "可以收利")
         : (need > 0 ? `还差 ${gap.toFixed(2)} 到收利门槛` : (h.reason || ""));
       if (accLive.auto_harvest) {
-        why = (h.can_click ? "自动收利待命：条件已满足。 " : "自动收利已开：达标且平稳后会自动平。 ") + why;
+        why = (h.can_click ? "自动收利待命：条件已满足（还需 MACD 金叉收空/死叉收多）。 " : "自动收利已开：达标且平稳后，再等 MACD 金叉收空或死叉收多。 ") + why;
       }
       $("harvest-why").textContent = why;
       $("btn-harvest").title = h.reason || "";
@@ -1045,7 +1045,7 @@
         // 开了自动收利时加快轮询，便于收利后尽快刷资金
         const autoOn = !!(s.account && s.account.auto_harvest);
         const nextMs = autoOn
-          ? Math.max(15000, Math.min(pollMs, Number(s.auto_harvest_seconds || 45) * 1000))
+          ? Math.max(60000, Math.min(pollMs, Number(s.auto_harvest_seconds || 60) * 1000))
           : pollMs;
         if (timer && gen === loadGen) {
           clearInterval(timer);

@@ -573,7 +573,7 @@ class OpsService:
             "leverage_target": lev_tgt,
             "uni_mmr": mmr_text,
             "live_poll_seconds": int(settings.live_poll_seconds),
-            "auto_harvest_seconds": int(getattr(settings, "auto_harvest_seconds", 45) or 45),
+            "auto_harvest_seconds": int(getattr(settings, "auto_harvest_seconds", 60) or 60),
             "price": stability.as_dict().get("mid") or "0",
             "legs": self._legs_payload(legs),
             "other_positions": self._other_positions(futures, settings.hedge_symbol, legs),
@@ -711,6 +711,7 @@ class OpsService:
         *,
         _locked: bool = False,
         auto: bool = False,
+        harvest_side: str | None = None,
     ) -> dict:
         own_lock = False
         if not _locked:
@@ -724,10 +725,32 @@ class OpsService:
                 }
             own_lock = True
         try:
-            return self._run_action_body(account, action, force=force, mode=mode, auto=auto)
+            return self._run_action_body(
+                account,
+                action,
+                force=force,
+                mode=mode,
+                auto=auto,
+                harvest_side=harvest_side,
+            )
         finally:
             if own_lock:
                 self.end_action(account.id)
+
+    @staticmethod
+    def _auto_side_harvest_ok(live: dict, harvest: dict, side: str) -> bool:
+        """自动收利指定腿：平稳+冷却+该腿浮盈达标+对冲齐全。"""
+        if not harvest.get("stable_ok"):
+            return False
+        if not harvest.get("cooldown_ok"):
+            return False
+        legs = (live or {}).get("legs") or {}
+        if legs.get("missing"):
+            return False
+        min_profit = d(harvest.get("min_profit") or "0")
+        key = "long_pnl" if side == "LONG" else "short_pnl"
+        pnl = d(legs.get(key) or "0")
+        return pnl > 0 and pnl >= min_profit
 
     def _run_action_body(
         self,
@@ -737,6 +760,7 @@ class OpsService:
         mode: str | None = None,
         *,
         auto: bool = False,
+        harvest_side: str | None = None,
     ) -> dict:
         if action not in {"enter", "harvest", "switch", "sweep", "hedge", "recycle", "fund", "leverage", "scale"}:
             raise ValueError(f"未知动作: {action}")
@@ -755,13 +779,21 @@ class OpsService:
         if action == "harvest":
             live = self.monitor(account)
             harvest = (live or {}).get("harvest") or {}
-            # 自动收利只走完整条件（含价格平稳）；手动仍可强行
+            side = (harvest_side or "").upper() or None
+            if side not in {"LONG", "SHORT"}:
+                side = None
+            # 自动收利：可按 MACD 指定腿；手动仍可强行
             if auto:
-                allowed = bool(harvest.get("can_click"))
+                if side:
+                    allowed = self._auto_side_harvest_ok(live, harvest, side)
+                else:
+                    allowed = bool(harvest.get("can_click"))
             else:
                 allowed = harvest.get("can_click") or (force and harvest.get("force_ok"))
             if not allowed:
                 reason = harvest.get("reason") or live.get("error") or "现在不适合平仓"
+                if auto and side:
+                    reason = f"自动收利({side})未满足：{reason}"
                 self.store.add_event(account.id, action, False, ("自动收利已拦截：" if auto else "已拦截：") + reason[:500])
                 return {
                     "ok": False,
@@ -797,7 +829,11 @@ class OpsService:
                     "steps": [],
                 }
         if action == "harvest":
-            steps = cycle.harvest_once(wait_stable=not force)
+            side = (harvest_side or "").upper() or None
+            if side not in {"LONG", "SHORT"}:
+                side = None
+            # 仅自动收利按 MACD 指定腿；手动仍按浮盈选赢家
+            steps = cycle.harvest_once(wait_stable=not force, side=side if auto else None)
         elif action == "scale":
             steps = cycle.scale_once(force=force or mode == "force")
         elif action == "switch":
