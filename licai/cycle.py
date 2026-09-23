@@ -105,8 +105,9 @@ class HedgeCycle:
     """
     理财仓位当保证金，多空对冲。
 
-    一键收利：平掉浮盈腿 → 归集 → 最大可转出结算币转到现货 → 立刻补回对冲
-    →（USDC 本位则先换成 USDT）现货买理财 → 再转入统一账户当保证金。理财代币本身不抽走。
+    一键收利（顺序固定，不可改成先补后转）：
+    平掉浮盈腿 → 先按本次浮盈额度转出现货 → 立刻补回对冲
+    → 对冲齐后再归集剩余可转出 →（USDC 则先换成 USDT）买理财 → 划入统一账户。
     """
 
     def __init__(self, pipeline: Pipeline):
@@ -406,17 +407,33 @@ class HedgeCycle:
             StepResult(
                 "触发止盈",
                 True,
-                f"平掉 {side} 浮盈约 {fmt_amount(pnl)} {self.settle_asset}，归集后转到现货买理财，再补仓",
+                f"平掉 {side} 浮盈约 {fmt_amount(pnl)} {self.settle_asset}，"
+                f"先转出本次浮盈再补仓；对冲齐后再归集剩余闲置买理财",
             )
         ]
         close_side = "SELL" if side == "LONG" else "BUY"
-        steps.extend(self._quote_side(close_side, side, qty, reduce_only=True))
+        close_steps = self._quote_side(close_side, side, qty, reduce_only=True)
+        steps.extend(close_steps)
         after = self.futures.legs(self.symbol)
+        # 平仓必须真正缺一边；否则绝不转出、绝不补仓
         if after.missing_side is None:
-            steps.append(StepResult("平仓异常", False, "平仓后两侧仍在，没有实现盈利可转出"))
+            if all(s.ok for s in close_steps):
+                steps.append(StepResult("平仓异常", False, "平仓后两侧仍在，没有实现盈利可转出"))
             return steps
-        # 顺序固定：先转出再补仓（不可改成先补后转）
-        steps.extend(self._profit_to_spot(pnl))
+        closed_qty = legs.long_qty if side == "LONG" else legs.short_qty
+        still = after.long_qty if side == "LONG" else after.short_qty
+        if still > 0:
+            steps.append(
+                StepResult(
+                    "平仓未净",
+                    False,
+                    f"{side} 仍剩 {fmt_amount(still)}（原 {fmt_amount(closed_qty)}），已撤继续收利，避免半平半转",
+                )
+            )
+            return steps
+
+        # 顺序固定：先转出再补仓。补仓前只转「本次浮盈」额度，留保证金给补仓。
+        steps.extend(self._profit_to_spot(pnl, limit=pnl))
         refill_qty = after.short_qty if side == "LONG" else after.long_qty
         refill_pos = "LONG" if side == "LONG" else "SHORT"
         refill_order = "BUY" if refill_pos == "LONG" else "SELL"
@@ -426,16 +443,30 @@ class HedgeCycle:
             steps.append(StepResult("补仓未完成", False, "挂单+市价后仍缺一边，平掉已开的单边，避免裸仓"))
             steps.extend(self._flatten_if_naked())
             restored = self.futures.legs(self.symbol)
+            # 对冲没齐也要把已转到现货的盈利申购掉，避免现货闲置
+            earn_steps = self._spot_profit_to_earn()
+            steps.extend(earn_steps)
+            if not self.settings.dry_run:
+                time.sleep(max(int(self.settings.settle_seconds or 0), 2))
+            steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
+            return steps
+
+        # 对冲已齐：再把统一账户剩余可转出归集到现货买理财
+        steps.extend(self._profit_to_spot(pnl, limit=None))
         earn_steps = self._spot_profit_to_earn()
         steps.extend(earn_steps)
         if not self.settings.dry_run:
             time.sleep(max(int(self.settings.settle_seconds or 0), 2))
         steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
-        if restored.missing_side is None:
-            steps.append(StepResult("收利完成", True, "对冲已齐。要放大仓位请点「加仓」"))
+        steps.append(StepResult("收利完成", True, "对冲已齐。要放大仓位请点「加仓」"))
         return steps
 
-    def _profit_to_spot(self, realized: Decimal) -> list[StepResult]:
+    def _profit_to_spot(self, realized: Decimal, *, limit: Decimal | None = None) -> list[StepResult]:
+        """转出统一账户结算币到现货。
+
+        limit=浮盈：补仓前只转不超过本次盈利的额度（先转后补，但不抽干保证金）。
+        limit=None：对冲齐后把剩余可转出尽量归集。
+        """
         steps: list[StepResult] = []
         asset = self.settle_asset
         # 顺序保持：先转出再补仓。用短轮询等可转出，尽快进入补仓。
@@ -467,14 +498,34 @@ class HedgeCycle:
                 StepResult(
                     "转出现货",
                     True,
-                    f"最大可转出 {fmt_amount(transferable)} {asset}，不足 1，先补仓",
+                    f"最大可转出 {fmt_amount(transferable)} {asset}，不足 1，跳过",
                 )
             )
             return steps
         amount = transferable
+        if limit is not None:
+            # 只转本次浮盈（向上留一点毛刺，但绝不整笔抽干）
+            cap = max(limit, Decimal("0"))
+            if cap < 1:
+                steps.append(
+                    StepResult(
+                        "转出现货",
+                        True,
+                        f"本次浮盈 {fmt_amount(limit)} 不足 1，补仓前不转出，可转出 {fmt_amount(transferable)}",
+                    )
+                )
+                return steps
+            amount = min(transferable, cap)
         moved = self._mutate(
-            f"最大可转出 {fmt_amount(amount)} {asset} 转到现货（本次浮盈约 {fmt_amount(realized)}）",
-            lambda: self.futures.unified_to_spot(asset, amount),
+            (
+                f"转出 {fmt_amount(amount)} {asset} 到现货"
+                + (
+                    f"（补仓前按浮盈封顶，可转出 {fmt_amount(transferable)}，浮盈约 {fmt_amount(realized)}）"
+                    if limit is not None
+                    else f"（对冲齐后归集剩余，可转出 {fmt_amount(transferable)}）"
+                )
+            ),
+            lambda amt=amount: self.futures.unified_to_spot(asset, amt),
         )
         if moved.ok and not moved.dry_run:
             self.pipeline.earn.invalidate()

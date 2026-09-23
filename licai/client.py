@@ -145,23 +145,34 @@ class BinanceClient:
             base = self.SPOT
         url = base + path
         last_net: BaseException | None = None
-        for attempt in range(self._max_proxy_rotations + 2):
+        same_proxy_tries = 0
+        for attempt in range(self._max_proxy_rotations + 4):
             try:
                 response = self.session.request(method, url, params=params, timeout=self.timeout)
             except requests.RequestException as exc:
                 last_net = exc
-                if not self._should_rotate_proxy(exc) or attempt >= self._max_proxy_rotations:
+                if not self._should_rotate_proxy(exc):
                     break
-                if not self.proxy or not self.proxy_rotator:
+                if not self.proxy:
+                    break
+                # 同一代理先重试 2 次（重建连接），避免收利中途误换 IP
+                if same_proxy_tries < 2:
+                    same_proxy_tries += 1
+                    cur = self.proxy
+                    self.apply_proxy(None)
+                    self.apply_proxy(cur)
+                    continue
+                if not self.proxy_rotator or attempt >= self._max_proxy_rotations + 2:
                     break
                 try:
                     nxt = self.proxy_rotator(self.proxy, exc)
                 except Exception as rot_exc:
                     last_net = rot_exc
                     self.apply_proxy(None)
+                    same_proxy_tries = 0
                     continue
-                # nxt 为新代理，或 None=改直连再试一次
                 self.apply_proxy(nxt)
+                same_proxy_tries = 0
                 continue
             try:
                 data = response.json()
