@@ -451,8 +451,24 @@
     const FUNDS_STORE = "licai_funds_cache_v1";
     let pollMs = 120000;
     let liveAt = 0;
-    let lastSeenEventId = 0;
+    const lastSeenByAccount = Object.create(null);
     const $ = (id) => document.getElementById(id);
+
+    function seenEventId(id) {
+      return Number(lastSeenByAccount[cacheId(id)]) || 0;
+    }
+
+    function setSeenEventId(id, eid) {
+      lastSeenByAccount[cacheId(id)] = Math.max(seenEventId(id), Number(eid) || 0);
+    }
+
+    function eventsForAccount(events, id) {
+      const aid = Number(id);
+      return (events || []).filter((e) => {
+        if (e == null || e.account_id == null || e.account_id === "") return true;
+        return Number(e.account_id) === aid;
+      });
+    }
 
     function mergeHedgeSymbols(list) {
       const out = [];
@@ -850,8 +866,8 @@
       if (busy) return;
       const gen = ++loadGen;
       selected = Number(id);
-      lastSeenEventId = 0;
       liveAt = 0;
+      setActionMsg("");
       $("settings-box").hidden = true;
       hideEditBoxes();
       const list = await loadAccounts();
@@ -895,6 +911,14 @@
       if (levTgt) {
         const tgt = (s.account && s.account.hedge_leverage) || s.leverage_target || "";
         if (tgt) levTgt.textContent = tgt;
+      }
+      const levChip = $("lev") && $("lev").closest(".lev-chip");
+      if (levChip) {
+        const tgt = Number((s.account && s.account.hedge_leverage) || s.leverage_target || 0) || 0;
+        const act = Number(s.leverage || 0) || 0;
+        levChip.title = tgt && act && tgt !== act
+          ? `实际 ${act}x · 目标 ${tgt}x`
+          : (act ? `杠杆 ${act}x` : "");
       }
       const price = s.price || (s.stability && s.stability.mid) || "";
       if (price) $("mid-price").textContent = price;
@@ -984,13 +1008,14 @@
         if (s.events) snapHit(selected).data.events = s.events;
         persistFunds();
       }
-      if (Array.isArray(s.events) && s.events.length) {
-        fillEvents(s.events);
-        const top = s.events[0];
+      if (Array.isArray(s.events)) {
+        const rows = eventsForAccount(s.events, selected);
+        fillEvents(rows);
+        const top = rows[0];
         const eid = Number(top && top.id) || 0;
-        if (eid > lastSeenEventId) {
-          const prev = lastSeenEventId;
-          lastSeenEventId = eid;
+        const prev = seenEventId(selected);
+        if (eid > prev) {
+          setSeenEventId(selected, eid);
           // 后台自动收利完成后，主动刷资金/日志（首次加载只记 id，不刷）
           if (prev > 0 && top.action === "harvest" && top.ok && !busy) {
             setActionMsg(String(top.detail || "自动收利已完成").slice(0, 220));
@@ -1102,10 +1127,9 @@
       const curSym = (s.account && s.account.hedge_symbol) || s.symbol || "ETHUSDT";
       syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, curSym);
       lastSymbol = curSym;
-      fillEvents(s.events || []);
-      if ((s.events || []).length) {
-        lastSeenEventId = Math.max(lastSeenEventId, Number(s.events[0].id) || 0);
-      }
+      const rows = eventsForAccount(s.events || [], selected);
+      fillEvents(rows);
+      if (rows.length) setSeenEventId(selected, rows[0].id);
       showSnapAge();
     }
 

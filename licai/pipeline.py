@@ -641,10 +641,11 @@ class Pipeline:
             "reason": reason,
         }
 
-    def switch_to_best(self, *, full: bool = False) -> list[StepResult]:
+    def switch_to_best(self, *, full: bool = False, has_hedge: bool | None = None) -> list[StepResult]:
         """把非目标活期换成当前最高年化产品。
 
         full=True：一键入场用。无仓时尽量一次赎完；有仓时仍守 uniMMR 安全线，但放宽批次数。
+        has_hedge：是否已有对冲仓。无仓时不按 uniMMR 估赎回量（文案与批次都跳过）。
         """
         try:
             target = self.pick()
@@ -653,17 +654,27 @@ class Pipeline:
         sources = [(p, amt) for p, amt in self.earn_holdings() if not self._same_product(p, target)]
         if not sources:
             return [StepResult("换产品", True, f"已经在 {target.asset}，不用换")]
+        if has_hedge is None:
+            try:
+                legs = self.futures.legs(self.settings.hedge_symbol)
+                has_hedge = legs.long_qty > 0 or legs.short_qty > 0
+            except Exception:
+                has_hedge = False
+        hedge_open = bool(has_hedge)
         max_batches = 50 if full else self.settings.switch_max_batches
-        steps = [
-            StepResult(
-                "开始分批换产品",
-                True,
+        if full and not hedge_open:
+            start_detail = (
+                f"目标 {target.asset} 年化 {apr_percent(target.apr):.2f}%；"
+                f"无对冲仓，其它活期整笔归集（不按 uniMMR 估批），最多 {max_batches} 批"
+            )
+        else:
+            start_detail = (
                 f"目标 {target.asset} 年化 {apr_percent(target.apr):.2f}%；"
                 f"{'入场归集其它活期，' if full else ''}"
                 f"每批按 uniMMR≥{fmt_amount(self.settings.switch_safe_uni_mmr, 4)} 估赎回量，"
-                f"最多 {max_batches} 批",
+                f"最多 {max_batches} 批"
             )
-        ]
+        steps = [StepResult("开始分批换产品", True, start_detail)]
         batches = 0
         dust_cut = Decimal("1")  # 入场：小于 1 的非目标活期直接 redeemAll，避免 0.01 取整漏尾
         for product, amount in sources:
@@ -683,7 +694,9 @@ class Pipeline:
                 if (not full) and remaining < self.settings.switch_min_batch:
                     break
                 mmr, equity = self._mmr_equity()
-                batch = self._next_switch_batch(remaining, mmr, equity, full=full)
+                batch = self._next_switch_batch(
+                    remaining, mmr, equity, full=full, hedge_open=hedge_open
+                )
                 if batch <= 0:
                     if full and remaining > 0:
                         steps.append(
@@ -725,7 +738,7 @@ class Pipeline:
                     return steps
                 remaining -= batch
                 batches += 1
-                if not self.settings.dry_run and self.settings.settle_seconds > 0:
+                if hedge_open and not self.settings.dry_run and self.settings.settle_seconds > 0:
                     time.sleep(self.settings.settle_seconds)
                     mmr_after, _ = self._mmr_equity()
                     if not is_mmr_sentinel(mmr_after) and mmr_after < self.settings.switch_safe_uni_mmr:
@@ -739,6 +752,8 @@ class Pipeline:
                         return steps
                 elif self.settings.dry_run:
                     continue
+                elif full and not hedge_open and not self.settings.dry_run and self.settings.settle_seconds > 0:
+                    time.sleep(self.settings.settle_seconds)
             if remaining > 0 and batches >= max_batches:
                 steps.append(
                     StepResult(
@@ -757,7 +772,7 @@ class Pipeline:
                 remaining = Decimal("0")
             elif 0 < remaining < self.settings.switch_min_batch:
                 mmr, equity = self._mmr_equity()
-                if self._next_switch_batch(remaining, mmr, equity, full=full) >= remaining:
+                if self._next_switch_batch(remaining, mmr, equity, full=full, hedge_open=hedge_open) >= remaining:
                     steps.extend(self._redeem_then_subscribe(product, target, remaining))
                     remaining = Decimal("0")
         if full:
@@ -800,10 +815,26 @@ class Pipeline:
             return Decimal("1"), Decimal("0")
 
     def _next_switch_batch(
-        self, remaining: Decimal, mmr: Decimal, equity: Decimal, *, full: bool = False
+        self,
+        remaining: Decimal,
+        mmr: Decimal,
+        equity: Decimal,
+        *,
+        full: bool = False,
+        hedge_open: bool = True,
     ) -> Decimal:
         if remaining <= 0:
             return Decimal("0")
+        # 无对冲仓：赎回不影响保证金，不必按 uniMMR 砍批次
+        if full and not hedge_open:
+            hard = max(self.settings.switch_batch_usdt, Decimal("2000"))
+            batch = min(remaining, hard)
+            q = batch.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            if q <= 0 and remaining > 0:
+                return remaining
+            if remaining - q > 0 and remaining - q < self.settings.switch_min_batch and remaining <= hard:
+                return remaining.quantize(Decimal("0.01"), rounding=ROUND_DOWN) or remaining
+            return q
         safe = self.settings.switch_safe_uni_mmr
         if not is_mmr_sentinel(mmr) and mmr < safe:
             return Decimal("0")
@@ -845,6 +876,14 @@ class Pipeline:
         redeem_all: bool = False,
     ) -> list[StepResult]:
         steps: list[StepResult] = []
+        if not source.can_redeem and source.kind != "bfusd":
+            return [
+                StepResult(
+                    f"赎回活期 {source.asset}",
+                    False,
+                    f"交易所标记不可赎回 canRedeem=false，productId={source.product_id}",
+                )
+            ]
         if source.kind == "bfusd":
             redeem = self._mutate(
                 f"赎回 BFUSD {fmt_amount(amount)}（FAST，回现货 USDT）",
@@ -860,6 +899,12 @@ class Pipeline:
                 f"赎回活期 {source.asset} {fmt_amount(amount)} productId={source.product_id}",
                 lambda: self.earn.redeem(source.product_id, amount=amount),
             )
+        if not redeem.ok and self._unauthorized(redeem):
+            redeem.detail = (
+                f"{redeem.detail}。"
+                "活期赎回/申购需要 API Key 勾选「允许现货及杠杆交易」(Enable Spot & Margin Trading)；"
+                "仅合约/只读权限会报 -1002。子账户要用该子账户自己的 Key。"
+            )
         steps.append(redeem)
         if not redeem.ok:
             return steps
@@ -868,15 +913,15 @@ class Pipeline:
         free = amount if self.settings.dry_run else self.earn.spot_free("USDT")
         buy_amount = min(amount, free) if free > 0 else (free if redeem_all else amount)
         if redeem_all and not self.settings.dry_run:
+            self.earn.invalidate()
             free = self.earn.spot_free("USDT")
-            buy_amount = free
+            buy_amount = free if free > 0 else Decimal("0")
         if buy_amount <= 0:
             if redeem_all:
-                steps.append(StepResult("申购跳过", True, "尾数赎回后现货可申购额为 0（可能低于最小申购）"))
-                return steps
-            steps.append(StepResult("申购跳过", False, "赎回后现货没有 USDT"))
-            return steps
-        # 尘埃可能低于 BFUSD 最小申购，失败则改记跳过
+                return steps + [
+                    StepResult("申购跳过", True, "赎回后现货 USDT 仍为 0（可能尚未到账或已是尾数）")
+                ]
+            return steps + [StepResult("申购跳过", False, "赎回后现货 USDT 不足，无法申购目标产品")]
         before = len(steps)
         steps.extend(self.buy(target, buy_amount))
         if any(not s.ok for s in steps[before:]) and buy_amount < SPOT_MIN:

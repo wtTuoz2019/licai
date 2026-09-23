@@ -292,18 +292,28 @@ def harvest_advice(
     last_harvest_at: str | None,
     principal: Decimal = Decimal("0"),
     fee: Decimal | None = None,
+    notional: Decimal | None = None,
 ) -> HarvestAdvice:
     if fee is None:
         fee = harvest_fee_estimate(legs, stability.mid, settings)
-    notional = position_notional(legs, stability.mid)
+    if notional is None or notional <= 0:
+        notional = position_notional(legs, stability.mid)
     auto = auto_harvest_profit(principal, fee, settings, notional)
     min_profit = min_harvest_profit(principal, fee, settings, notional)
     custom = bool(settings.take_profit_custom and settings.take_profit_usdt > 0)
     if legs.long_qty <= 0 and legs.short_qty <= 0:
+        lev = int(getattr(settings, "hedge_leverage", 0) or 0)
+        if notional > 0:
+            reason = (
+                f"还没有对冲仓位。按预计 {lev}x 开仓名义约 {fmt_amount(notional, 0)}，"
+                f"建议每次收利 {fmt_amount(min_profit, 4)}"
+            )
+        else:
+            reason = "还没有对冲仓位"
         return HarvestAdvice(
             None,
             Decimal("0"),
-            Decimal("0"),
+            fee,
             min_profit,
             Decimal("0"),
             Decimal("0"),
@@ -313,7 +323,7 @@ def harvest_advice(
             stability.stable,
             False,
             False,
-            "还没有对冲仓位",
+            reason,
             auto,
             custom,
         )

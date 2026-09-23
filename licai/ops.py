@@ -8,8 +8,16 @@ from dataclasses import replace
 from decimal import Decimal
 
 from .config import Settings, d, fmt_amount, is_mmr_sentinel, load_settings, settings_for_account, settle_asset_of
-from .cycle import HedgeCycle, position_plan
-from .monitor import enter_advice, exit_ip, harvest_advice, price_stability, resolve_harvest_fee, schedule_hint
+from .cycle import HedgeCycle, margin_use_pct, position_plan
+from .monitor import (
+    enter_advice,
+    exit_ip,
+    harvest_advice,
+    position_notional,
+    price_stability,
+    resolve_harvest_fee,
+    schedule_hint,
+)
 from .pipeline import Pipeline, StepResult
 from .store import Account, AccountStore
 from .webshare import WebshareClient, WebshareError, proxy_endpoint
@@ -46,6 +54,8 @@ _KEEP_STEP_KEYS = (
     "数量拉平",
     "对冲已齐",
     "收利未齐",
+    "等待平稳",
+    "价格已平稳",
 )
 
 
@@ -121,6 +131,58 @@ def format_uni_mmr(mmr: Decimal, has_pos: bool) -> str:
     if mmr >= 10:
         return fmt_amount(mmr, 2)
     return fmt_amount(mmr, 4)
+
+
+def _events_payload(account_id: int, events) -> list[dict]:
+    return [
+        {
+            "id": event.id,
+            "account_id": account_id,
+            "action": event.action,
+            "ok": event.ok,
+            "detail": event.detail,
+            "created_at": event.created_at,
+        }
+        for event in events
+    ]
+
+
+def _harvest_notional(
+    legs,
+    mid: Decimal,
+    plan: dict | None,
+    *,
+    collateral: Decimal = Decimal("0"),
+    settings: Settings | None = None,
+) -> Decimal:
+    """有仓用实际名义；无仓用预计开仓单边名义，避免门槛退化成 √本金。
+
+    资金在理财里时 available 可能为 0，plan.target_qty 会被压成 0，
+    这时按本金×占用×杠杆估算开仓后名义（与 position_plan 一致）。
+    """
+    live = position_notional(legs, mid)
+    if live > 0:
+        return live
+    if plan:
+        qty = d(plan.get("target_qty") or "0")
+        if qty > 0 and mid > 0:
+            return qty * mid
+    if settings and collateral > 0:
+        use = margin_use_pct(settings)
+        lev = Decimal(max(int(settings.hedge_leverage), 1))
+        return collateral * use * lev / Decimal("2")
+    return Decimal("0")
+
+
+def _display_leverage(legs, settings: Settings) -> tuple[int, int]:
+    """返回 (展示用实际杠杆, 目标杠杆)。无仓时用 settings 里已按上限压过的有效倍数。"""
+    target = int(settings.hedge_leverage_target or settings.hedge_leverage or 0)
+    actual = int(getattr(legs, "leverage", 0) or 0)
+    if actual <= 0:
+        actual = int(settings.hedge_leverage or target or 0)
+    if target <= 0:
+        target = actual
+    return actual, target
 
 
 def _gather(jobs: dict) -> tuple[dict, dict]:
@@ -395,9 +457,9 @@ class OpsService:
                 coll = risk.get("equity") or Decimal("0")
             fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
             last_harvest = self.store.last_ok_action_at(account.id, "harvest")
-            advice = harvest_advice(legs, stability, settings, last_harvest, principal=coll, fee=fee)
+            sized = _sizing_settings(settings, legs)
             plan = position_plan(
-                _sizing_settings(settings, legs),
+                sized,
                 stability.mid,
                 coll,
                 legs,
@@ -405,10 +467,23 @@ class OpsService:
                 lambda q: futures.round_qty(q, Decimal("0.001")),
                 available=risk.get("available"),
             )
+            advice = harvest_advice(
+                legs,
+                stability,
+                sized,
+                last_harvest,
+                principal=coll,
+                fee=fee,
+                notional=_harvest_notional(
+                    legs, stability.mid, plan, collateral=coll, settings=sized
+                ),
+            )
             has_pos = legs.long_qty > 0 or legs.short_qty > 0
+            lev, lev_tgt = _display_leverage(legs, settings)
             data["symbol"] = settings.hedge_symbol
             data["settle_asset"] = settle_asset_of(settings.hedge_symbol)
-            data["leverage"] = int(legs.leverage or settings.hedge_leverage or 0) or int(settings.hedge_leverage)
+            data["leverage"] = lev
+            data["leverage_target"] = lev_tgt
             data["uni_mmr"] = format_uni_mmr(mmr, has_pos)
             data["price"] = stability.as_dict().get("mid") or data.get("price") or "0"
             data["legs"] = self._legs_payload(legs)
@@ -417,6 +492,7 @@ class OpsService:
             data["enter"] = enter_advice(legs, stability, d(data.get("spot_usdt") or "0"), plan)
             data["harvest"] = advice.as_dict()
             data["account"] = account.public_dict()
+            data["events"] = _events_payload(account.id, self.store.recent_events(account.id, 12))
         except Exception as exc:
             data["legs_refresh_error"] = str(exc)
         return data
@@ -466,11 +542,9 @@ class OpsService:
         if coll <= 0:
             coll = risk.get("equity") or Decimal("0")
         fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
-        advice = harvest_advice(legs, stability, settings, last_harvest, principal=coll, fee=fee)
-        mmr_text = format_uni_mmr(mmr, legs.long_qty > 0 or legs.short_qty > 0)
-        lev = int(legs.leverage or settings.hedge_leverage)
+        sized = _sizing_settings(settings, legs)
         plan = position_plan(
-            _sizing_settings(settings, legs),
+            sized,
             stability.mid,
             coll,
             legs,
@@ -478,12 +552,25 @@ class OpsService:
             lambda q: futures.round_qty(q, Decimal("0.001")),
             available=risk.get("available"),
         )
+        advice = harvest_advice(
+            legs,
+            stability,
+            sized,
+            last_harvest,
+            principal=coll,
+            fee=fee,
+            notional=_harvest_notional(
+                legs, stability.mid, plan, collateral=coll, settings=sized
+            ),
+        )
+        mmr_text = format_uni_mmr(mmr, legs.long_qty > 0 or legs.short_qty > 0)
+        lev, lev_tgt = _display_leverage(legs, settings)
         return {
             "ok": True,
             "account": account.public_dict(),
             "symbol": settings.hedge_symbol,
             "leverage": lev,
-            "leverage_target": int(settings.hedge_leverage_target or settings.hedge_leverage),
+            "leverage_target": lev_tgt,
             "uni_mmr": mmr_text,
             "live_poll_seconds": int(settings.live_poll_seconds),
             "auto_harvest_seconds": int(getattr(settings, "auto_harvest_seconds", 45) or 45),
@@ -493,16 +580,7 @@ class OpsService:
             "stability": stability.as_dict(),
             "enter": enter_advice(legs, stability, self._idle_spot(account), plan),
             "harvest": advice.as_dict(),
-            "events": [
-                {
-                    "id": event.id,
-                    "action": event.action,
-                    "ok": event.ok,
-                    "detail": event.detail,
-                    "created_at": event.created_at,
-                }
-                for event in self.store.recent_events(account.id, 12)
-            ],
+            "events": _events_payload(account.id, self.store.recent_events(account.id, 12)),
         }
 
     def _build_snapshot(self, account: Account) -> dict:
@@ -555,17 +633,28 @@ class OpsService:
         equity = risk.get("equity") or Decimal("0")
         last_harvest = self.store.last_ok_action_at(account.id, "harvest")
         fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
-        advice = harvest_advice(legs, stability, settings, last_harvest, principal=collateral, fee=fee)
         filters = fetched.get("filters")
         step = filters[1] if isinstance(filters, tuple) and len(filters) > 1 else Decimal("0.001")
+        sized = _sizing_settings(settings, legs)
         plan = position_plan(
-            _sizing_settings(settings, legs),
+            sized,
             stability.mid,
             collateral,
             legs,
             mmr,
             lambda q: futures.round_qty(q, step),
             available=risk.get("available"),
+        )
+        advice = harvest_advice(
+            legs,
+            stability,
+            sized,
+            last_harvest,
+            principal=collateral,
+            fee=fee,
+            notional=_harvest_notional(
+                legs, stability.mid, plan, collateral=collateral, settings=sized
+            ),
         )
         enter = enter_advice(legs, stability, spot_usdt, plan)
         try:
@@ -578,7 +667,7 @@ class OpsService:
             margin = {"equity": "0", "need_move": False, "can_click": False, "summary": str(exc), "rows": []}
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
         mmr_text = format_uni_mmr(mmr, has_pos)
-        lev = int(legs.leverage or settings.hedge_leverage or 0) or int(settings.hedge_leverage)
+        lev, lev_tgt = _display_leverage(legs, settings)
         return {
             **base,
             "ok": True,
@@ -586,7 +675,7 @@ class OpsService:
             "symbol": settings.hedge_symbol,
             "settle_asset": settle_asset_of(settings.hedge_symbol),
             "leverage": lev,
-            "leverage_target": int(settings.hedge_leverage_target or settings.hedge_leverage),
+            "leverage_target": lev_tgt,
             "live_poll_seconds": int(settings.live_poll_seconds),
             "collateral_usdt": fmt_amount(collateral, 4),
             "spot_usdt": wallet.get("spot_usdt") or fmt_amount(spot_usdt, 4),
@@ -610,16 +699,7 @@ class OpsService:
             "harvest": advice.as_dict(),
             "switch": switch,
             "holdings": wallet.get("holdings") or [],
-            "events": [
-                {
-                    "id": event.id,
-                    "action": event.action,
-                    "ok": event.ok,
-                    "detail": event.detail,
-                    "created_at": event.created_at,
-                }
-                for event in self.store.recent_events(account.id)
-            ],
+            "events": _events_payload(account.id, self.store.recent_events(account.id)),
         }
 
     def run_action(

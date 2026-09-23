@@ -167,6 +167,8 @@ class HedgeCycle:
 
         if skip_hedge and not repairing:
             steps.extend(self._bootstrap_funds())
+            if any(not s.ok for s in steps):
+                return steps
             steps.append(StepResult("暂缓开对冲", True, "按选择只处理理财"))
             return steps
 
@@ -227,7 +229,7 @@ class HedgeCycle:
         # 先把其它活期（如 USDT 活期）赎成当前最高年化产品，再扫现货申购并入金
         legs = self.futures.legs(self.symbol)
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
-        steps = list(self.pipeline.switch_to_best(full=not has_pos))
+        steps = list(self.pipeline.switch_to_best(full=not has_pos, has_hedge=has_pos))
         if any(not s.ok for s in steps):
             return steps
         sweep = self.pipeline.sweep_spot_to_earn()
