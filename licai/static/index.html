@@ -280,6 +280,103 @@
     }
     .events-scroll table { margin: 0; }
     .events-scroll td.detail { max-width: 520px; white-space: pre-wrap; }
+    #log-overlay { z-index: 1100; }
+    .log-modal {
+      width: min(720px, 96vw);
+      max-height: 88vh;
+      display: flex;
+      flex-direction: column;
+      padding: 0;
+      overflow: hidden;
+      animation: logIn .18s ease-out;
+    }
+    @keyframes logIn {
+      from { opacity: 0; transform: translateY(8px) scale(.98); }
+      to { opacity: 1; transform: none; }
+    }
+    .log-modal-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 18px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .log-modal-head h3 { margin: 0 0 6px; font-size: 16px; }
+    .log-meta { margin: 0; font-size: 12px; color: var(--muted); }
+    .log-pill {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      vertical-align: middle;
+    }
+    .log-pill.ok { background: #143d2a; color: var(--good); }
+    .log-pill.no { background: #4a1d1d; color: var(--bad); }
+    .log-close {
+      flex: 0 0 auto;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      padding: 0;
+      font-size: 18px;
+      line-height: 1;
+      color: var(--muted);
+      background: transparent;
+      border: 1px solid transparent;
+    }
+    .log-close:hover { border-color: var(--line); color: var(--text); background: var(--panel2); }
+    .log-steps {
+      flex: 1 1 auto;
+      overflow: auto;
+      padding: 12px 14px;
+      max-height: 58vh;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .log-step {
+      display: grid;
+      grid-template-columns: 22px 1fr;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: var(--panel2);
+      border: 1px solid var(--line);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .log-step.fail {
+      border-color: rgba(255, 107, 107, .35);
+      background: rgba(74, 29, 29, .35);
+    }
+    .log-step .mark {
+      font-weight: 700;
+      color: var(--good);
+    }
+    .log-step.fail .mark { color: var(--bad); }
+    .log-step .name { color: var(--text); font-weight: 600; margin-bottom: 4px; }
+    .log-step .time {
+      float: right;
+      color: var(--muted);
+      font-weight: 400;
+      font-variant-numeric: tabular-nums;
+    }
+    .log-step .body {
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 11.5px;
+    }
+    .log-modal-foot {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 12px 16px 16px;
+      border-top: 1px solid var(--line);
+    }
     .spinner {
       width: 36px;
       height: 36px;
@@ -473,6 +570,22 @@
       <div class="row">
         <button type="button" id="events-history-more">加载更早</button>
         <button type="button" id="events-history-close" class="primary">关闭</button>
+      </div>
+    </div>
+  </div>
+  <div id="log-overlay" class="overlay" hidden aria-hidden="true">
+    <div class="modal log-modal" role="dialog" aria-modal="true" aria-labelledby="log-title">
+      <div class="log-modal-head">
+        <div>
+          <h3 id="log-title">操作详情</h3>
+          <p class="log-meta" id="log-meta"></p>
+        </div>
+        <button type="button" class="log-close" id="log-close" aria-label="关闭">×</button>
+      </div>
+      <div class="log-steps" id="log-steps"></div>
+      <div class="log-modal-foot">
+        <button type="button" id="log-copy">复制全文</button>
+        <button type="button" id="log-ok" class="primary">关闭</button>
       </div>
     </div>
   </div>
@@ -880,6 +993,67 @@
       return slice.length > 160 ? slice.slice(0, 160) + "…" : slice;
     }
 
+    function parseLogSteps(detail) {
+      const text = String(detail || "").trim();
+      if (!text) return [];
+      return text.split("；").map((part) => {
+        const raw = part.trim();
+        if (!raw) return null;
+        // "16:18:12 开仓 挂单 BUY[ok]: detail" or "开仓…[FAIL]: …"
+        const m = raw.match(/^(?:(\d{1,2}:\d{2}:\d{2})\s+)?(.+?)\[(ok|FAIL)\]:\s*([\s\S]*)$/i);
+        if (m) {
+          return {
+            time: m[1] || "",
+            name: m[2].trim(),
+            ok: String(m[3]).toLowerCase() === "ok",
+            body: m[4].trim(),
+          };
+        }
+        return { time: "", name: "步骤", ok: !/FAIL|错误|失败/.test(raw), body: raw };
+      }).filter(Boolean);
+    }
+
+    let _logFullText = "";
+
+    function showLogDetail(ev) {
+      const overlay = $("log-overlay");
+      const stepsEl = $("log-steps");
+      const ok = !!ev.ok;
+      const action = ev.action || "操作";
+      const when = shortTime(ev.created_at);
+      $("log-title").textContent = action;
+      $("log-meta").innerHTML =
+        `${esc(when)} · <span class="log-pill ${ok ? "ok" : "no"}">${ok ? "成功" : "失败"}</span>`;
+      const detail = String(ev.detail || "");
+      _logFullText = `${when} · ${action} · ${ok ? "成功" : "失败"}\n\n${detail}`;
+      const steps = parseLogSteps(detail);
+      stepsEl.innerHTML = "";
+      if (!steps.length) {
+        stepsEl.innerHTML = `<div class="log-step"><span class="mark">·</span><div><div class="body">${esc(detail || "无详情")}</div></div></div>`;
+      } else {
+        steps.forEach((s) => {
+          const div = document.createElement("div");
+          div.className = "log-step" + (s.ok ? "" : " fail");
+          div.innerHTML =
+            `<span class="mark">${s.ok ? "✓" : "✗"}</span>` +
+            `<div>` +
+            `<div class="name">${s.time ? `<span class="time">${esc(s.time)}</span>` : ""}${esc(s.name)}</div>` +
+            `<div class="body">${esc(s.body)}</div>` +
+            `</div>`;
+          stepsEl.appendChild(div);
+        });
+      }
+      overlay.hidden = false;
+      overlay.setAttribute("aria-hidden", "false");
+      stepsEl.scrollTop = 0;
+    }
+
+    function closeLogDetail() {
+      const overlay = $("log-overlay");
+      overlay.hidden = true;
+      overlay.setAttribute("aria-hidden", "true");
+    }
+
     function appendEventRows(tbody, events) {
       (events || []).forEach((e) => {
         const tr = document.createElement("tr");
@@ -887,9 +1061,7 @@
         const short = eventPreview(detail);
         tr.innerHTML = `<td>${esc(shortTime(e.created_at))}</td><td>${esc(e.action)}</td><td>${e.ok ? "成功" : "失败"}</td><td class="detail" title="${esc(detail)}">${esc(short)}</td>`;
         tr.style.cursor = "pointer";
-        tr.onclick = () => {
-          alert(`${shortTime(e.created_at)} · ${e.action} · ${e.ok ? "成功" : "失败"}\n\n${detail}`);
-        };
+        tr.onclick = () => showLogDetail(e);
         tbody.appendChild(tr);
       });
     }
@@ -1739,6 +1911,25 @@
     $("events-history-close").onclick = () => closeEventsHistory();
     $("events-overlay").addEventListener("click", (ev) => {
       if (ev.target === $("events-overlay")) closeEventsHistory();
+    });
+    $("log-close").onclick = () => closeLogDetail();
+    $("log-ok").onclick = () => closeLogDetail();
+    $("log-overlay").addEventListener("click", (ev) => {
+      if (ev.target === $("log-overlay")) closeLogDetail();
+    });
+    $("log-copy").onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(_logFullText || "");
+        $("log-copy").textContent = "已复制";
+        setTimeout(() => { $("log-copy").textContent = "复制全文"; }, 1200);
+      } catch (err) {
+        $("log-copy").textContent = "复制失败";
+        setTimeout(() => { $("log-copy").textContent = "复制全文"; }, 1200);
+      }
+    };
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      if (!$("log-overlay").hidden) closeLogDetail();
     });
 
     $("btn-logout").onclick = async () => {
