@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from .config import ROOT, normalize_hedge_symbol
 
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "accounts.sqlite"
+ACTIONS_JSONL = DATA_DIR / "actions.jsonl"
 
 
 @dataclass
@@ -260,6 +262,14 @@ class AccountStore:
             )
             for row in rows
         ]
+
+    def append_action_jsonl(self, payload: dict) -> None:
+        """每次动作追加一行完整步骤，方便重启后排查；与 events 表互补。"""
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        row = dict(payload)
+        row["created_at"] = _now()
+        with ACTIONS_JSONL.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
     def last_ok_action_at(self, account_id: int, action: str) -> str | None:
         with self._connect() as conn:

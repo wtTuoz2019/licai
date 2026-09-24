@@ -866,11 +866,25 @@
       return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
     }
 
+    function eventPreview(detail) {
+      const text = String(detail || "");
+      if (!text) return "";
+      // 优先露出开仓/对冲片段，避免只显示前面的换产品/赎回
+      const keys = ["开仓 挂单", "开仓 市价", "对冲平衡", "单边兜底", "入场顺序", "自动开仓", "自动收利"];
+      let hit = -1;
+      for (const k of keys) {
+        const i = text.indexOf(k);
+        if (i >= 0 && (hit < 0 || i < hit)) hit = i;
+      }
+      const slice = hit >= 0 ? text.slice(Math.max(0, hit - 8)) : text;
+      return slice.length > 160 ? slice.slice(0, 160) + "…" : slice;
+    }
+
     function appendEventRows(tbody, events) {
       (events || []).forEach((e) => {
         const tr = document.createElement("tr");
         const detail = String(e.detail || "");
-        const short = detail.length > 120 ? detail.slice(0, 120) + "…" : detail;
+        const short = eventPreview(detail);
         tr.innerHTML = `<td>${esc(shortTime(e.created_at))}</td><td>${esc(e.action)}</td><td>${e.ok ? "成功" : "失败"}</td><td class="detail" title="${esc(detail)}">${esc(short)}</td>`;
         tr.style.cursor = "pointer";
         tr.onclick = () => {
@@ -921,9 +935,10 @@
         }
         appendEventRows(body, rows);
         historyOldestId = Math.min(...rows.map((e) => Number(e.id) || 0));
-        $("events-history-hint").textContent =
-          `已加载 ${body.children.length} 条 · 存在本机 SQLite，重启可查`;
-        more.disabled = !data.has_more;
+          $("events-history-hint").textContent =
+            `已加载 ${body.children.length} 条 · 库 ${data.db_path || ""}` +
+            (data.actions_log ? ` · 全文备份 ${data.actions_log}` : "");
+          more.disabled = !data.has_more;
       } catch (err) {
         $("events-history-hint").textContent = "加载失败：" + (err.message || err);
       } finally {

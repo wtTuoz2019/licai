@@ -30,11 +30,48 @@ def _detail(value) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
-# 收利/补仓诊断必须留住的步骤名关键词（不能只存末尾 4 步）
+def _post_only_fail(step: StepResult) -> bool:
+    if step.ok:
+        return False
+    text = str(step.detail or "").lower()
+    return "-5022" in text or "post only" in text or "could not be executed as maker" in text
+
+
+def _action_ok(steps: list[StepResult], *, error: Exception | None = None) -> bool:
+    """最终对冲/收利成功则算成功；中间可恢复的 -5022 不把整单打成失败。"""
+    if error is not None:
+        return False
+    if not steps:
+        return True
+    success_names = ("对冲平衡", "对冲已齐", "收利完成", "单边已平")
+    if any(s.ok and s.name in success_names for s in steps):
+        for s in steps:
+            if s.ok:
+                continue
+            if _post_only_fail(s):
+                continue
+            if s.name in {"PostOnly 改价", "第二腿追价", "单边兜底", "挂单未齐"}:
+                continue
+            # 其它失败（保证金不够、异常等）仍算失败
+            return False
+        return True
+    return all(s.ok for s in steps)
+
+
+# 收利/补仓/开仓诊断必须留住的步骤名关键词
 _KEEP_STEP_KEYS = (
     "触发止盈",
     "平仓",
     "补仓",
+    "开仓",
+    "挂单",
+    "对冲",
+    "入场顺序",
+    "PostOnly",
+    "第二腿",
+    "单边兜底",
+    "市价",
+    "杠杆",
     "保证金",
     "转出",
     "可转",
@@ -53,14 +90,16 @@ _KEEP_STEP_KEYS = (
     "补齐缺口",
     "数量拉平",
     "对冲已齐",
+    "对冲平衡",
     "收利未齐",
     "等待平稳",
     "价格已平稳",
+    "异常中断",
 )
 
 
-def _event_summary(steps: list[StepResult], *, limit: int = 2000) -> str:
-    """失败步骤 + 关键节点优先入事件，避免只留末 4 步把补仓原因裁掉。"""
+def _event_summary(steps: list[StepResult], *, limit: int = 12000) -> str:
+    """失败 + 关键节点优先；剩余额度从后往前补，避免开仓挂单被前面的赎回 JSON 挤掉。"""
     if not steps:
         return "无步骤"
 
@@ -83,8 +122,8 @@ def _event_summary(steps: list[StepResult], *, limit: int = 2000) -> str:
     for i, step in enumerate(steps):
         if any(k in step.name for k in _KEEP_STEP_KEYS):
             add(i)
-    # 再按时间顺序补全，直到接近上限
-    for i in range(len(steps)):
+    # 从后往前补全（开仓/挂单通常在末尾）
+    for i in range(len(steps) - 1, -1, -1):
         add(i)
         draft = "；".join(line(steps[j]) for j in sorted(seen))
         if len(draft) >= limit:
@@ -94,19 +133,22 @@ def _event_summary(steps: list[StepResult], *, limit: int = 2000) -> str:
     text = "；".join(line(steps[i]) for i in ordered)
     if len(text) <= limit:
         return text
-    # 超长时：失败优先，再关键，再截断
     failed = [i for i in ordered if not steps[i].ok]
     key = [i for i in ordered if i not in failed and any(k in steps[i].name for k in _KEEP_STEP_KEYS)]
     rest = [i for i in ordered if i not in failed and i not in key]
+    # 剩余也优先靠后的步骤
+    rest = sorted(rest, reverse=True)
     picked: list[int] = []
     for group in (failed, key, rest):
         for i in group:
-            trial = "；".join(line(steps[j]) for j in sorted(picked + [i]))
-            if trial and len(trial) > limit and picked:
+            trial = sorted(picked + [i])
+            draft = "；".join(line(steps[j]) for j in trial)
+            if len(draft) > limit and picked:
                 continue
             picked.append(i)
-    out = "；".join(line(steps[i]) for i in sorted(picked))
-    return out[:limit]
+            if len(draft) >= limit:
+                break
+    return "；".join(line(steps[i]) for i in sorted(picked))[:limit]
 
 
 def _sizing_settings(settings: Settings, legs) -> Settings:
@@ -720,11 +762,16 @@ class OpsService:
     def list_events(self, account: Account, *, limit: int = 100, before_id: int | None = None) -> dict:
         limit = max(1, min(int(limit or 100), 500))
         rows = self.store.list_events(account.id, limit=limit, before_id=before_id)
+        from .store import ACTIONS_JSONL, DB_PATH
+
         return {
             "ok": True,
             "account_id": account.id,
             "events": _events_payload(account.id, rows),
             "has_more": len(rows) >= limit,
+            "db_path": str(self.store.path),
+            "actions_log": str(ACTIONS_JSONL),
+            "default_db": str(DB_PATH),
         }
 
     def run_action(
@@ -859,32 +906,44 @@ class OpsService:
                 side = None
             # 自动收利：按 MACD 指定腿；平稳用收利宽阈值，仍可等一会再平
             wait_stable = not force
-            steps = cycle.harvest_once(wait_stable=wait_stable, side=side if auto else None)
+            run = lambda: cycle.harvest_once(wait_stable=wait_stable, side=side if auto else None)
         elif action == "scale":
-            steps = cycle.scale_once(force=force or mode == "force")
+            run = lambda: cycle.scale_once(force=force or mode == "force")
         elif action == "switch":
-            steps = pipe.switch_to_best()
+            run = lambda: pipe.switch_to_best()
         elif action == "leverage":
-            steps = cycle.apply_leverage()
+            run = lambda: cycle.apply_leverage()
         else:
-            steps = cycle.setup_once(
+            run = lambda: cycle.setup_once(
                 force_hedge=force or mode == "force",
                 skip_hedge=mode == "earn_only",
             )
-        if getattr(cycle, "leverage_cap_changed", False):
-            account = self.store.set_leverage_cap(
-                account.id,
-                getattr(cycle, "leverage_cap", None),
-                getattr(cycle, "leverage_unlock_at", None),
-            )
-        ok = all(step.ok for step in steps) if steps else True
-        summary = _event_summary(steps, limit=1900)
-        if auto:
-            prefix = "自动开仓：" if action == "enter" else "自动收利："
-            summary = prefix + summary
-        self.store.add_event(account.id, action, ok, summary[:2000])
+
+        steps: list[StepResult] = []
+        err: Exception | None = None
+        try:
+            steps = list(run() or [])
+            if getattr(cycle, "leverage_cap_changed", False):
+                account = self.store.set_leverage_cap(
+                    account.id,
+                    getattr(cycle, "leverage_cap", None),
+                    getattr(cycle, "leverage_unlock_at", None),
+                )
+        except Exception as exc:
+            err = exc
+            steps.append(StepResult("异常中断", False, str(exc)))
+        finally:
+            # 无论成功、失败还是中途抛错，都落库 + jsonl，避免重启后看不到开单过程
+            self._persist_action_log(account, action, steps, auto=auto, error=err)
+
+        if err is not None:
+            raise err
+
+        ok = _action_ok(steps, error=None)
         if not ok:
-            fails = [f"{s.name}: {_detail(s.detail)}" for s in steps if not s.ok]
+            fails = [f"{s.name}: {_detail(s.detail)}" for s in steps if not s.ok and not _post_only_fail(s)]
+            if not fails:
+                fails = [f"{s.name}: {_detail(s.detail)}" for s in steps if not s.ok]
             if fails:
                 print(f"动作失败 account={account.id} action={action} " + " | ".join(fails)[:800])
         self.invalidate_snapshot(account.id)
@@ -895,3 +954,38 @@ class OpsService:
             "steps": steps_payload(steps),
             "snapshot": self.snapshot(account, force=True),
         }
+
+    def _persist_action_log(
+        self,
+        account: Account,
+        action: str,
+        steps: list[StepResult],
+        *,
+        auto: bool = False,
+        error: Exception | None = None,
+    ) -> None:
+        ok = _action_ok(steps, error=error)
+        summary = _event_summary(steps, limit=12000)
+        if error is not None and "异常中断" not in summary:
+            summary = (summary + "；" if summary else "") + f"异常中断[FAIL]: {error}"
+        if auto:
+            prefix = "自动开仓：" if action == "enter" else "自动收利："
+            summary = prefix + summary
+        try:
+            self.store.add_event(account.id, action, ok, summary[:12000])
+        except Exception as exc:
+            print(f"写 events 失败 account={account.id} action={action}: {exc}", flush=True)
+        try:
+            self.store.append_action_jsonl(
+                {
+                    "account_id": account.id,
+                    "action": action,
+                    "ok": ok,
+                    "auto": auto,
+                    "error": str(error) if error else "",
+                    "steps": steps_payload(steps),
+                    "summary": summary[:12000],
+                }
+            )
+        except Exception as exc:
+            print(f"写 actions.jsonl 失败 account={account.id} action={action}: {exc}", flush=True)
