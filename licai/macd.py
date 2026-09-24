@@ -1,4 +1,4 @@
-"""c7.pro MACD 金叉/死叉信号，仅用于自动收利过滤。"""
+"""c7.pro MACD 金叉/死叉，仅用于自动收利过滤。"""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ _cache: dict[str, tuple[float, "MacdCross | None", str]] = {}
 
 @dataclass(frozen=True)
 class MacdCross:
-    """最近两根 K 线是否刚发生金叉/死叉。"""
+    """最近两根 K 线是否刚发生金叉/死叉（必须交叉那一根）。"""
 
     kind: str  # golden | death
     time: str
@@ -83,7 +83,7 @@ def _detect_cross(rows: list[dict]) -> MacdCross | None:
 
 
 def fetch_macd_cross(url: str | None = None, *, timeout: float = 4.0) -> MacdCross | None:
-    """拉取指标；失败返回 None（自动收利视为无信号，不触发）。"""
+    """仅在刚交叉时返回；无交叉或失败返回 None。"""
     endpoint = (url or DEFAULT_URL).strip() or DEFAULT_URL
     now = time.monotonic()
     hit = _cache.get(endpoint)
@@ -98,6 +98,5 @@ def fetch_macd_cross(url: str | None = None, *, timeout: float = 4.0) -> MacdCro
         return cross
     except Exception as exc:
         log.warning("MACD 指标拉取失败: %s", exc)
-        # 短暂缓存失败，避免打爆接口；不沿用过期金叉以免误触发
         _cache[endpoint] = (now, None, str(exc))
         return None

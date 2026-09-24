@@ -58,14 +58,16 @@ maker_only: false            # 入场/加仓仍可市价兜底；收利平仓固
 quote_refresh_seconds: 2     # 每轮挂单约 1–1.5s 改价
 hedge_quote_retries: 8       # 挂单轮数：入场/补仓约 12+，平仓更长
 maker_improve_bps: 1         # 追价时相对现价最多往里靠 1bp；仍留 1 档，GTX 不吃单
-maker_passive_bps: 1         # 首挂：买=买一×(1-1bp)、卖=卖一×(1+1bp)，两边对称等成交
-# 第二腿（单边成交后补齐）：时间截断 + 价格逃逸，任一触发立刻撤挂转市价
-hedge_max_wait_seconds: 0.8  # 第一腿成交后最多再等多久挂第二腿
-hedge_max_slippage_bps: 3.5  # 相对第一腿成交价，BBO 不利偏离超过此 bp 则市价补齐
+maker_passive_bps: 2         # 首挂：买/卖相对买一/卖一往外约 2bp，少贴盘口少 -5022
+maker_passive_ticks: 2       # 首挂至少离买一/卖一 2 档（与 bp 取更远）
+# 第二腿（单边成交后补齐）：先等多一会 → maker 追价 1–2 次 → 再市价
+hedge_max_wait_seconds: 2.0  # 第一腿成交后最多再等多久第二腿挂单
+hedge_second_leg_chases: 2   # 超时/逃逸后、市价前再 GTX 追价次数
+hedge_max_slippage_bps: 3.5  # 相对第一腿成交价，BBO 不利偏离超过此 bp 则进入追价/市价
 watch_seconds: 60            # 命令行盯盘间隔
 live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
 auto_harvest_seconds: 60     # 开启「自动收利」后后台检查间隔（与 MACD 1 分钟对齐）
-# 自动收利开关：无仓且平稳时自动双边开仓；有仓时再按 MACD 金叉收空/死叉收多（手动不受影响）
+# 自动收利：无仓且严平稳时自动开仓；有仓须 MACD 金叉/死叉 + 收利宽平稳（金叉收空/死叉收多）
 # 接口示例 https://c7.pro/capi/indicator
 macd_auto_harvest: true
 macd_indicator_url: "https://c7.pro/capi/indicator"
@@ -81,8 +83,10 @@ harvest_pos_pct: 0.03        # 单边名义约 3% 再收（少收几次，少磨
 harvest_sqrt_coeff: 0.5      # 无仓位时 0.5×√本金兜底
 harvest_min_usdt: 1          # 绝对下限（结算币，USDT/USDC 都适用）
 cooldown_minutes: 15         # 两次平仓最短间隔
-stable_range_pct: 0.0025     # 15 分钟振幅 ≤ 0.25%（各币通用）；近 5/2 分钟按比例更严
-stable_spread_pct: 0.00025   # 盘口价差 ≤ 0.025%
+stable_range_pct: 0.0025     # 入场：15 分钟振幅 ≤ 0.25%；近 5/2 分钟按比例更严
+stable_spread_pct: 0.00025   # 入场：盘口价差 ≤ 0.025%
+harvest_stable_range_pct: 0.006  # 收利：15 分钟振幅 ≤ 0.6%（比入场宽，交叉时更容易收）
+harvest_stable_spread_pct: 0.0006  # 收利：盘口价差 ≤ 0.06%
 harvest_stable_wait_seconds: 90  # 收利中平仓/补仓前最多等多久变平稳；超时仍继续
 
 # 换产品：分批赎回旧仓、立刻申购更高年化。按赎回瞬间这块保证金暂时失效来估

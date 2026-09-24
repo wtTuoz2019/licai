@@ -26,8 +26,9 @@ def _qty(legs: dict, key: str):
 class AutoHarvestWorker:
     """后台轮询（账号开启「自动收利」）：
 
-    - 无仓：价格平稳时自动双边开仓（不看 MACD）
-    - 有仓：浮盈/冷却/平稳 + c7 MACD 金叉收空、死叉收多
+    - 无仓：严平稳时自动双边开仓（不看 MACD）
+    - 有仓：浮盈达标 + 冷却 + MACD 金叉/死叉那一根
+      （金叉收空、死叉收多）+ 收利宽平稳
     手动一键入场/收利不受影响。
     """
 
@@ -43,7 +44,7 @@ class AutoHarvestWorker:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="auto-harvest", daemon=True)
         self._thread.start()
-        _print("自动收利后台已启动（无仓平稳可自动开仓）")
+        _print("自动收利后台已启动（无仓严平稳开仓；有仓须金叉/死叉+收利宽平稳）")
 
     def stop(self) -> None:
         self._stop.set()
@@ -77,14 +78,14 @@ class AutoHarvestWorker:
                 log.exception("账号 %s 自动开仓/收利失败", account.id)
 
     def _macd_side(self) -> tuple[str | None, str]:
-        """返回 (harvest_side, 说明)。无信号时 side=None。"""
+        """仅金叉/死叉那一根才返回腿；否则 None。"""
         base = self.ops.base
         if not bool(getattr(base, "macd_auto_harvest", True)):
             return None, "MACD 过滤已关闭"
         url = getattr(base, "macd_indicator_url", None) or ""
         cross = fetch_macd_cross(url)
         if cross is None:
-            return None, "无金叉/死叉或指标不可用"
+            return None, "当前不是金叉/死叉那一根"
         key = f"{cross.kind}:{cross.time}"
         if key == self._last_cross_key:
             return None, f"{cross.label}@{cross.time} 已处理过"
@@ -107,12 +108,11 @@ class AutoHarvestWorker:
             self.ops.end_action(account.id)
 
     def _maybe_enter(self, account, live: dict) -> None:
-        """无仓：价格平稳则自动双边开仓，不要求金叉/死叉。"""
+        """无仓：价格平稳则自动双边开仓，不要求 MACD。"""
         stability = live.get("stability") or {}
         enter = live.get("enter") or {}
         if not stability.get("stable"):
             return
-        # enter.can_click 在无仓不稳时为 False；稳时为 True（或有闲置现货也可点）
         if enter.get("can_click") is False and not enter.get("stable_ok"):
             return
         if not enter.get("stable_ok", stability.get("stable")):
@@ -143,6 +143,7 @@ class AutoHarvestWorker:
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
             if not side:
                 return
+            # 必须交叉那一根 + 收利平稳(更宽) + 浮盈 + 冷却
             if not harvest.get("stable_ok") or not harvest.get("cooldown_ok"):
                 return
             if legs.get("missing"):

@@ -97,8 +97,18 @@ def exit_ip(client: BinanceClient, *, force: bool = False) -> str:
     return ip
 
 
-def price_stability(futures: FuturesAPI, settings: Settings) -> Stability:
-    """更严的平稳：15/5/2 分钟振幅 + 盘口价差都过，才适合挂单平仓/开仓。"""
+def price_stability(
+    futures: FuturesAPI,
+    settings: Settings,
+    *,
+    range_pct: Decimal | None = None,
+    spread_pct_limit: Decimal | None = None,
+    purpose: str = "enter",
+) -> Stability:
+    """平稳判定：15/5/2 分钟振幅 + 盘口价差。
+
+    purpose=harvest 时用收利专用更宽阈值（harvest_stable_*），入场仍用更严的 stable_*。
+    """
     symbol = settings.hedge_symbol
     bid, ask = futures.book(symbol)
     mid = (bid + ask) / 2 if bid + ask > 0 else Decimal("0")
@@ -120,29 +130,44 @@ def price_stability(futures: FuturesAPI, settings: Settings) -> Stability:
     range_15m = _range(rows[-15:])
     range_5m = _range(rows[-5:])
     range_2m = _range(rows[-2:])
-    limit = settings.stable_range_pct
+    if range_pct is not None:
+        limit = range_pct
+    elif purpose == "harvest":
+        limit = getattr(settings, "harvest_stable_range_pct", None) or settings.stable_range_pct
+    else:
+        limit = settings.stable_range_pct
     limit_5m = limit * Decimal("0.45")
     limit_2m = limit * Decimal("0.28")
-    spread_limit = getattr(settings, "stable_spread_pct", None) or Decimal("0.0003")
+    if spread_pct_limit is not None:
+        spread_limit = spread_pct_limit
+    elif purpose == "harvest":
+        spread_limit = (
+            getattr(settings, "harvest_stable_spread_pct", None)
+            or getattr(settings, "stable_spread_pct", None)
+            or Decimal("0.0003")
+        )
+    else:
+        spread_limit = getattr(settings, "stable_spread_pct", None) or Decimal("0.0003")
     stable = (
         range_15m <= limit
         and range_5m <= limit_5m
         and range_2m <= limit_2m
         and spread_pct <= spread_limit
     )
+    tag = "收利" if purpose == "harvest" else "入场"
     if stable:
         hint = (
-            f"价格较稳：15 分 {_pct(range_15m)}% / 5 分 {_pct(range_5m)}% / 近 2 分 {_pct(range_2m)}%，"
-            f"价差 {_pct(spread_pct)}%，适合挂单入场或平仓"
+            f"价格较稳（{tag}）：15 分 {_pct(range_15m)}% / 5 分 {_pct(range_5m)}% / 近 2 分 {_pct(range_2m)}%，"
+            f"价差 {_pct(spread_pct)}%，适合挂单"
         )
     elif range_15m > limit:
-        hint = f"波动偏大：15 分钟振幅 {_pct(range_15m)}%，超过 {_pct(limit)}%，挂单难成交、易滑点"
+        hint = f"波动偏大：15 分钟振幅 {_pct(range_15m)}%，超过 {_pct(limit)}%（{tag}），挂单难成交、易滑点"
     elif range_5m > limit_5m:
-        hint = f"近 5 分钟还在晃：振幅 {_pct(range_5m)}%，超过 {_pct(limit_5m)}%，再等一会再挂单"
+        hint = f"近 5 分钟还在晃：振幅 {_pct(range_5m)}%，超过 {_pct(limit_5m)}%（{tag}），再等一会再挂单"
     elif range_2m > limit_2m:
         hint = f"刚有跳动：近 2 分钟振幅 {_pct(range_2m)}%，等盘口稳住再挂单平/开"
     else:
-        hint = f"盘口偏宽：价差 {_pct(spread_pct)}%，超过 {_pct(spread_limit)}%，限价不易两边一起成交"
+        hint = f"盘口偏宽：价差 {_pct(spread_pct)}%，超过 {_pct(spread_limit)}%（{tag}），限价不易两边一起成交"
     return Stability(symbol, mid, spread_pct, range_15m, range_5m, stable, hint)
 
 
@@ -350,7 +375,7 @@ def harvest_advice(
     elif not cooldown_ok:
         reason = f"距上次平仓还差 {left} 秒冷却，先别连点"
     elif not stable_ok:
-        reason = "价格还不够稳（近几分钟或盘口），等「平稳」再收，挂单更容易成交；也可强行收利（易吃单）"
+        reason = "价格还不够稳（收利已放宽振幅，仍超限），等稳一点再收；也可强行收利（易吃单）"
     else:
         reason = (
             f"{winner} 浮盈 {fmt_amount(pnl, 4)}，扣完约 {fmt_amount(fee, 4)} 手续费后净利约 {fmt_amount(net, 4)}。"
@@ -379,7 +404,8 @@ def schedule_hint(settings: Settings) -> str:
     return (
         f"资金/理财一天拉一次，点「刷新」才重拉。"
         f"仓位浮盈大约每 {int(settings.live_poll_seconds)} 秒更新。"
-        f"价格要够稳（15 分振幅 ≤ {_pct(settings.stable_range_pct)}%，近几分钟也小、盘口不宽）才挂单收利；"
+        f"入场要够稳（15 分 ≤ {_pct(settings.stable_range_pct)}%）；"
+        f"收利更宽（15 分 ≤ {_pct(getattr(settings, 'harvest_stable_range_pct', None) or settings.stable_range_pct)}%）。"
         f"收利门槛按仓位名义和约 {fmt_amount(settings.min_profit_fee_multiple, 0)} 倍手续费、"
         f"距上次平仓超过 {settings.cooldown_minutes} 分钟。"
     )

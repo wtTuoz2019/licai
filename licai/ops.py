@@ -467,9 +467,13 @@ class OpsService:
                 lambda q: futures.round_qty(q, Decimal("0.001")),
                 available=risk.get("available"),
             )
+            try:
+                harvest_stab = price_stability(futures, settings, purpose="harvest")
+            except Exception:
+                harvest_stab = stability
             advice = harvest_advice(
                 legs,
-                stability,
+                harvest_stab,
                 sized,
                 last_harvest,
                 principal=coll,
@@ -552,9 +556,13 @@ class OpsService:
             lambda q: futures.round_qty(q, Decimal("0.001")),
             available=risk.get("available"),
         )
+        try:
+            harvest_stab = price_stability(futures, settings, purpose="harvest")
+        except Exception:
+            harvest_stab = stability
         advice = harvest_advice(
             legs,
-            stability,
+            harvest_stab,
             sized,
             last_harvest,
             principal=coll,
@@ -647,7 +655,7 @@ class OpsService:
         )
         advice = harvest_advice(
             legs,
-            stability,
+            price_stability(futures, settings, purpose="harvest"),
             sized,
             last_harvest,
             principal=collateral,
@@ -739,7 +747,7 @@ class OpsService:
 
     @staticmethod
     def _auto_side_harvest_ok(live: dict, harvest: dict, side: str) -> bool:
-        """自动收利指定腿：平稳+冷却+该腿浮盈达标+对冲齐全。"""
+        """自动收利指定腿：收利平稳(更宽)+冷却+该腿浮盈达标+对冲齐全。"""
         if not harvest.get("stable_ok"):
             return False
         if not harvest.get("cooldown_ok"):
@@ -832,8 +840,9 @@ class OpsService:
             side = (harvest_side or "").upper() or None
             if side not in {"LONG", "SHORT"}:
                 side = None
-            # 仅自动收利按 MACD 指定腿；手动仍按浮盈选赢家
-            steps = cycle.harvest_once(wait_stable=not force, side=side if auto else None)
+            # 自动收利：按 MACD 指定腿；平稳用收利宽阈值，仍可等一会再平
+            wait_stable = not force
+            steps = cycle.harvest_once(wait_stable=wait_stable, side=side if auto else None)
         elif action == "scale":
             steps = cycle.scale_once(force=force or mode == "force")
         elif action == "switch":
