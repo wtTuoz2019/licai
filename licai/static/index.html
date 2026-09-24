@@ -261,6 +261,25 @@
     .modal p { margin: 0 0 16px; color: var(--muted); white-space: pre-wrap; }
     .modal p:empty { display: none; margin: 0; }
     .modal .row { justify-content: flex-end; margin-top: 12px; }
+    .events-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .events-head .ghost { font-size: 12px; padding: 4px 10px; }
+    .events-modal { width: min(860px, 96vw); max-height: 86vh; display: flex; flex-direction: column; }
+    .events-modal h3 { flex: 0 0 auto; }
+    .events-scroll {
+      flex: 1 1 auto;
+      overflow: auto;
+      max-height: 58vh;
+      margin: 0 0 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .events-scroll table { margin: 0; }
+    .events-scroll td.detail { max-width: 520px; white-space: pre-wrap; }
     .spinner {
       width: 36px;
       height: 36px;
@@ -416,7 +435,10 @@
               <button type="button" id="btn-proxy" class="primary">保存</button>
             </div>
           </div>
-          <h2>最近操作</h2>
+          <h2 class="events-head">
+            最近操作
+            <button type="button" id="btn-events-history" class="ghost">历史日志</button>
+          </h2>
           <table>
             <thead><tr><th>时间</th><th>动作</th><th>结果</th><th>详情</th></tr></thead>
             <tbody id="events"></tbody>
@@ -435,6 +457,22 @@
         <button type="button" id="modal-cancel">取消</button>
         <button type="button" id="modal-extra" class="warn" hidden>只买理财</button>
         <button type="button" id="modal-ok" class="primary">确认</button>
+      </div>
+    </div>
+  </div>
+  <div id="events-overlay" class="overlay" hidden aria-hidden="true">
+    <div class="modal events-modal" role="dialog" aria-modal="true">
+      <h3>历史操作日志</h3>
+      <p class="muted" id="events-history-hint">数据存在本机 SQLite，重启后仍可查看。</p>
+      <div class="events-scroll">
+        <table>
+          <thead><tr><th>时间</th><th>动作</th><th>结果</th><th>详情</th></tr></thead>
+          <tbody id="events-history-body"></tbody>
+        </table>
+      </div>
+      <div class="row">
+        <button type="button" id="events-history-more">加载更早</button>
+        <button type="button" id="events-history-close" class="primary">关闭</button>
       </div>
     </div>
   </div>
@@ -820,9 +858,83 @@
     function shortTime(iso) {
       if (!iso) return "";
       const d = new Date(iso);
-      if (Number.isNaN(d.getTime())) return String(iso).slice(5, 16).replace("T", " ");
+      if (Number.isNaN(d.getTime())) {
+        const s = String(iso).replace("T", " ").replace("Z", "");
+        return s.length >= 19 ? s.slice(5, 19) : s.slice(5, 16);
+      }
       const p = (n) => String(n).padStart(2, "0");
-      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    }
+
+    function appendEventRows(tbody, events) {
+      (events || []).forEach((e) => {
+        const tr = document.createElement("tr");
+        const detail = String(e.detail || "");
+        const short = detail.length > 120 ? detail.slice(0, 120) + "…" : detail;
+        tr.innerHTML = `<td>${esc(shortTime(e.created_at))}</td><td>${esc(e.action)}</td><td>${e.ok ? "成功" : "失败"}</td><td class="detail" title="${esc(detail)}">${esc(short)}</td>`;
+        tr.style.cursor = "pointer";
+        tr.onclick = () => {
+          alert(`${shortTime(e.created_at)} · ${e.action} · ${e.ok ? "成功" : "失败"}\n\n${detail}`);
+        };
+        tbody.appendChild(tr);
+      });
+    }
+
+    function fillEvents(events, tbodyEl) {
+      const tbody = tbodyEl || $("events");
+      if (!tbody) return;
+      tbody.innerHTML = "";
+      appendEventRows(tbody, events);
+    }
+
+    let historyOldestId = null;
+    let historyLoading = false;
+
+    async function openEventsHistory({ append = false } = {}) {
+      if (!selected) {
+        setActionMsg("先选账号");
+        return;
+      }
+      if (historyLoading) return;
+      historyLoading = true;
+      const overlay = $("events-overlay");
+      const body = $("events-history-body");
+      const more = $("events-history-more");
+      try {
+        if (!append) {
+          historyOldestId = null;
+          body.innerHTML = "";
+          overlay.hidden = false;
+          overlay.setAttribute("aria-hidden", "false");
+          $("events-history-hint").textContent = "加载中…";
+        }
+        const q = new URLSearchParams({ limit: "80" });
+        if (append && historyOldestId) q.set("before_id", String(historyOldestId));
+        const data = await api(`/api/accounts/${selected}/events?${q}`);
+        const rows = eventsForAccount(data.events || [], selected);
+        if (!rows.length) {
+          $("events-history-hint").textContent = append
+            ? "没有更早的记录了"
+            : "这个账号还没有操作日志（存在本机 data/accounts.sqlite）";
+          more.disabled = true;
+          return;
+        }
+        appendEventRows(body, rows);
+        historyOldestId = Math.min(...rows.map((e) => Number(e.id) || 0));
+        $("events-history-hint").textContent =
+          `已加载 ${body.children.length} 条 · 存在本机 SQLite，重启可查`;
+        more.disabled = !data.has_more;
+      } catch (err) {
+        $("events-history-hint").textContent = "加载失败：" + (err.message || err);
+      } finally {
+        historyLoading = false;
+      }
+    }
+
+    function closeEventsHistory() {
+      const overlay = $("events-overlay");
+      overlay.hidden = true;
+      overlay.setAttribute("aria-hidden", "true");
     }
 
     async function api(path, opts) {
@@ -1142,19 +1254,6 @@
       showSnapAge();
     }
 
-    function fillEvents(events) {
-      const tbody = $("events");
-      if (!tbody) return;
-      tbody.innerHTML = "";
-      (events || []).forEach((e) => {
-        const tr = document.createElement("tr");
-        const detail = String(e.detail || "");
-        const short = detail.length > 72 ? detail.slice(0, 72) + "…" : detail;
-        tr.innerHTML = `<td>${esc(shortTime(e.created_at))}</td><td>${esc(e.action)}</td><td>${e.ok ? "成功" : "失败"}</td><td class="detail" title="${esc(detail)}">${esc(short)}</td>`;
-        tbody.appendChild(tr);
-      });
-    }
-
     async function refresh({ force = false, silent = false } = {}) {
       if (!selected) return;
       const id = selected;
@@ -1211,7 +1310,10 @@
     function formatActionResult(data) {
       if (data.blocked) return "已拦截：" + (data.reason || "");
       if (data.error) return data.error;
-      const rows = (data.steps || []).map((s) => `${s.ok ? "✓" : "✗"} ${s.name}：${s.detail || ""}`);
+      const rows = (data.steps || []).map((s) => {
+        const t = s.at ? `${s.at} ` : "";
+        return `${s.ok ? "✓" : "✗"} ${t}${s.name}：${s.detail || ""}`;
+      });
       return (data.ok ? "完成" : "失败") + (rows.length ? "\n" + rows.join("\n") : "");
     }
 
@@ -1617,6 +1719,13 @@
         hideModal();
       }
     };
+    $("btn-events-history").onclick = () => openEventsHistory({ append: false });
+    $("events-history-more").onclick = () => openEventsHistory({ append: true });
+    $("events-history-close").onclick = () => closeEventsHistory();
+    $("events-overlay").addEventListener("click", (ev) => {
+      if (ev.target === $("events-overlay")) closeEventsHistory();
+    });
+
     $("btn-logout").onclick = async () => {
       try {
         await fetch("/api/logout", { method: "POST", credentials: "same-origin" });

@@ -1,4 +1,4 @@
-"""c7.pro MACD 金叉/死叉，仅用于自动收利过滤。"""
+"""c7.pro MACD：自动收利看金叉/死叉；入场看涨跌方向决定先挂哪一边。"""
 
 from __future__ import annotations
 
@@ -15,27 +15,47 @@ log = logging.getLogger("licai.macd")
 
 DEFAULT_URL = "https://c7.pro/capi/indicator"
 _CACHE_TTL = 55.0
-_cache: dict[str, tuple[float, "MacdCross | None", str]] = {}
+# endpoint -> (mono_ts, state|None, err)
+_cache: dict[str, tuple[float, "MacdState | None", str]] = {}
 
 
 @dataclass(frozen=True)
-class MacdCross:
-    """最近两根 K 线是否刚发生金叉/死叉（必须交叉那一根）。"""
+class MacdState:
+    """最新一根：相对 Signal 的方向；若刚交叉则带 cross。"""
 
-    kind: str  # golden | death
+    bias: str  # bull | bear
+    cross: str | None  # golden | death | None
     time: str
     macd: Decimal
     signal: Decimal
     hist: Decimal
 
     @property
+    def kind(self) -> str:
+        """兼容旧字段：golden | death（无交叉为空串）。"""
+        return self.cross or ""
+
+    @property
     def harvest_side(self) -> str:
-        # 金叉收空、死叉收多
-        return "SHORT" if self.kind == "golden" else "LONG"
+        # 金叉收空、死叉收多；方向同理：多头方向收空、空头方向收多
+        return "SHORT" if self.bias == "bull" else "LONG"
+
+    @property
+    def enter_first_side(self) -> str:
+        # 上涨先挂多，下跌先挂空
+        return "LONG" if self.bias == "bull" else "SHORT"
 
     @property
     def label(self) -> str:
-        return "金叉" if self.kind == "golden" else "死叉"
+        if self.cross == "golden":
+            return "金叉"
+        if self.cross == "death":
+            return "死叉"
+        return "上涨" if self.bias == "bull" else "下跌"
+
+
+# 兼容旧名
+MacdCross = MacdState
 
 
 def _parse_rows(payload) -> list[dict]:
@@ -60,21 +80,28 @@ def _parse_rows(payload) -> list[dict]:
     return rows
 
 
-def _detect_cross(rows: list[dict]) -> MacdCross | None:
-    if len(rows) < 2:
+def _detect_state(rows: list[dict]) -> MacdState | None:
+    if not rows:
         return None
-    prev, curr = rows[-2], rows[-1]
-    prev_diff = prev["macd"] - prev["signal"]
-    curr_diff = curr["macd"] - curr["signal"]
-    kind = ""
-    if prev_diff <= 0 and curr_diff > 0:
-        kind = "golden"
-    elif prev_diff >= 0 and curr_diff < 0:
-        kind = "death"
-    if not kind:
+    curr = rows[-1]
+    diff = curr["macd"] - curr["signal"]
+    if diff > 0:
+        bias = "bull"
+    elif diff < 0:
+        bias = "bear"
+    else:
         return None
-    return MacdCross(
-        kind=kind,
+    cross = None
+    if len(rows) >= 2:
+        prev = rows[-2]
+        prev_diff = prev["macd"] - prev["signal"]
+        if prev_diff <= 0 and diff > 0:
+            cross = "golden"
+        elif prev_diff >= 0 and diff < 0:
+            cross = "death"
+    return MacdState(
+        bias=bias,
+        cross=cross,
         time=str(curr["time"]),
         macd=curr["macd"],
         signal=curr["signal"],
@@ -82,8 +109,15 @@ def _detect_cross(rows: list[dict]) -> MacdCross | None:
     )
 
 
-def fetch_macd_cross(url: str | None = None, *, timeout: float = 4.0) -> MacdCross | None:
-    """仅在刚交叉时返回；无交叉或失败返回 None。"""
+def _detect_cross(rows: list[dict]) -> MacdState | None:
+    """仅在刚交叉时返回。"""
+    state = _detect_state(rows)
+    if state is None or not state.cross:
+        return None
+    return state
+
+
+def _load_state(url: str | None, *, timeout: float = 4.0) -> MacdState | None:
     endpoint = (url or DEFAULT_URL).strip() or DEFAULT_URL
     now = time.monotonic()
     hit = _cache.get(endpoint)
@@ -92,11 +126,29 @@ def fetch_macd_cross(url: str | None = None, *, timeout: float = 4.0) -> MacdCro
     try:
         resp = requests.get(endpoint, timeout=timeout, proxies={"http": None, "https": None})
         resp.raise_for_status()
-        rows = _parse_rows(resp.json())
-        cross = _detect_cross(rows)
-        _cache[endpoint] = (now, cross, "")
-        return cross
+        state = _detect_state(_parse_rows(resp.json()))
+        _cache[endpoint] = (now, state, "")
+        return state
     except Exception as exc:
         log.warning("MACD 指标拉取失败: %s", exc)
         _cache[endpoint] = (now, None, str(exc))
         return None
+
+
+def fetch_macd_state(url: str | None = None, *, timeout: float = 4.0) -> MacdState | None:
+    """最新涨跌方向；失败返回 None。"""
+    return _load_state(url, timeout=timeout)
+
+
+def fetch_macd_bias(url: str | None = None, *, timeout: float = 4.0) -> str | None:
+    """返回 bull / bear；失败 None。"""
+    state = _load_state(url, timeout=timeout)
+    return None if state is None else state.bias
+
+
+def fetch_macd_cross(url: str | None = None, *, timeout: float = 4.0) -> MacdState | None:
+    """仅在刚交叉时返回；无交叉或失败返回 None。"""
+    state = _load_state(url, timeout=timeout)
+    if state is None or not state.cross:
+        return None
+    return state

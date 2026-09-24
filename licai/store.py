@@ -228,13 +228,36 @@ class AccountStore:
         return Event(event_id, account_id, action, ok, detail, created)
 
     def recent_events(self, account_id: int, limit: int = 20) -> list[Event]:
+        return self.list_events(account_id, limit=limit)
+
+    def list_events(
+        self,
+        account_id: int,
+        *,
+        limit: int = 100,
+        before_id: int | None = None,
+    ) -> list[Event]:
+        limit = max(1, min(int(limit or 100), 500))
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM events WHERE account_id = ? ORDER BY id DESC LIMIT ?",
-                (account_id, limit),
-            ).fetchall()
+            if before_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM events WHERE account_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+                    (account_id, int(before_id), limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM events WHERE account_id = ? ORDER BY id DESC LIMIT ?",
+                    (account_id, limit),
+                ).fetchall()
         return [
-            Event(int(row["id"]), int(row["account_id"]), row["action"], bool(row["ok"]), row["detail"] or "", row["created_at"])
+            Event(
+                int(row["id"]),
+                int(row["account_id"]),
+                row["action"],
+                bool(row["ok"]),
+                row["detail"] or "",
+                row["created_at"],
+            )
             for row in rows
         ]
 

@@ -6,6 +6,7 @@ from decimal import ROUND_DOWN, Decimal
 from .client import BinanceAPIError
 from .config import d, fmt_amount, is_mmr_sentinel, settle_asset_of
 from .futures import FuturesAPI, HedgeLegs
+from .macd import fetch_macd_state
 from .monitor import min_harvest_profit, price_stability, resolve_harvest_fee
 from .pipeline import Pipeline, StepResult
 
@@ -121,6 +122,8 @@ class HedgeCycle:
         self.leverage_cap = self.settings.leverage_cap
         self.leverage_unlock_at = self.settings.leverage_unlock_at
         self.leverage_cap_changed = False
+        self._enter_first_side: str | None = None  # LONG|SHORT，入场按 MACD 决定先挂哪边
+        self._enter_order_note: str = ""
 
     def _limit_tries(self) -> int:
         return max(1, int(getattr(self.settings, "hedge_quote_retries", None) or LIMIT_FILL_TRIES))
@@ -384,6 +387,21 @@ class HedgeCycle:
         wait = max(1.0, min(1.6, float(self.settings.quote_refresh_seconds or 1) * 0.8))
         return tries, wait
 
+    def _resolve_enter_leg_order(self) -> list[StepResult]:
+        """按 MACD 涨跌决定入场先挂哪边：上涨先多，下跌先空。"""
+        url = getattr(self.settings, "macd_indicator_url", None) or ""
+        state = fetch_macd_state(url)
+        if state is None:
+            self._enter_first_side = "LONG"
+            self._enter_order_note = "MACD 不可用，默认先挂多再挂空"
+        elif state.bias == "bear":
+            self._enter_first_side = "SHORT"
+            self._enter_order_note = f"MACD 下跌@{state.time}，先挂空再挂多"
+        else:
+            self._enter_first_side = "LONG"
+            self._enter_order_note = f"MACD 上涨@{state.time}，先挂多再挂空"
+        return [StepResult("入场顺序", True, self._enter_order_note)]
+
     def _ensure_hedge(self) -> list[StepResult]:
         if self.settings.dry_run:
             qty = self._collateral_qty()
@@ -397,7 +415,7 @@ class HedgeCycle:
                     True,
                     f"理财保证金约 {fmt_amount(collateral)} USDT，按 {margin_use_pct(self.settings)} 占用、{self.settings.hedge_leverage}x、双边各占保证金，开 "
                     f"两边先挂单（GTX，首挂买一/卖一外约 {getattr(self.settings, 'maker_passive_bps', 2)}bp/"
-                    f"{getattr(self.settings, 'maker_passive_ticks', 2)} 档），"
+                    f"{getattr(self.settings, 'maker_passive_ticks', 2)} 档），按 MACD 涨跌决定先多/先空；"
                     f"单边后最多等 {getattr(self.settings, 'hedge_max_wait_seconds', 2.0)}s，"
                     f"再 maker 追价 {getattr(self.settings, 'hedge_second_leg_chases', 2)} 次，仍不成或滑点 "
                     f"{getattr(self.settings, 'hedge_max_slippage_bps', 3.5)}bp 才市价补齐  数量={fmt_amount(qty)} {self.symbol}",
@@ -412,7 +430,12 @@ class HedgeCycle:
             qty = self._collateral_qty()
         if qty <= 0:
             return [StepResult("开对冲", False, "算出的下单数量为 0，检查理财仓位或 hedge_qty")]
-        return self._quote_until_balanced(qty, reduce_only=False)
+        steps: list[StepResult] = []
+        # 双边都还没仓时，按 MACD 定先后
+        if legs.long_qty <= 0 and legs.short_qty <= 0:
+            steps.extend(self._resolve_enter_leg_order())
+        steps.extend(self._quote_until_balanced(qty, reduce_only=False))
+        return steps
 
     def scale_once(self, force: bool = False) -> list[StepResult]:
         legs = self.futures.legs(self.symbol)
@@ -1110,10 +1133,33 @@ class HedgeCycle:
             target = self.futures.round_qty(target, step)
             if target <= 0:
                 return [StepResult("开对冲", False, "算出的下单数量为 0")]
+            to_place: list[tuple[str, str, Decimal]] = []
             if legs.long_qty <= 0:
-                steps.append(self._place("BUY", "LONG", target, buy_px, reduce_only, market=market))
+                to_place.append(("BUY", "LONG", buy_px))
             if legs.short_qty <= 0:
-                steps.append(self._place("SELL", "SHORT", target, sell_px, reduce_only, market=market))
+                to_place.append(("SELL", "SHORT", sell_px))
+            # 双边齐开：按 MACD 涨跌决定先后（下跌先空，上涨先多）
+            if dual_open and len(to_place) == 2 and not reduce_only:
+                first = (self._enter_first_side or "LONG").upper()
+                to_place.sort(key=lambda item: 0 if item[1] == first else 1)
+                if retreat_n <= 0 and pass_n <= 0 and not market:
+                    # 先挂优先腿，稍等再挂另一边，提高趋势腿先挂上的概率
+                    side0, pos0, px0 = to_place[0]
+                    steps.append(self._place(side0, pos0, target, px0, reduce_only, market=market))
+                    time.sleep(0.25)
+                    legs = self.futures.legs(self.symbol)
+                    if legs.missing_side is None:
+                        return steps
+                    # 另一边仍缺才挂
+                    side1, pos1, px1 = to_place[1]
+                    need_other = (pos1 == "LONG" and legs.long_qty <= 0) or (
+                        pos1 == "SHORT" and legs.short_qty <= 0
+                    )
+                    if need_other:
+                        steps.append(self._place(side1, pos1, target, px1, reduce_only, market=market))
+                    to_place = []
+            for side, pos, px in to_place:
+                steps.append(self._place(side, pos, target, px, reduce_only, market=market))
 
         # -5022：立刻撤双侧（含已挂成的另一腿），按新盘口向外改价重挂，禁止同价重试
         if (not market) and any(_post_only_reject(item) for item in steps):

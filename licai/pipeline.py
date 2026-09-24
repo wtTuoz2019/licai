@@ -28,6 +28,11 @@ class StepResult:
     ok: bool
     detail: Any
     dry_run: bool = False
+    at: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.at:
+            self.at = time.strftime("%H:%M:%S")
 
 
 SPOT_MIN = Decimal("1")

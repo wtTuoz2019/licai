@@ -66,7 +66,8 @@ def _event_summary(steps: list[StepResult], *, limit: int = 2000) -> str:
 
     def line(step: StepResult) -> str:
         flag = "ok" if step.ok else "FAIL"
-        return f"{step.name}[{flag}]: {_detail(step.detail)}"
+        stamp = f"{step.at} " if getattr(step, "at", "") else ""
+        return f"{stamp}{step.name}[{flag}]: {_detail(step.detail)}"
 
     keep_idx: list[int] = []
     seen: set[int] = set()
@@ -118,7 +119,13 @@ def _sizing_settings(settings: Settings, legs) -> Settings:
 
 def steps_payload(steps: list[StepResult]) -> list[dict]:
     return [
-        {"name": step.name, "ok": step.ok, "detail": _detail(step.detail), "dry_run": step.dry_run}
+        {
+            "name": step.name,
+            "ok": step.ok,
+            "detail": _detail(step.detail),
+            "dry_run": step.dry_run,
+            "at": getattr(step, "at", "") or "",
+        }
         for step in steps
     ]
 
@@ -496,7 +503,7 @@ class OpsService:
             data["enter"] = enter_advice(legs, stability, d(data.get("spot_usdt") or "0"), plan)
             data["harvest"] = advice.as_dict()
             data["account"] = account.public_dict()
-            data["events"] = _events_payload(account.id, self.store.recent_events(account.id, 12))
+            data["events"] = _events_payload(account.id, self.store.recent_events(account.id, 30))
         except Exception as exc:
             data["legs_refresh_error"] = str(exc)
         return data
@@ -588,7 +595,7 @@ class OpsService:
             "stability": stability.as_dict(),
             "enter": enter_advice(legs, stability, self._idle_spot(account), plan),
             "harvest": advice.as_dict(),
-            "events": _events_payload(account.id, self.store.recent_events(account.id, 12)),
+            "events": _events_payload(account.id, self.store.recent_events(account.id, 30)),
         }
 
     def _build_snapshot(self, account: Account) -> dict:
@@ -707,7 +714,17 @@ class OpsService:
             "harvest": advice.as_dict(),
             "switch": switch,
             "holdings": wallet.get("holdings") or [],
-            "events": _events_payload(account.id, self.store.recent_events(account.id)),
+            "events": _events_payload(account.id, self.store.recent_events(account.id, 30)),
+        }
+
+    def list_events(self, account: Account, *, limit: int = 100, before_id: int | None = None) -> dict:
+        limit = max(1, min(int(limit or 100), 500))
+        rows = self.store.list_events(account.id, limit=limit, before_id=before_id)
+        return {
+            "ok": True,
+            "account_id": account.id,
+            "events": _events_payload(account.id, rows),
+            "has_more": len(rows) >= limit,
         }
 
     def run_action(

@@ -210,6 +210,17 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(500, str(exc)) from exc
 
+    @app.get("/api/accounts/{account_id}/events")
+    def account_events(account_id: int, limit: int = 100, before_id: int | None = None):
+        try:
+            account = store.get(account_id)
+        except KeyError:
+            raise HTTPException(404, "账号不存在") from None
+        try:
+            return ops.list_events(account, limit=limit, before_id=before_id)
+        except Exception as exc:
+            raise HTTPException(500, str(exc)) from exc
+
     @app.post("/api/accounts/{account_id}/actions")
     def run_action(account_id: int, body: ActionIn):
         try:
