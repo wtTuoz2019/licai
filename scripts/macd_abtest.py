@@ -14,6 +14,7 @@
   nohup .venv/bin/python scripts/macd_abtest.py --account-no 4 --live --confirm \\
       >> logs/macd_abtest.log 2>&1 &
   .venv/bin/python scripts/macd_abtest.py --summary
+  # 汇总会写 data/macd_abtest_scorecard.json + .csv，按权益差/价差/市价次数排优势
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from licai.store import Account, AccountStore  # noqa: E402
 
 log = logging.getLogger("macd_abtest")
 LOG_PATH = (PKG_ROOT / "data") / "macd_abtest.jsonl"
+SCORECARD_PATH = (PKG_ROOT / "data") / "macd_abtest_scorecard.json"
 FIXED_QTY = Decimal("0.001")
 # 开仓：单边后不利价差或等待超时 → 市价补第二腿（保证对冲）
 ENTER_BAIL_SPREAD_BPS = Decimal("3.5")
@@ -111,6 +113,25 @@ def entry_spread_bps(legs: HedgeLegs) -> Decimal | None:
     if mid <= 0:
         return None
     return (legs.short_entry - legs.long_entry) / mid * Decimal("10000")
+
+
+def _legs_snap(legs: HedgeLegs) -> dict[str, str]:
+    return {
+        "long": str(legs.long_qty),
+        "short": str(legs.short_qty),
+        "long_entry": str(legs.long_entry),
+        "short_entry": str(legs.short_entry),
+        "long_pnl": str(legs.long_pnl),
+        "short_pnl": str(legs.short_pnl),
+        "missing": str(legs.missing_side or ""),
+    }
+
+
+def _read_equity(cycle: AbTestCycle) -> Decimal:
+    try:
+        return d((cycle.futures.account_risk() or {}).get("equity") or "0")
+    except Exception:
+        return Decimal("0")
 
 
 class AbTestCycle(HedgeCycle):
@@ -513,6 +534,8 @@ class GridRunner:
         self.trials = trials or build_trials()
         self.log_path = log_path or LOG_PATH
         self._last_cross_key = ""
+        # 当前组实验快照，供 trial_done / scorecard 聚合
+        self._trial_metrics: dict[str, Any] = {}
 
     def _log(self, payload: dict[str, Any]) -> None:
         row = {
@@ -572,16 +595,22 @@ class GridRunner:
 
     def _run_one(self, idx: int, trial: TrialParams) -> None:
         tag = trial.name
+        self._trial_metrics = {
+            "trial": tag,
+            "trial_i": idx,
+            "params": {
+                "passive_bps": str(trial.passive_bps),
+                "tp_usdt": str(trial.tp_usdt),
+                "need_macd": trial.need_macd,
+            },
+            "qty": str(self.qty),
+        }
         self._log(
             {
                 "event": "trial_start",
                 "trial": tag,
                 "trial_i": idx,
-                "params": {
-                    "passive_bps": str(trial.passive_bps),
-                    "tp_usdt": str(trial.tp_usdt),
-                    "need_macd": trial.need_macd,
-                },
+                "params": self._trial_metrics["params"],
             }
         )
         if not self.ops.try_begin_action(self.account.id):
@@ -589,44 +618,72 @@ class GridRunner:
             return
         try:
             cycle = self._cycle(trial)
-            # 1) 保证空仓
             flat_steps = cycle.ensure_flat()
+            eq0 = _read_equity(cycle)
+            self._trial_metrics["equity_before"] = str(eq0)
             self._log(
                 {
                     "event": "pre_flat",
                     "trial": tag,
                     "ok": all(s.ok for s in flat_steps) if flat_steps else True,
+                    "equity": str(eq0),
                     "detail": "；".join(f"{s.name}:{s.detail}" for s in flat_steps[-3:]),
                 }
             )
         finally:
             self.ops.end_action(self.account.id)
 
-        # 等信号期间不占锁，避免卡死页面操作
         enter_ok = self._wait_and_enter(cycle, trial, tag)
         if not enter_ok:
             if self.ops.try_begin_action(self.account.id):
                 try:
                     cycle.ensure_flat()
+                    eq_fail = _read_equity(cycle)
                 finally:
                     self.ops.end_action(self.account.id)
-            self._log({"event": "trial_fail_enter", "trial": tag, "detail": "开仓失败，已全平"})
+            else:
+                eq_fail = None
+            self._trial_metrics.update(
+                {
+                    "enter_ok": False,
+                    "harvest_ok": False,
+                    "equity_after_flat": str(eq_fail) if eq_fail is not None else None,
+                    "cycle_equity_delta": (
+                        str(eq_fail - d(self._trial_metrics.get("equity_before") or "0"))
+                        if eq_fail is not None
+                        else None
+                    ),
+                }
+            )
+            self._log(
+                {
+                    "event": "trial_fail_enter",
+                    "trial": tag,
+                    "metrics": dict(self._trial_metrics),
+                    "detail": "开仓失败，已全平",
+                }
+            )
             return
 
         try:
             legs = cycle.futures.legs(cycle.symbol)
             spr = entry_spread_bps(legs)
+            eq_enter = _read_equity(cycle)
+            self._trial_metrics.update(
+                {
+                    "enter_ok": True,
+                    "entry_spread_bps": str(spr) if spr is not None else None,
+                    "equity_after_enter": str(eq_enter),
+                    "legs_after_enter": _legs_snap(legs),
+                }
+            )
             self._log(
                 {
                     "event": "enter_ok",
                     "trial": tag,
                     "entry_spread_bps": str(spr) if spr is not None else None,
-                    "legs": {
-                        "long": str(legs.long_qty),
-                        "short": str(legs.short_qty),
-                        "long_entry": str(legs.long_entry),
-                        "short_entry": str(legs.short_entry),
-                    },
+                    "equity": str(eq_enter),
+                    "legs": _legs_snap(legs),
                     "macd": self._macd_snap(),
                 }
             )
@@ -634,20 +691,51 @@ class GridRunner:
             self._log({"event": "enter_ok_log_fail", "trial": tag, "detail": str(exc)})
 
         harvest_ok = self._wait_and_harvest(cycle, trial, tag)
+        self._trial_metrics["harvest_ok"] = harvest_ok
 
         if self.ops.try_begin_action(self.account.id):
             try:
+                eq_before_flat = _read_equity(cycle)
+                legs_before_flat = _legs_snap(cycle.futures.legs(cycle.symbol))
                 flat_steps = cycle.ensure_flat()
                 flat_ok = (
                     cycle.futures.legs(cycle.symbol).long_qty <= 0
                     and cycle.futures.legs(cycle.symbol).short_qty <= 0
                 )
+                eq_after = _read_equity(cycle)
+                eq0 = d(self._trial_metrics.get("equity_before") or "0")
+                delta = eq_after - eq0
+                self._trial_metrics.update(
+                    {
+                        "equity_before_flat": str(eq_before_flat),
+                        "legs_before_flat": legs_before_flat,
+                        "equity_after_flat": str(eq_after),
+                        "flat_ok": flat_ok,
+                        "cycle_equity_delta": str(delta),
+                        # 简单优势分：权益差为主，开仓正价差加分，市价次数减分（后面 summarize 再用）
+                        "score_hint": str(delta),
+                    }
+                )
                 self._log(
                     {
                         "event": "trial_done",
                         "trial": tag,
+                        "enter_ok": True,
                         "harvest_ok": harvest_ok,
                         "flat_ok": flat_ok,
+                        "equity_before": self._trial_metrics.get("equity_before"),
+                        "equity_after_enter": self._trial_metrics.get("equity_after_enter"),
+                        "equity_before_flat": str(eq_before_flat),
+                        "equity_after_flat": str(eq_after),
+                        "cycle_equity_delta": str(delta),
+                        "entry_spread_bps": self._trial_metrics.get("entry_spread_bps"),
+                        "enter_used_market": self._trial_metrics.get("enter_used_market"),
+                        "harvest_used_market": self._trial_metrics.get("harvest_used_market"),
+                        "enter_elapsed_s": self._trial_metrics.get("enter_elapsed_s"),
+                        "harvest_elapsed_s": self._trial_metrics.get("harvest_elapsed_s"),
+                        "harvest_side": self._trial_metrics.get("harvest_side"),
+                        "params": self._trial_metrics.get("params"),
+                        "metrics": dict(self._trial_metrics),
                         "detail": "；".join(f"{s.name}:{s.detail}" for s in flat_steps[-3:]),
                     }
                 )
@@ -660,6 +748,7 @@ class GridRunner:
                     "trial": tag,
                     "harvest_ok": harvest_ok,
                     "flat_ok": False,
+                    "metrics": dict(self._trial_metrics),
                     "detail": "结束全平时账号忙，请手动检查仓位",
                 }
             )
@@ -689,6 +778,14 @@ class GridRunner:
             ok = legs.missing_side is None and legs.long_qty > 0 and legs.short_qty > 0
             spr = entry_spread_bps(legs) if ok else None
             used_market = any("市价" in str(s.name) or "市价" in str(s.detail) for s in steps)
+            self._trial_metrics.update(
+                {
+                    "enter_elapsed_s": round(elapsed, 3),
+                    "enter_used_market": used_market,
+                    "entry_spread_bps": str(spr) if spr is not None else None,
+                    "enter_ok": ok,
+                }
+            )
             self._log(
                 {
                     "event": "enter_done",
@@ -697,8 +794,11 @@ class GridRunner:
                     "elapsed_s": round(elapsed, 3),
                     "entry_spread_bps": str(spr) if spr is not None else None,
                     "used_market": used_market,
+                    "equity": str(_read_equity(cycle)),
+                    "legs": _legs_snap(legs),
                     "detail": "；".join(f"{s.name}:{s.detail}" for s in steps[-8:])[:2000],
                     "macd": self._macd_snap(),
+                    "params": self._trial_metrics.get("params"),
                 }
             )
             if ok:
@@ -816,6 +916,16 @@ class GridRunner:
             after = cycle.futures.legs(cycle.symbol)
             ok = after.missing_side is None and after.long_qty > 0
             used_market = any("市价" in str(s.name) or "市价" in str(s.detail) for s in steps)
+            self._trial_metrics.update(
+                {
+                    "harvest_ok": ok,
+                    "harvest_elapsed_s": round(elapsed, 3),
+                    "harvest_used_market": used_market,
+                    "harvest_side": side,
+                    "equity_after_harvest": str(_read_equity(cycle)),
+                    "legs_after_harvest": _legs_snap(after),
+                }
+            )
             self._log(
                 {
                     "event": "harvest_done",
@@ -824,7 +934,10 @@ class GridRunner:
                     "elapsed_s": round(elapsed, 3),
                     "side": side,
                     "used_market": used_market,
+                    "equity": str(_read_equity(cycle)),
+                    "legs": _legs_snap(after),
                     "detail": "；".join(f"{s.name}:{s.detail}" for s in steps[-10:])[:2000],
+                    "params": self._trial_metrics.get("params"),
                 }
             )
             return ok
@@ -832,81 +945,239 @@ class GridRunner:
         return False
 
 
-def summarize(path: Path | None = None) -> str:
+def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
+    """按组汇总优势：权益差优先，其次开仓价差、少市价、耗时。"""
     target = path or LOG_PATH
     if not target.exists():
         return f"还没有日志: {target}"
-    by_trial: dict[str, dict[str, Any]] = {}
+
+    # 两遍：先标出有 trial_done 的组，再聚合，避免 enter/harvest 与 trial_done 重复计价
+    raw_rows: list[dict[str, Any]] = []
     for line in target.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            row = json.loads(line)
+            raw_rows.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+
+    trials_with_done: set[str] = {
+        str(r["trial"]) for r in raw_rows if r.get("event") == "trial_done" and r.get("trial")
+    }
+
+    by_trial: dict[str, dict[str, Any]] = {}
+    for row in raw_rows:
         trial = str(row.get("trial") or "")
         if not trial:
             continue
         slot = by_trial.setdefault(
             trial,
             {
+                "params": row.get("params") or {},
+                "n_done": 0,
                 "enter_ok": 0,
                 "enter_fail": 0,
                 "harvest_ok": 0,
                 "harvest_fail": 0,
                 "spreads": [],
+                "equity_deltas": [],
                 "enter_elapsed": [],
                 "harvest_elapsed": [],
                 "enter_market": 0,
                 "harvest_market": 0,
+                "samples": [],
             },
         )
         ev = row.get("event")
-        if ev == "enter_done":
+        if ev == "trial_done":
+            slot["n_done"] += 1
+            if row.get("enter_ok", True):
+                slot["enter_ok"] += 1
+            if row.get("harvest_ok"):
+                slot["harvest_ok"] += 1
+            else:
+                slot["harvest_fail"] += 1
+            if row.get("entry_spread_bps") is not None:
+                try:
+                    slot["spreads"].append(float(row["entry_spread_bps"]))
+                except (TypeError, ValueError):
+                    pass
+            if row.get("cycle_equity_delta") is not None:
+                try:
+                    slot["equity_deltas"].append(float(row["cycle_equity_delta"]))
+                except (TypeError, ValueError):
+                    pass
+            if row.get("enter_elapsed_s") is not None:
+                slot["enter_elapsed"].append(float(row["enter_elapsed_s"]))
+            if row.get("harvest_elapsed_s") is not None:
+                slot["harvest_elapsed"].append(float(row["harvest_elapsed_s"]))
+            if row.get("enter_used_market"):
+                slot["enter_market"] += 1
+            if row.get("harvest_used_market"):
+                slot["harvest_market"] += 1
+            if row.get("params"):
+                slot["params"] = row["params"]
+            slot["samples"].append(
+                {
+                    "ts": row.get("ts"),
+                    "cycle_equity_delta": row.get("cycle_equity_delta"),
+                    "entry_spread_bps": row.get("entry_spread_bps"),
+                    "enter_used_market": row.get("enter_used_market"),
+                    "harvest_used_market": row.get("harvest_used_market"),
+                    "harvest_ok": row.get("harvest_ok"),
+                    "flat_ok": row.get("flat_ok"),
+                }
+            )
+        elif ev == "trial_fail_enter":
+            slot["enter_fail"] += 1
+            metrics = row.get("metrics") or {}
+            if metrics.get("cycle_equity_delta") is not None:
+                try:
+                    slot["equity_deltas"].append(float(metrics["cycle_equity_delta"]))
+                except (TypeError, ValueError):
+                    pass
+            if row.get("params") or metrics.get("params"):
+                slot["params"] = row.get("params") or metrics.get("params")
+        elif ev == "enter_done" and trial not in trials_with_done:
             slot["enter_ok" if row.get("ok") else "enter_fail"] += 1
             if row.get("entry_spread_bps") is not None:
-                slot["spreads"].append(float(row["entry_spread_bps"]))
+                try:
+                    slot["spreads"].append(float(row["entry_spread_bps"]))
+                except (TypeError, ValueError):
+                    pass
             if row.get("elapsed_s") is not None:
                 slot["enter_elapsed"].append(float(row["elapsed_s"]))
             if row.get("used_market"):
                 slot["enter_market"] += 1
-        elif ev == "harvest_done":
+        elif ev == "harvest_done" and trial not in trials_with_done:
             slot["harvest_ok" if row.get("ok") else "harvest_fail"] += 1
             if row.get("elapsed_s") is not None:
                 slot["harvest_elapsed"].append(float(row["elapsed_s"]))
             if row.get("used_market"):
                 slot["harvest_market"] += 1
-        elif ev == "enter_ok" and row.get("entry_spread_bps") is not None:
-            slot["spreads"].append(float(row["entry_spread_bps"]))
 
-    lines = [f"日志 {target}  qty={FIXED_QTY}", ""]
-    ranked: list[tuple[tuple, str, str]] = []
-    for trial, slot in sorted(by_trial.items()):
+    lines = [
+        f"日志 {target}",
+        f"评分卡会写入 {SCORECARD_PATH}",
+        "排序：均权益差 ↓ → 开仓价差(正更好) → 少市价 → 入场更快",
+        "",
+    ]
+    ranked: list[tuple[tuple, dict]] = []
+    for trial, slot in by_trial.items():
+        deltas = slot["equity_deltas"]
         spreads = slot["spreads"]
+        avg_delta = sum(deltas) / len(deltas) if deltas else 0.0
         avg_spr = sum(spreads) / len(spreads) if spreads else 0.0
         avg_e = sum(slot["enter_elapsed"]) / len(slot["enter_elapsed"]) if slot["enter_elapsed"] else 0.0
         avg_h = sum(slot["harvest_elapsed"]) / len(slot["harvest_elapsed"]) if slot["harvest_elapsed"] else 0.0
-        e_ok = slot["enter_ok"]
+        market_n = slot["enter_market"] + slot["harvest_market"]
         h_ok = slot["harvest_ok"]
+        e_ok = slot["enter_ok"]
+        # 综合分：权益差权重大；正价差加分；市价惩罚；耗时轻微惩罚
+        score = (
+            avg_delta * 100.0
+            + avg_spr * 0.05
+            - market_n * 0.02
+            - avg_e * 0.0005
+            + h_ok * 0.5
+        )
+        rec = {
+            "trial": trial,
+            "params": slot["params"],
+            "n_done": slot["n_done"],
+            "enter_ok": e_ok,
+            "enter_fail": slot["enter_fail"],
+            "harvest_ok": h_ok,
+            "harvest_fail": slot["harvest_fail"],
+            "avg_equity_delta": round(avg_delta, 6),
+            "avg_entry_spread_bps": round(avg_spr, 4),
+            "avg_enter_elapsed_s": round(avg_e, 3),
+            "avg_harvest_elapsed_s": round(avg_h, 3),
+            "enter_market_count": slot["enter_market"],
+            "harvest_market_count": slot["harvest_market"],
+            "score": round(score, 6),
+            "samples": slot["samples"],
+        }
         line = (
-            f"{trial}  入场{e_ok}/{e_ok+slot['enter_fail']} 收利{h_ok}/{h_ok+slot['harvest_fail']}  "
-            f"均开仓价差={avg_spr:.2f}bp 入场耗时={avg_e:.1f}s 收利耗时={avg_h:.1f}s  "
-            f"市价次数 入{slot['enter_market']}/收{slot['harvest_market']}"
+            f"{trial}  score={score:.4f}  均权益差={avg_delta:.4f}  "
+            f"均开仓价差={avg_spr:.2f}bp  入场{e_ok}/{e_ok+slot['enter_fail']}  "
+            f"收利{h_ok}/{h_ok+slot['harvest_fail']}  市价入{slot['enter_market']}/收{slot['harvest_market']}  "
+            f"耗时入{avg_e:.1f}s/收{avg_h:.1f}s"
         )
         lines.append(line)
-        # 排序：收利成功 > 开仓价差更好（正）> 少用市价 > 入场更快
-        ranked.append(
-            (
-                (h_ok, avg_spr, -(slot["enter_market"] + slot["harvest_market"]), -avg_e, e_ok),
-                trial,
-                line,
-            )
-        )
-    if ranked:
-        ranked.sort(reverse=True)
-        lines += ["", f"当前较优: {ranked[0][1]}", ranked[0][2]]
-        lines.append("把较优的 passive / tp / need_macd 写回正式流程；开仓价差是对比指标不是熔断。")
+        ranked.append(((score, avg_delta, avg_spr, -market_n, -avg_e), rec))
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    best = ranked[0][1] if ranked else None
+    if best:
+        lines += [
+            "",
+            f"优势最大: {best['trial']}",
+            f"  params={best['params']}",
+            f"  均权益差={best['avg_equity_delta']}  均开仓价差={best['avg_entry_spread_bps']}bp  score={best['score']}",
+            "落地建议：把该组 passive_bps / tp_usdt / need_macd 写回正式自动收利逻辑。",
+        ]
+
+    if write_scorecard:
+        SCORECARD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "generated_at": _now(),
+            "log_path": str(target),
+            "best": best,
+            "ranking": [r[1] for r in ranked],
+        }
+        SCORECARD_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        # CSV 方便表格对比
+        csv_path = SCORECARD_PATH.with_suffix(".csv")
+        headers = [
+            "rank",
+            "trial",
+            "score",
+            "avg_equity_delta",
+            "avg_entry_spread_bps",
+            "enter_ok",
+            "enter_fail",
+            "harvest_ok",
+            "harvest_fail",
+            "enter_market_count",
+            "harvest_market_count",
+            "avg_enter_elapsed_s",
+            "avg_harvest_elapsed_s",
+            "passive_bps",
+            "tp_usdt",
+            "need_macd",
+        ]
+        with csv_path.open("w", encoding="utf-8") as fh:
+            fh.write(",".join(headers) + "\n")
+            for i, (_, rec) in enumerate(ranked, start=1):
+                p = rec.get("params") or {}
+                fh.write(
+                    ",".join(
+                        [
+                            str(i),
+                            rec["trial"],
+                            str(rec["score"]),
+                            str(rec["avg_equity_delta"]),
+                            str(rec["avg_entry_spread_bps"]),
+                            str(rec["enter_ok"]),
+                            str(rec["enter_fail"]),
+                            str(rec["harvest_ok"]),
+                            str(rec["harvest_fail"]),
+                            str(rec["enter_market_count"]),
+                            str(rec["harvest_market_count"]),
+                            str(rec["avg_enter_elapsed_s"]),
+                            str(rec["avg_harvest_elapsed_s"]),
+                            str(p.get("passive_bps", "")),
+                            str(p.get("tp_usdt", "")),
+                            str(p.get("need_macd", "")),
+                        ]
+                    )
+                    + "\n"
+                )
+        lines.append(f"已写评分卡 JSON: {SCORECARD_PATH}")
+        lines.append(f"已写评分卡 CSV:  {csv_path}")
+
     return "\n".join(lines)
 
 
