@@ -672,12 +672,13 @@ class GridRunner:
                 self._log({"event": "wait_enter", "trial": tag, "detail": note, "macd": self._macd_snap()})
                 time.sleep(self.poll_seconds)
                 continue
-            self._last_cross_key = f"{cross.kind}:{cross.time}"
-            self._log({"event": "enter_start", "trial": tag, "detail": note, "macd": self._macd_snap()})
             if not self.ops.try_begin_action(self.account.id):
-                self._log({"event": "enter_busy", "trial": tag, "detail": "账号忙，稍后重试"})
+                self._log({"event": "enter_busy", "trial": tag, "detail": "账号忙，稍后重试（本交叉未消费）"})
                 time.sleep(self.poll_seconds)
                 continue
+            # 拿到锁后再标记交叉已用，避免 busy 时白白跳过信号
+            self._last_cross_key = f"{cross.kind}:{cross.time}"
+            self._log({"event": "enter_start", "trial": tag, "detail": note, "macd": self._macd_snap()})
             t0 = time.monotonic()
             try:
                 steps = cycle.enter_tight(self.qty)
@@ -773,6 +774,16 @@ class GridRunner:
                     )
                     time.sleep(self.poll_seconds)
                     continue
+                if not self.ops.try_begin_action(self.account.id):
+                    self._log(
+                        {
+                            "event": "harvest_busy",
+                            "trial": tag,
+                            "detail": "账号忙，稍后重试（本交叉未消费）",
+                        }
+                    )
+                    time.sleep(self.poll_seconds)
+                    continue
                 self._last_cross_key = f"{cross.kind}:{cross.time}"
             else:
                 # 无 MACD：收浮盈更大的一边
@@ -781,6 +792,10 @@ class GridRunner:
                 else:
                     side = "SHORT"
                 note = "不需要 MACD，按浮盈收"
+                if not self.ops.try_begin_action(self.account.id):
+                    self._log({"event": "harvest_busy", "trial": tag, "detail": "账号忙，稍后重试"})
+                    time.sleep(self.poll_seconds)
+                    continue
 
             self._log(
                 {
@@ -793,10 +808,6 @@ class GridRunner:
                 }
             )
             t0 = time.monotonic()
-            if not self.ops.try_begin_action(self.account.id):
-                self._log({"event": "harvest_busy", "trial": tag, "detail": "账号忙，稍后重试"})
-                time.sleep(self.poll_seconds)
-                continue
             try:
                 steps = cycle.harvest_tight(side)
             finally:
