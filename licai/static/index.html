@@ -97,6 +97,17 @@
       padding: 10px 12px;
     }
     .acct b { display: block; font-size: 13px; }
+    .acct-id {
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+      margin-right: 4px;
+    }
+    #acct-id-now {
+      font-size: 13px;
+      font-weight: 650;
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+    }
     .acct.active { outline: 1px solid var(--accent); background: #152033; }
     .muted { color: var(--muted); }
     .toolbar {
@@ -434,6 +445,7 @@
       <div id="panel" hidden>
         <div class="toolbar">
           <div class="meta">
+            <span class="acct-id" id="acct-id-now"></span>
             <span class="sym" id="symbol-now">-</span>
             <span class="lev-chip" id="settle-chip" hidden><b id="settle-asset"></b></span>
             <span class="lev-chip"><b id="lev">-</b>x</span>
@@ -638,11 +650,24 @@
       return selected != null && Number(selected) === Number(id);
     }
 
+    function setAcctLabel(account) {
+      const el = $("acct-id-now");
+      if (!el) return;
+      const id = account && account.id != null ? Number(account.id) : NaN;
+      if (!Number.isFinite(id)) {
+        el.textContent = "";
+        return;
+      }
+      const name = (account && account.name) ? String(account.name) : "";
+      el.textContent = name ? `#${id} ${name}` : `#${id}`;
+    }
+
     function resetPanelSkeleton(account) {
       $("empty").hidden = true;
       $("panel").hidden = false;
       $("error").hidden = true;
       $("error").textContent = "";
+      setAcctLabel(account);
       $("symbol-now").textContent = (account && account.hedge_symbol) || "-";
       const settleChip = $("settle-chip");
       const settleEl = $("settle-asset");
@@ -1154,7 +1179,8 @@
         btn.className = "acct" + (sameAccount(a.id) ? " active" : "");
         const sym = a.hedge_symbol || "ETHUSDT";
         const p = parseHedgeSymbol(sym);
-        btn.innerHTML = `<b>${esc(a.name)}</b><div class="muted">${esc(p.settle)} · ${esc(p.base)}</div>`;
+        const no = Number(a.id);
+        btn.innerHTML = `<b><span class="acct-id">#${no}</span>${esc(a.name)}</b><div class="muted">${esc(p.settle)} · ${esc(p.base)}</div>`;
         btn.onclick = () => selectAccount(a.id);
         box.appendChild(btn);
       });
@@ -1387,6 +1413,7 @@
       $("earn-yesterday").textContent = s.earn_yesterday || "0";
       $("mid-price").textContent = s.price || (s.stability && s.stability.mid) || "-";
       setMmr(s.uni_mmr || "-");
+      setAcctLabel(s.account);
       $("symbol-now").textContent = s.symbol || "-";
       const settleChip = $("settle-chip");
       const settleEl = $("settle-asset");

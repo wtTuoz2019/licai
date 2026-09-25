@@ -10,7 +10,7 @@ from .config import d
 
 FAPI = "https://fapi.binance.com"
 SPOT = "https://api.binance.com"
-BOOK_TTL = 2.0
+BOOK_TTL = 0.2
 KLINE_TTL = 20.0
 FILTER_TTL = 6 * 3600.0
 RATE_TTL = 10 * 60.0
@@ -50,15 +50,28 @@ def _get(url: str, params: dict | None = None) -> object:
     return data
 
 
-def book(symbol: str) -> tuple[Decimal, Decimal]:
-    """单币种盘口，带短 TTL；下单热路径不再拉全市场 bookTicker。"""
+def invalidate_book(symbol: str | None = None) -> None:
+    """下单/撤单前作废盘口缓存，避免吃到陈旧 BBO。"""
+    with _lock:
+        if symbol:
+            key = symbol.upper()
+            _books.pop(key, None)
+            _books_at.pop(key, None)
+        else:
+            _books.clear()
+            _books_at.clear()
+
+
+def book(symbol: str, *, force: bool = False) -> tuple[Decimal, Decimal]:
+    """单币种盘口；默认短 TTL，force=True 时跳过缓存实时拉 bookTicker。"""
     symbol = symbol.upper()
     now = time.monotonic()
-    with _lock:
-        hit = _books.get(symbol)
-        ts = _books_at.get(symbol, 0.0)
-        if hit and now - ts < BOOK_TTL:
-            return hit
+    if not force:
+        with _lock:
+            hit = _books.get(symbol)
+            ts = _books_at.get(symbol, 0.0)
+            if hit and now - ts < BOOK_TTL:
+                return hit
     data = _get(f"{FAPI}/fapi/v1/ticker/bookTicker", {"symbol": symbol})
     if isinstance(data, list):
         data = data[0] if data else {}

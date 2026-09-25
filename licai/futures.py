@@ -236,8 +236,11 @@ class FuturesAPI:
     def set_leverage(self, symbol: str, leverage: int) -> dict:
         return self.apply_best_leverage(symbol, leverage)
 
-    def book(self, symbol: str) -> tuple[Decimal, Decimal]:
-        return market.book(symbol)
+    def book(self, symbol: str, *, force: bool = False) -> tuple[Decimal, Decimal]:
+        return market.book(symbol, force=force)
+
+    def invalidate_book(self, symbol: str | None = None) -> None:
+        market.invalidate_book(symbol)
 
     def klines(self, symbol: str, interval: str = "1m", limit: int = 20) -> list:
         return market.klines(symbol, interval, limit)

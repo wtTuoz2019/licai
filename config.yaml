@@ -55,15 +55,14 @@ scale_min_add_pct: 0.03      # 目标仓位比当前大 3% 以上才两边一起
 # 收利门槛按单边仓位名义本金算，不再固定绝对值。账号里保存过自定义值才锁定
 take_profit_usdt: 0
 maker_only: false            # 入场/加仓仍可市价兜底；收利平仓固定只挂 GTX；补仓先长挂再市价
-quote_refresh_seconds: 2     # 每轮挂单约 1–1.5s 改价
+quote_refresh_seconds: 0.5   # 开仓/补仓改价轮次约 0.3–0.5s，快速跟随盘口
 hedge_quote_retries: 8       # 挂单轮数：入场/补仓约 12+，平仓更长
 maker_improve_bps: 1         # 追价时相对现价最多往里靠 1bp；仍留 1 档，GTX 不吃单
 maker_passive_bps: 2         # 首挂：买/卖相对买一/卖一往外约 2bp，少贴盘口少 -5022
 maker_passive_ticks: 2       # 首挂至少离买一/卖一 2 档（与 bp 取更远）
-# 第二腿（单边成交后补齐）：先等多一会 → maker 追价 1–2 次 → 再市价
-hedge_max_wait_seconds: 2.0  # 第一腿成交后最多再等多久第二腿挂单
-hedge_second_leg_chases: 2   # 超时/逃逸后、市价前再 GTX 追价次数
-hedge_max_slippage_bps: 3.5  # 相对第一腿成交价，BBO 不利偏离超过此 bp 则进入追价/市价
+# 第二腿（单边成交后）：100ms 高频盯盘；超时或滑点超限立刻市价，不再 maker 追价
+hedge_max_wait_seconds: 0.8  # 第一腿成交后最多再等多久第二腿
+hedge_max_slippage_bps: 3.5  # 相对第一腿成交价，BBO 不利偏离超过此 bp 则立刻市价
 watch_seconds: 60            # 命令行盯盘间隔
 live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
 auto_harvest_seconds: 60     # 开启「自动收利」后后台检查间隔（与 MACD 1 分钟对齐）
