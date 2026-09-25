@@ -2,10 +2,10 @@
 """MACD 挂单开仓/收利参数网格测试（独立脚本，不改正式流程）。
 
 目标：
-  - 开仓：固定 0.001 BTC；优先 GTX 挂单追价省手续费；
-    必须双边对冲上——单边后价差拉太大或超时 → 市价兜底补齐（不裸仓）；
+  - 开仓：固定 0.001 BTC；贴盘 GTX 追价，尽量挂单成交；
+    单边超过约 4s 或不利价差过大才市价补齐（不裸仓）；
     对冲齐后继续测收利，记录开仓价差作对比，不因价差整组重开。
-  - 收利：先挂单；平不净/补不齐再用市价兜底，保证对冲。
+  - 收利：止盈网格约 0.05/0.08/0.12；先挂单追价，不成再市价。
   - 流程：每组参数 → 开仓 → 收利 → 全平 → 下一组。
 
 固定数量：BTC 0.001（可用 --qty 改）。
@@ -27,7 +27,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -49,15 +49,17 @@ log = logging.getLogger("macd_abtest")
 LOG_PATH = (PKG_ROOT / "data") / "macd_abtest.jsonl"
 SCORECARD_PATH = (PKG_ROOT / "data") / "macd_abtest_scorecard.json"
 FIXED_QTY = Decimal("0.001")
-# 开仓：单边后不利价差或等待超时 → 市价补第二腿（保证对冲）
-ENTER_BAIL_SPREAD_BPS = Decimal("3.5")
-ENTER_BAIL_NAKED_SECONDS = 0.8
+# 开仓：尽量 GTX 追到齐；仅单边拖太久或不利价差过大才市价补（保证对冲）
+ENTER_BAIL_SPREAD_BPS = Decimal("8")
+ENTER_BAIL_NAKED_SECONDS = 4.0
+# 单边补腿时挂单追价间隔（秒）；越小越勤改价贴盘
+ENTER_CHASE_INTERVAL = 0.12
 
 # 开仓参数网格（开仓价差写入日志对比；单边过大时用市价兜底，不整组重开）
-ENTER_PASSIVE_BPS = (Decimal("1"), Decimal("2"))  # 首挂外让 bp（越小越贴盘）
+ENTER_PASSIVE_BPS = (Decimal("0.5"), Decimal("1"))  # 首挂外让 bp（越小越贴盘）
 
-# 收利参数网格
-HARVEST_TP_USDT = (Decimal("0.15"), Decimal("0.30"), Decimal("0.50"))
+# 收利参数网格（止盈阈值，方便更快跑完对比）
+HARVEST_TP_USDT = (Decimal("0.05"), Decimal("0.08"), Decimal("0.12"))
 HARVEST_NEED_MACD = (True, False)
 
 
@@ -146,12 +148,86 @@ class AbTestCycle(HedgeCycle):
             self.settings,
             maker_only=False,  # 允许市价兜底；正常路径仍先 GTX
             maker_passive_bps=passive_bps,
-            maker_passive_ticks=1,
-            maker_improve_bps=Decimal("1"),
-            quote_refresh_seconds=0.35,
+            maker_passive_ticks=0,  # 允许贴买一/卖一排队（见 _maker_prices 覆盖）
+            maker_improve_bps=Decimal("2"),
+            quote_refresh_seconds=0.2,
             hedge_max_wait_seconds=ENTER_BAIL_NAKED_SECONDS,
             hedge_max_slippage_bps=ENTER_BAIL_SPREAD_BPS,
         )
+
+    def _maker_prices(
+        self,
+        bid: Decimal,
+        ask: Decimal,
+        tick: Decimal,
+        *,
+        improve: bool = False,
+        pass_n: int = 0,
+        retreat_n: int = 0,
+    ) -> tuple[Decimal, Decimal]:
+        """测试专用：默认贴买一/卖一排队；-5022 才外退；追价尽量贴盘。"""
+        if tick <= 0:
+            tick = Decimal("0.01")
+        if bid <= 0 or ask <= 0 or ask <= bid:
+            mid = self.futures.round_price(max(bid, ask), tick)
+            return mid, mid
+        bid = self.futures.round_price(bid, tick)
+        ask = self.futures.round_price(ask, tick)
+        if ask <= bid:
+            ask = self.futures.round_price(bid + tick, tick)
+
+        # -5022 外退：买更低、卖更高
+        if retreat_n > 0:
+            n = max(1, int(retreat_n))
+            buy_px = self.futures.round_price(bid - tick * n, tick)
+            sell_px = self.futures.round_price(ask + tick * n, tick)
+            return buy_px, sell_px
+
+        # 首挂：按 passive_bps 略外让；0.5bp 以下直接贴买一/卖一
+        if not improve and pass_n <= 0:
+            passive = d(self.ab_passive_bps)
+            if passive <= 0:
+                return bid, ask
+            factor = passive / Decimal("10000")
+            buy_px = self.futures.round_price(bid * (Decimal("1") - factor), tick)
+            sell_px = self.futures.round_price(ask * (Decimal("1") + factor), tick)
+            if buy_px >= bid:
+                buy_px = bid
+            if sell_px <= ask:
+                sell_px = ask
+            # 仍须严格 maker：买 < 卖一、卖 > 买一
+            if buy_px >= ask:
+                buy_px = self.futures.round_price(ask - tick, tick)
+            if sell_px <= bid:
+                sell_px = self.futures.round_price(bid + tick, tick)
+            return buy_px, sell_px
+
+        # 追价：尽快贴到买一/卖一（仍留 1 档不穿盘）
+        spread_ticks = int(((ask - bid) / tick).to_integral_value(rounding=ROUND_DOWN))
+        room = max(0, spread_ticks - 1)
+        # pass_n 越大越贴；单边补腿直接贴盘
+        if pass_n >= 2 or improve:
+            buy_px = bid
+            sell_px = ask
+        else:
+            n = min(room, max(0, int(pass_n) + 1))
+            buy_px = self.futures.round_price(bid + tick * n, tick)
+            sell_px = self.futures.round_price(ask - tick * n, tick)
+        buy_ceil = self.futures.round_price(ask - tick, tick)
+        sell_floor = self.futures.round_price(bid + tick, tick)
+        if buy_px > buy_ceil:
+            buy_px = buy_ceil if buy_ceil > 0 else bid
+        if sell_px < sell_floor:
+            sell_px = sell_floor if sell_floor > 0 else ask
+        if buy_px <= 0:
+            buy_px = bid
+        if sell_px <= 0:
+            sell_px = ask
+        return buy_px, sell_px
+
+    def _keep_resting_maker(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        """测试追价：不保留远处旧单，每轮按新盘口改挂。"""
+        return None
 
     def ensure_flat(self) -> list[StepResult]:
         """撤挂 + 双边市价扫平（收尾用；测试组之间必须空仓）。"""
@@ -317,10 +393,12 @@ class AbTestCycle(HedgeCycle):
         return [StepResult("入场顺序", True, note)]
 
     def _ab_quote_tight(self, qty: Decimal) -> list[StepResult]:
-        """双边：先 GTX；单边超时或不利价差过大 → 市价补齐，保证对冲。"""
+        """双边：先 GTX 贴盘追价；仅单边过久/价差过大才市价补齐。"""
         steps: list[StepResult] = []
-        tries = 40
-        wait = 0.28
+        # 4s 裸仓窗口 / 0.12s 一轮 ≈ 30+ 轮追价
+        tries = max(50, int(self.ab_bail_naked_s / ENTER_CHASE_INTERVAL) + 20)
+        wait_dual = 0.25
+        wait_naked = ENTER_CHASE_INTERVAL
         naked_since: float | None = None
         for i in range(tries):
             legs = self.futures.legs(self.symbol)
@@ -349,14 +427,14 @@ class AbTestCycle(HedgeCycle):
                     if legs.missing_side is None and legs.long_qty > 0:
                         steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
                         return steps
-                    # 市价后仍不齐：交给外层再兜底/全平，避免误报已平衡
                     steps.append(StepResult("市价后仍缺口", False, self._legs_text(legs)))
                     return steps
             else:
                 naked_since = None
 
+            # 单边：每轮强制贴盘追（aggressive + 高 pass_n）；双边：前几轮略防守
             aggressive = naked or i >= 1
-            pass_n = i + (3 if naked else 0)
+            pass_n = (i + 4) if naked else i
             extra = self._hedge_pass(
                 qty,
                 False,
@@ -375,8 +453,8 @@ class AbTestCycle(HedgeCycle):
                     self.futures.legs(self.symbol).missing_side is None
                     and self.futures.legs(self.symbol).long_qty > 0
                 ),
-                timeout=wait if not naked else 0.15,
-                interval=0.08 if naked else 0.2,
+                timeout=wait_naked if naked else wait_dual,
+                interval=0.06 if naked else 0.12,
             ):
                 legs = self.futures.legs(self.symbol)
                 if legs.missing_side is None:
@@ -407,8 +485,9 @@ class AbTestCycle(HedgeCycle):
     ) -> list[StepResult]:
         steps: list[StepResult] = []
         done_name = f"已平 {position_side}" if reduce_only else f"已补 {position_side}"
-        tries = 28
-        wait = 0.28
+        # 收利/补仓：多轮贴盘 GTX，尽量不成交才市价
+        tries = 48
+        wait = 0.18
 
         def finished(legs: HedgeLegs) -> bool:
             current = legs.long_qty if position_side == "LONG" else legs.short_qty
@@ -420,13 +499,19 @@ class AbTestCycle(HedgeCycle):
                 steps.append(StepResult(done_name, True, self._legs_text(legs)))
                 return steps
             extra = self._side_pass(
-                order_side, position_side, qty, reduce_only, market=False, aggressive=True, pass_n=i
+                order_side,
+                position_side,
+                qty,
+                reduce_only,
+                market=False,
+                aggressive=True,
+                pass_n=i + 2,
             )
             steps.extend(extra)
             if any(_order_filled_hint(item) for item in extra) and finished(self.futures.legs(self.symbol)):
                 steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
                 return steps
-            if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=wait, interval=0.1):
+            if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=wait, interval=0.06):
                 steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
                 return steps
 
@@ -435,7 +520,7 @@ class AbTestCycle(HedgeCycle):
             self.futures.cancel_open(self.symbol)
         except BinanceAPIError:
             pass
-        steps.append(StepResult("市价兜底", True, f"{position_side} 挂单未成，改市价"))
+        steps.append(StepResult("市价兜底", True, f"{position_side} 挂单追价 {tries} 轮未成，改市价"))
         for _ in range(2):
             legs = self.futures.legs(self.symbol)
             if finished(legs):
