@@ -2,10 +2,11 @@
 """MACD 挂单开仓/收利参数网格测试（独立脚本，不改正式流程）。
 
 目标：
+  - 一律等 MACD 金叉/死叉；用交叉前柱 |hist|（敞口）过滤波动大小。
   - 开仓：固定 0.001 BTC；贴盘 GTX 追价，尽量挂单成交；
     单边超过约 4s 或不利价差过大才市价补齐（不裸仓）；
     对冲齐后继续测收利，记录开仓价差作对比，不因价差整组重开。
-  - 收利：止盈网格约 0.05/0.08/0.12；先挂单追价，不成再市价。
+  - 收利：止盈网格约 0.05/0.08/0.12；交叉且敞口够才收；先挂单追价。
   - 流程：每组参数 → 开仓 → 收利 → 全平 → 下一组。
 
 固定数量：BTC 0.001（可用 --qty 改）。
@@ -58,27 +59,27 @@ ENTER_CHASE_INTERVAL = 0.12
 # 开仓参数网格（开仓价差写入日志对比；单边过大时用市价兜底，不整组重开）
 ENTER_PASSIVE_BPS = (Decimal("0.5"), Decimal("1"))  # 首挂外让 bp（越小越贴盘）
 
-# 收利参数网格（止盈阈值，方便更快跑完对比）
+# 收利止盈网格
 HARVEST_TP_USDT = (Decimal("0.05"), Decimal("0.08"), Decimal("0.12"))
-HARVEST_NEED_MACD = (True, False)
+# 交叉前柱 |hist| 最小敞口：0=任意交叉；越大只吃大波动交叉（图上柱高约到 50）
+MACD_MIN_GAP = (Decimal("0"), Decimal("10"), Decimal("25"))
 
 
 @dataclass(frozen=True)
 class TrialParams:
     passive_bps: Decimal
     tp_usdt: Decimal
-    need_macd: bool
+    min_gap: Decimal  # 交叉时要求的最小敞口（|hist| 前柱）
 
     @property
     def name(self) -> str:
-        macd = "macd" if self.need_macd else "nomacd"
-        return f"pas{self.passive_bps}_tp{self.tp_usdt}_{macd}"
+        return f"pas{self.passive_bps}_tp{self.tp_usdt}_gap{self.min_gap}"
 
 
 def build_trials() -> list[TrialParams]:
     out: list[TrialParams] = []
-    for pas, tp, macd in itertools.product(ENTER_PASSIVE_BPS, HARVEST_TP_USDT, HARVEST_NEED_MACD):
-        out.append(TrialParams(pas, tp, macd))
+    for pas, tp, gap in itertools.product(ENTER_PASSIVE_BPS, HARVEST_TP_USDT, MACD_MIN_GAP):
+        out.append(TrialParams(pas, tp, gap))
     return out
 
 
@@ -651,13 +652,17 @@ class GridRunner:
             "cross": state.cross,
             "label": state.label,
             "time": state.time,
+            "macd": str(state.macd),
+            "signal": str(state.signal),
             "hist": str(state.hist),
             "hist_abs": str(abs(state.hist)),
+            "gap_abs": str(state.gap_abs),
             "enter_first": state.enter_first_side,
             "harvest_side": state.harvest_side,
         }
 
-    def _fresh_cross(self):
+    def _fresh_cross(self, *, min_gap: Decimal | None = None):
+        """取未用过的金叉/死叉；若 min_gap 给定则要求交叉前柱敞口够大。"""
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
         cross = fetch_macd_cross(url)
         if cross is None:
@@ -665,7 +670,14 @@ class GridRunner:
         key = f"{cross.kind}:{cross.time}"
         if key == self._last_cross_key:
             return None, f"{cross.label}@{cross.time} 已用过"
-        return cross, f"{cross.label}@{cross.time}"
+        if min_gap is not None and cross.gap_abs < min_gap:
+            # 敞口不够：消费掉这根，避免死等同一根小波动交叉
+            self._last_cross_key = key
+            return (
+                None,
+                f"{cross.label}@{cross.time} 敞口{cross.gap_abs}<{min_gap}，跳过",
+            )
+        return cross, f"{cross.label}@{cross.time} 敞口={cross.gap_abs}"
 
     def run(self) -> None:
         _print(
@@ -686,7 +698,7 @@ class GridRunner:
             "params": {
                 "passive_bps": str(trial.passive_bps),
                 "tp_usdt": str(trial.tp_usdt),
-                "need_macd": trial.need_macd,
+                "min_gap": str(trial.min_gap),
             },
             "qty": str(self.qty),
         }
@@ -841,7 +853,7 @@ class GridRunner:
     def _wait_and_enter(self, cycle: AbTestCycle, trial: TrialParams, tag: str) -> bool:
         deadline = time.monotonic() + self.enter_timeout
         while time.monotonic() < deadline:
-            cross, note = self._fresh_cross()
+            cross, note = self._fresh_cross(min_gap=trial.min_gap)
             if cross is None:
                 self._log({"event": "wait_enter", "trial": tag, "detail": note, "macd": self._macd_snap()})
                 time.sleep(self.poll_seconds)
@@ -852,7 +864,17 @@ class GridRunner:
                 continue
             # 拿到锁后再标记交叉已用，避免 busy 时白白跳过信号
             self._last_cross_key = f"{cross.kind}:{cross.time}"
-            self._log({"event": "enter_start", "trial": tag, "detail": note, "macd": self._macd_snap()})
+            self._trial_metrics["enter_gap_abs"] = str(cross.gap_abs)
+            self._log(
+                {
+                    "event": "enter_start",
+                    "trial": tag,
+                    "detail": note,
+                    "gap_abs": str(cross.gap_abs),
+                    "min_gap": str(trial.min_gap),
+                    "macd": self._macd_snap(),
+                }
+            )
             t0 = time.monotonic()
             try:
                 steps = cycle.enter_tight(self.qty)
@@ -879,6 +901,7 @@ class GridRunner:
                     "elapsed_s": round(elapsed, 3),
                     "entry_spread_bps": str(spr) if spr is not None else None,
                     "used_market": used_market,
+                    "gap_abs": str(cross.gap_abs),
                     "equity": str(_read_equity(cycle)),
                     "legs": _legs_snap(legs),
                     "detail": "；".join(f"{s.name}:{s.detail}" for s in steps[-8:])[:2000],
@@ -929,58 +952,50 @@ class GridRunner:
                 time.sleep(self.poll_seconds)
                 continue
 
-            side: str | None = None
-            note = ""
-            if trial.need_macd:
-                cross, note = self._fresh_cross()
-                if cross is None:
-                    self._log(
-                        {
-                            "event": "wait_harvest_cross",
-                            "trial": tag,
-                            "detail": note,
-                            "long_ready": long_ready,
-                            "short_ready": short_ready,
-                            "macd": self._macd_snap(),
-                        }
-                    )
-                    time.sleep(self.poll_seconds)
-                    continue
-                side = cross.harvest_side
-                pnl = legs.long_pnl if side == "LONG" else legs.short_pnl
-                if pnl < need:
-                    self._last_cross_key = f"{cross.kind}:{cross.time}"
-                    self._log(
-                        {
-                            "event": "cross_skip_pnl",
-                            "trial": tag,
-                            "detail": f"{note}→收{side} pnl={fmt_amount(pnl)}<{fmt_amount(need)}",
-                        }
-                    )
-                    time.sleep(self.poll_seconds)
-                    continue
-                if not self.ops.try_begin_action(self.account.id):
-                    self._log(
-                        {
-                            "event": "harvest_busy",
-                            "trial": tag,
-                            "detail": "账号忙，稍后重试（本交叉未消费）",
-                        }
-                    )
-                    time.sleep(self.poll_seconds)
-                    continue
+            # 一律等 MACD 交叉，且敞口 ≥ min_gap
+            cross, note = self._fresh_cross(min_gap=trial.min_gap)
+            if cross is None:
+                self._log(
+                    {
+                        "event": "wait_harvest_cross",
+                        "trial": tag,
+                        "detail": note,
+                        "long_ready": long_ready,
+                        "short_ready": short_ready,
+                        "macd": self._macd_snap(),
+                    }
+                )
+                time.sleep(self.poll_seconds)
+                continue
+            side = cross.harvest_side
+            pnl = legs.long_pnl if side == "LONG" else legs.short_pnl
+            if pnl < need:
                 self._last_cross_key = f"{cross.kind}:{cross.time}"
-            else:
-                # 无 MACD：收浮盈更大的一边
-                if long_ready and (not short_ready or legs.long_pnl >= legs.short_pnl):
-                    side = "LONG"
-                else:
-                    side = "SHORT"
-                note = "不需要 MACD，按浮盈收"
-                if not self.ops.try_begin_action(self.account.id):
-                    self._log({"event": "harvest_busy", "trial": tag, "detail": "账号忙，稍后重试"})
-                    time.sleep(self.poll_seconds)
-                    continue
+                self._log(
+                    {
+                        "event": "cross_skip_pnl",
+                        "trial": tag,
+                        "detail": (
+                            f"{note}→收{side} pnl={fmt_amount(pnl)}<{fmt_amount(need)} "
+                            f"敞口={cross.gap_abs}"
+                        ),
+                        "gap_abs": str(cross.gap_abs),
+                    }
+                )
+                time.sleep(self.poll_seconds)
+                continue
+            if not self.ops.try_begin_action(self.account.id):
+                self._log(
+                    {
+                        "event": "harvest_busy",
+                        "trial": tag,
+                        "detail": "账号忙，稍后重试（本交叉未消费）",
+                    }
+                )
+                time.sleep(self.poll_seconds)
+                continue
+            self._last_cross_key = f"{cross.kind}:{cross.time}"
+            self._trial_metrics["harvest_gap_abs"] = str(cross.gap_abs)
 
             self._log(
                 {
@@ -989,6 +1004,8 @@ class GridRunner:
                     "detail": f"{note} → 收{side}",
                     "side": side,
                     "need": str(need),
+                    "gap_abs": str(cross.gap_abs),
+                    "min_gap": str(trial.min_gap),
                     "macd": self._macd_snap(),
                 }
             )
@@ -1019,6 +1036,7 @@ class GridRunner:
                     "elapsed_s": round(elapsed, 3),
                     "side": side,
                     "used_market": used_market,
+                    "gap_abs": str(cross.gap_abs),
                     "equity": str(_read_equity(cycle)),
                     "legs": _legs_snap(after),
                     "detail": "；".join(f"{s.name}:{s.detail}" for s in steps[-10:])[:2000],
@@ -1026,8 +1044,9 @@ class GridRunner:
                 }
             )
             return ok
-        self._log({"event": "harvest_timeout", "trial": tag, "detail": f">{self.harvest_timeout}s 未达收利"})
+        self._log({"event": "harvest_timeout", "trial": tag, "detail": f"{self.harvest_timeout}s 未达收利"})
         return False
+
 
 
 def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
@@ -1201,7 +1220,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             f"优势最大: {best['trial']}",
             f"  params={best['params']}",
             f"  均权益差={best['avg_equity_delta']}  均开仓价差={best['avg_entry_spread_bps']}bp  score={best['score']}",
-            "落地建议：把该组 passive_bps / tp_usdt / need_macd 写回正式自动收利逻辑。",
+            "落地建议：把该组 passive_bps / tp_usdt / min_gap 写回正式自动收利逻辑。",
         ]
 
     if write_scorecard:
@@ -1231,7 +1250,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             "avg_harvest_elapsed_s",
             "passive_bps",
             "tp_usdt",
-            "need_macd",
+            "min_gap",
         ]
         with csv_path.open("w", encoding="utf-8") as fh:
             fh.write(",".join(headers) + "\n")
@@ -1255,7 +1274,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
                             str(rec["avg_harvest_elapsed_s"]),
                             str(p.get("passive_bps", "")),
                             str(p.get("tp_usdt", "")),
-                            str(p.get("need_macd", "")),
+                            str(p.get("min_gap", "")),
                         ]
                     )
                     + "\n"

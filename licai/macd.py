@@ -29,6 +29,9 @@ class MacdState:
     macd: Decimal
     signal: Decimal
     hist: Decimal
+    # 交叉前一根 |hist|（开口敞口）；无交叉则为当前 |hist|
+    # 交叉当下 hist≈0，用前柱衡量这波波动大小
+    gap_abs: Decimal = Decimal("0")
 
     @property
     def kind(self) -> str:
@@ -92,13 +95,17 @@ def _detect_state(rows: list[dict]) -> MacdState | None:
     else:
         return None
     cross = None
+    prev_hist = curr["hist"]
     if len(rows) >= 2:
         prev = rows[-2]
+        prev_hist = prev["hist"]
         prev_diff = prev["macd"] - prev["signal"]
         if prev_diff <= 0 and diff > 0:
             cross = "golden"
         elif prev_diff >= 0 and diff < 0:
             cross = "death"
+    # 交叉时用前柱 |hist| 作敞口；平时用当前 |hist|
+    gap_abs = abs(prev_hist) if cross else abs(curr["hist"])
     return MacdState(
         bias=bias,
         cross=cross,
@@ -106,6 +113,7 @@ def _detect_state(rows: list[dict]) -> MacdState | None:
         macd=curr["macd"],
         signal=curr["signal"],
         hist=curr["hist"],
+        gap_abs=gap_abs,
     )
 
 
