@@ -603,6 +603,7 @@
   </div>
   <script>
     let selected = null;
+    let accountsCache = [];
     let loadGen = 0;
     let timer = null;
     let busy = false;
@@ -650,6 +651,13 @@
       return selected != null && Number(selected) === Number(id);
     }
 
+    function acctNo(id) {
+      const aid = Number(id);
+      if (!Number.isFinite(aid)) return null;
+      const idx = accountsCache.findIndex((a) => Number(a.id) === aid);
+      return idx >= 0 ? idx + 1 : null;
+    }
+
     function setAcctLabel(account) {
       const el = $("acct-id-now");
       if (!el) return;
@@ -658,8 +666,10 @@
         el.textContent = "";
         return;
       }
+      const no = acctNo(id);
       const name = (account && account.name) ? String(account.name) : "";
-      el.textContent = name ? `#${id} ${name}` : `#${id}`;
+      const prefix = no != null ? `#${no}` : `#${id}`;
+      el.textContent = name ? `${prefix} ${name}` : prefix;
     }
 
     function resetPanelSkeleton(account) {
@@ -1174,16 +1184,21 @@
       syncHedgePickers($("add-settle"), $("add-base"), $("add-symbol-preview"), $("add-symbol"), $("add-symbol").value || "ETHUSDT");
       const box = $("accounts");
       box.innerHTML = "";
-      data.accounts.forEach((a) => {
+      accountsCache = Array.isArray(data.accounts) ? data.accounts.slice() : [];
+      accountsCache.forEach((a, i) => {
         const btn = document.createElement("button");
         btn.className = "acct" + (sameAccount(a.id) ? " active" : "");
         const sym = a.hedge_symbol || "ETHUSDT";
         const p = parseHedgeSymbol(sym);
-        const no = Number(a.id);
+        const no = i + 1;
         btn.innerHTML = `<b><span class="acct-id">#${no}</span>${esc(a.name)}</b><div class="muted">${esc(p.settle)} · ${esc(p.base)}</div>`;
         btn.onclick = () => selectAccount(a.id);
         box.appendChild(btn);
       });
+      if (selected != null) {
+        const cur = accountsCache.find((a) => Number(a.id) === Number(selected));
+        if (cur) setAcctLabel(cur);
+      }
       return data;
     }
 
