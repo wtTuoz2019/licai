@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """MACD 挂单开仓/收利参数网格测试（独立脚本，不改正式流程）。
 
-本轮重点（少市价 + 记敞口分布）：
+本轮重点（少市价 + 记敞口分布 + 盘口确认/滑点熔断）：
   - 一律等 MACD 金叉/死叉；min_gap 固定 0（先收集真实 gap_abs 分布）。
   - 开仓网格：首挂贴盘(pas) × 单边追价秒数(bail)；拉长追价少用市价。
+  - 交叉后要求连续盘口够紧才挂；连续市价/负价差则暂停开仓（借鉴逐点执行层）。
   - 止盈固定 0.08；每组参数重复多轮，再看均值。
   - 评分卡：只把「开仓成功」的组排优势；失败不开仓的不算第一。
 
@@ -61,6 +62,14 @@ FIXED_TP_USDT = Decimal("0.08")
 FIXED_MIN_GAP = Decimal("0")
 ROUNDS_PER_TRIAL = 3
 
+# 借鉴逐点：交叉后盘口确认 + 滑点熔断（只影响测试脚本）
+BOOK_CONFIRM_N = 2  # 连续几次盘口都合格才开仓
+BOOK_CONFIRM_INTERVAL = 0.45
+MAX_BOOK_SPREAD_BPS = Decimal("3")  # 盘口过宽则跳过本交叉时机（继续等）
+BAD_ENTRY_SPREAD_BPS = Decimal("-2")  # 成交后开仓价差差于该值算不利
+BAD_ENTER_STREAK = 2  # 连续不利（市价或负价差）几次后暂停
+ENTER_PAUSE_SECONDS = 300.0  # 熔断暂停秒数
+
 
 @dataclass(frozen=True)
 class TrialParams:
@@ -115,6 +124,31 @@ def entry_spread_bps(legs: HedgeLegs) -> Decimal | None:
     if mid <= 0:
         return None
     return (legs.short_entry - legs.long_entry) / mid * Decimal("10000")
+
+
+def book_spread_bps(bid: Decimal, ask: Decimal) -> Decimal | None:
+    """盘口买卖价差（bp）。"""
+    if bid <= 0 or ask <= 0 or ask <= bid:
+        return None
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid * Decimal("10000")
+
+
+def estimate_maker_entry_spread_bps(
+    bid: Decimal, ask: Decimal, passive_bps: Decimal
+) -> Decimal | None:
+    """预估挂单成交后的开仓价差（多≈买一外让、空≈卖一外让）。正更好。"""
+    if bid <= 0 or ask <= 0 or ask <= bid:
+        return None
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return None
+    factor = d(passive_bps) / Decimal("10000")
+    long_px = bid * (Decimal("1") - factor) if factor > 0 else bid
+    short_px = ask * (Decimal("1") + factor) if factor > 0 else ask
+    return (short_px - long_px) / mid * Decimal("10000")
 
 
 def _legs_snap(legs: HedgeLegs) -> dict[str, str]:
@@ -633,6 +667,8 @@ class GridRunner:
         self.log_path = log_path or LOG_PATH
         self._last_cross_key = ""
         self._last_gap_logged = ""
+        self._bad_enter_streak = 0
+        self._pause_until = 0.0
         # 当前组实验快照，供 trial_done / scorecard 聚合
         self._trial_metrics: dict[str, Any] = {}
 
@@ -713,6 +749,106 @@ class GridRunner:
             )
         return cross, f"{cross.label}@{cross.time} 敞口={cross.gap_abs}"
 
+    def _wait_if_paused(self, trial: str) -> None:
+        """连续不利开仓后的熔断等待。"""
+        while True:
+            remain = self._pause_until - time.monotonic()
+            if remain <= 0:
+                return
+            self._log(
+                {
+                    "event": "enter_paused",
+                    "trial": trial,
+                    "detail": f"滑点熔断，剩余 {remain:.0f}s（连续不利≥{BAD_ENTER_STREAK}）",
+                    "pause_remain_s": round(remain, 1),
+                }
+            )
+            time.sleep(min(remain, max(5.0, self.poll_seconds)))
+
+    def _confirm_book(self, cycle: AbTestCycle, trial: TrialParams, tag: str) -> tuple[bool, str, dict]:
+        """连续 N 次盘口够紧才允许开仓；短暂触及不算。"""
+        samples: list[dict[str, str]] = []
+        for i in range(BOOK_CONFIRM_N):
+            try:
+                bid, ask = cycle.futures.book(cycle.symbol, force=True)
+            except Exception as exc:
+                return False, f"读盘口失败: {exc}", {"samples": samples}
+            book_bp = book_spread_bps(bid, ask)
+            est_bp = estimate_maker_entry_spread_bps(bid, ask, trial.passive_bps)
+            snap = {
+                "i": str(i + 1),
+                "bid": str(bid),
+                "ask": str(ask),
+                "book_spread_bps": str(book_bp) if book_bp is not None else "",
+                "est_maker_spread_bps": str(est_bp) if est_bp is not None else "",
+            }
+            samples.append(snap)
+            if book_bp is None:
+                return False, "盘口无效", {"samples": samples}
+            if book_bp > MAX_BOOK_SPREAD_BPS:
+                return (
+                    False,
+                    f"盘口过宽 {fmt_amount(book_bp, 2)}bp>{MAX_BOOK_SPREAD_BPS}bp（{i+1}/{BOOK_CONFIRM_N}）",
+                    {"samples": samples, "book_spread_bps": str(book_bp)},
+                )
+            if i + 1 < BOOK_CONFIRM_N:
+                time.sleep(BOOK_CONFIRM_INTERVAL)
+        last = samples[-1] if samples else {}
+        return (
+            True,
+            f"盘口确认×{BOOK_CONFIRM_N} book={last.get('book_spread_bps')}bp",
+            {"samples": samples, "book_spread_bps": last.get("book_spread_bps", "")},
+        )
+
+    def _note_enter_quality(self, *, ok: bool, used_market: bool, spr: Decimal | None, tag: str) -> None:
+        """更新不利开仓计数；达阈值则熔断暂停。"""
+        if not ok:
+            # 开仓失败也算一轮不利，避免反复硬撞
+            bad = True
+            why = "开仓失败"
+        elif used_market:
+            bad = True
+            why = "使用市价"
+        elif spr is not None and spr < BAD_ENTRY_SPREAD_BPS:
+            bad = True
+            why = f"开仓价差{fmt_amount(spr, 2)}bp<{BAD_ENTRY_SPREAD_BPS}bp"
+        else:
+            bad = False
+            why = ""
+        if bad:
+            self._bad_enter_streak += 1
+            self._log(
+                {
+                    "event": "enter_quality_bad",
+                    "trial": tag,
+                    "detail": f"{why}；连续不利 {self._bad_enter_streak}/{BAD_ENTER_STREAK}",
+                    "streak": self._bad_enter_streak,
+                    "used_market": used_market,
+                    "entry_spread_bps": str(spr) if spr is not None else None,
+                }
+            )
+            if self._bad_enter_streak >= BAD_ENTER_STREAK:
+                self._pause_until = time.monotonic() + ENTER_PAUSE_SECONDS
+                self._bad_enter_streak = 0
+                self._log(
+                    {
+                        "event": "enter_circuit_break",
+                        "trial": tag,
+                        "detail": f"连续不利达阈值，暂停开仓 {ENTER_PAUSE_SECONDS:.0f}s",
+                        "pause_s": ENTER_PAUSE_SECONDS,
+                    }
+                )
+        else:
+            if self._bad_enter_streak:
+                self._log(
+                    {
+                        "event": "enter_quality_ok",
+                        "trial": tag,
+                        "detail": f"开仓质量恢复，清零不利计数（原 {self._bad_enter_streak}）",
+                    }
+                )
+            self._bad_enter_streak = 0
+
     def run(self) -> None:
         total = len(self.trials) * self.rounds
         _print(
@@ -724,7 +860,18 @@ class GridRunner:
                 "event": "grid_start",
                 "trials": len(self.trials),
                 "rounds": self.rounds,
-                "detail": f"开仓→收利→全平；每组 {self.rounds} 轮",
+                "detail": (
+                    f"开仓→收利→全平；每组 {self.rounds} 轮；"
+                    f"盘口确认×{BOOK_CONFIRM_N}≤{MAX_BOOK_SPREAD_BPS}bp；"
+                    f"连续不利{BAD_ENTER_STREAK}次暂停{ENTER_PAUSE_SECONDS:.0f}s"
+                ),
+                "guards": {
+                    "book_confirm_n": BOOK_CONFIRM_N,
+                    "max_book_spread_bps": str(MAX_BOOK_SPREAD_BPS),
+                    "bad_entry_spread_bps": str(BAD_ENTRY_SPREAD_BPS),
+                    "bad_enter_streak": BAD_ENTER_STREAK,
+                    "enter_pause_s": ENTER_PAUSE_SECONDS,
+                },
             }
         )
         idx = 0
@@ -907,11 +1054,31 @@ class GridRunner:
     def _wait_and_enter(self, cycle: AbTestCycle, trial: TrialParams, tag: str) -> bool:
         deadline = time.monotonic() + self.enter_timeout
         while time.monotonic() < deadline:
+            self._wait_if_paused(tag)
+            if time.monotonic() >= deadline:
+                break
             cross, note = self._fresh_cross(min_gap=trial.min_gap, trial=tag)
             if cross is None:
                 self._log({"event": "wait_enter", "trial": tag, "detail": note, "macd": self._macd_snap()})
                 time.sleep(self.poll_seconds)
                 continue
+
+            # 交叉后先确认盘口；不合格不消费交叉，短暂触及不算
+            book_ok, book_note, book_meta = self._confirm_book(cycle, trial, tag)
+            if not book_ok:
+                self._log(
+                    {
+                        "event": "cross_skip_book",
+                        "trial": tag,
+                        "detail": f"{note} → {book_note}",
+                        "gap_abs": str(cross.gap_abs),
+                        "book": book_meta,
+                        "macd": self._macd_snap(),
+                    }
+                )
+                time.sleep(self.poll_seconds)
+                continue
+
             if not self.ops.try_begin_action(self.account.id):
                 self._log({"event": "enter_busy", "trial": tag, "detail": "账号忙，稍后重试（本交叉未消费）"})
                 time.sleep(self.poll_seconds)
@@ -919,13 +1086,15 @@ class GridRunner:
             # 拿到锁后再标记交叉已用，避免 busy 时白白跳过信号
             self._last_cross_key = f"{cross.kind}:{cross.time}"
             self._trial_metrics["enter_gap_abs"] = str(cross.gap_abs)
+            self._trial_metrics["book_spread_bps"] = book_meta.get("book_spread_bps")
             self._log(
                 {
                     "event": "enter_start",
                     "trial": tag,
-                    "detail": note,
+                    "detail": f"{note}；{book_note}",
                     "gap_abs": str(cross.gap_abs),
                     "min_gap": str(trial.min_gap),
+                    "book": book_meta,
                     "macd": self._macd_snap(),
                 }
             )
@@ -963,6 +1132,7 @@ class GridRunner:
                     "params": self._trial_metrics.get("params"),
                 }
             )
+            self._note_enter_quality(ok=ok, used_market=used_market, spr=spr, tag=tag)
             if ok:
                 return True
             if self.ops.try_begin_action(self.account.id):
