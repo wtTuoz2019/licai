@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """MACD 挂单开仓/收利参数网格测试（独立脚本，不改正式流程）。
 
-目标：
-  - 一律等 MACD 金叉/死叉；用交叉前柱 |hist|（敞口）过滤波动大小。
-  - 开仓：固定 0.001 BTC；贴盘 GTX 追价，尽量挂单成交；
-    单边超过约 4s 或不利价差过大才市价补齐（不裸仓）；
-    对冲齐后继续测收利，记录开仓价差作对比，不因价差整组重开。
-  - 收利：止盈网格约 0.05/0.08/0.12；交叉且敞口够才收；先挂单追价。
-  - 流程：每组参数 → 开仓 → 收利 → 全平 → 下一组。
+本轮重点（少市价 + 记敞口分布）：
+  - 一律等 MACD 金叉/死叉；min_gap 固定 0（先收集真实 gap_abs 分布）。
+  - 开仓网格：首挂贴盘(pas) × 单边追价秒数(bail)；拉长追价少用市价。
+  - 止盈固定 0.08；每组参数重复多轮，再看均值。
+  - 评分卡：只把「开仓成功」的组排优势；失败不开仓的不算第一。
 
 固定数量：BTC 0.001（可用 --qty 改）。
 
 用法：
-  nohup .venv/bin/python scripts/macd_abtest.py --account-no 4 --live --confirm \\
+  nohup .venv/bin/python scripts/macd_abtest.py --account-no 4 --live --confirm \
       >> logs/macd_abtest.log 2>&1 &
   .venv/bin/python scripts/macd_abtest.py --summary
-  # 汇总会写 data/macd_abtest_scorecard.json + .csv，按权益差/价差/市价次数排优势
 """
 
 from __future__ import annotations
@@ -49,37 +46,39 @@ from licai.store import Account, AccountStore  # noqa: E402
 log = logging.getLogger("macd_abtest")
 LOG_PATH = (PKG_ROOT / "data") / "macd_abtest.jsonl"
 SCORECARD_PATH = (PKG_ROOT / "data") / "macd_abtest_scorecard.json"
+GAP_STATS_PATH = (PKG_ROOT / "data") / "macd_abtest_gap_stats.json"
 FIXED_QTY = Decimal("0.001")
-# 开仓：尽量 GTX 追到齐；仅单边拖太久或不利价差过大才市价补（保证对冲）
+# 默认兜底（可被 TrialParams 覆盖）
 ENTER_BAIL_SPREAD_BPS = Decimal("8")
-ENTER_BAIL_NAKED_SECONDS = 4.0
+ENTER_BAIL_NAKED_SECONDS = 8.0
 # 单边补腿时挂单追价间隔（秒）；越小越勤改价贴盘
 ENTER_CHASE_INTERVAL = 0.12
 
-# 开仓参数网格（开仓价差写入日志对比；单边过大时用市价兜底，不整组重开）
-ENTER_PASSIVE_BPS = (Decimal("0.5"), Decimal("1"))  # 首挂外让 bp（越小越贴盘）
-
-# 收利止盈网格
-HARVEST_TP_USDT = (Decimal("0.05"), Decimal("0.08"), Decimal("0.12"))
-# 交叉前柱 |hist| 最小敞口：0=任意交叉；越大只吃大波动交叉（图上柱高约到 50）
-MACD_MIN_GAP = (Decimal("0"), Decimal("10"), Decimal("25"))
+# 本轮网格：贴盘 × 追价时长（固定 gap0 + tp0.08）
+ENTER_PASSIVE_BPS = (Decimal("0"), Decimal("0.5"))  # 0=直接贴买一/卖一
+ENTER_BAIL_NAKED_GRID = (8.0, 16.0)  # 单边挂单追价秒数，再长才市价
+FIXED_TP_USDT = Decimal("0.08")
+FIXED_MIN_GAP = Decimal("0")
+ROUNDS_PER_TRIAL = 3
 
 
 @dataclass(frozen=True)
 class TrialParams:
     passive_bps: Decimal
-    tp_usdt: Decimal
-    min_gap: Decimal  # 交叉时要求的最小敞口（|hist| 前柱）
+    bail_naked_s: float
+    tp_usdt: Decimal = FIXED_TP_USDT
+    min_gap: Decimal = FIXED_MIN_GAP
 
     @property
     def name(self) -> str:
-        return f"pas{self.passive_bps}_tp{self.tp_usdt}_gap{self.min_gap}"
+        bail = f"{self.bail_naked_s:g}"
+        return f"pas{self.passive_bps}_bail{bail}_tp{self.tp_usdt}"
 
 
 def build_trials() -> list[TrialParams]:
     out: list[TrialParams] = []
-    for pas, tp, gap in itertools.product(ENTER_PASSIVE_BPS, HARVEST_TP_USDT, MACD_MIN_GAP):
-        out.append(TrialParams(pas, tp, gap))
+    for pas, bail in itertools.product(ENTER_PASSIVE_BPS, ENTER_BAIL_NAKED_GRID):
+        out.append(TrialParams(pas, float(bail)))
     return out
 
 
@@ -140,11 +139,22 @@ def _read_equity(cycle: AbTestCycle) -> Decimal:
 class AbTestCycle(HedgeCycle):
     """测试专用：紧对冲开仓 / 挂单收利 / 全平；不碰理财划转。"""
 
-    def __init__(self, pipeline, *, passive_bps: Decimal = Decimal("2")):
+    def __init__(
+        self,
+        pipeline,
+        *,
+        passive_bps: Decimal = Decimal("2"),
+        bail_naked_s: float | None = None,
+        bail_spread_bps: Decimal | None = None,
+    ):
         super().__init__(pipeline)
         self.ab_passive_bps = passive_bps
-        self.ab_bail_spread_bps = ENTER_BAIL_SPREAD_BPS
-        self.ab_bail_naked_s = ENTER_BAIL_NAKED_SECONDS
+        self.ab_bail_spread_bps = (
+            bail_spread_bps if bail_spread_bps is not None else ENTER_BAIL_SPREAD_BPS
+        )
+        self.ab_bail_naked_s = float(
+            bail_naked_s if bail_naked_s is not None else ENTER_BAIL_NAKED_SECONDS
+        )
         self.settings = replace(
             self.settings,
             maker_only=False,  # 允许市价兜底；正常路径仍先 GTX
@@ -152,8 +162,8 @@ class AbTestCycle(HedgeCycle):
             maker_passive_ticks=0,  # 允许贴买一/卖一排队（见 _maker_prices 覆盖）
             maker_improve_bps=Decimal("2"),
             quote_refresh_seconds=0.2,
-            hedge_max_wait_seconds=ENTER_BAIL_NAKED_SECONDS,
-            hedge_max_slippage_bps=ENTER_BAIL_SPREAD_BPS,
+            hedge_max_wait_seconds=self.ab_bail_naked_s,
+            hedge_max_slippage_bps=self.ab_bail_spread_bps,
         )
 
     def _maker_prices(
@@ -608,6 +618,7 @@ class GridRunner:
         enter_timeout: float = 3600.0,
         harvest_timeout: float = 7200.0,
         trials: list[TrialParams] | None = None,
+        rounds: int = ROUNDS_PER_TRIAL,
         log_path: Path | None = None,
     ):
         self.ops = ops
@@ -618,8 +629,10 @@ class GridRunner:
         self.enter_timeout = enter_timeout
         self.harvest_timeout = harvest_timeout
         self.trials = trials or build_trials()
+        self.rounds = max(1, int(rounds))
         self.log_path = log_path or LOG_PATH
         self._last_cross_key = ""
+        self._last_gap_logged = ""
         # 当前组实验快照，供 trial_done / scorecard 聚合
         self._trial_metrics: dict[str, Any] = {}
 
@@ -640,7 +653,11 @@ class GridRunner:
 
     def _cycle(self, trial: TrialParams) -> AbTestCycle:
         pipe = pipeline_for(self.account, self.ops.base, dry_run=False, ops=self.ops)
-        return AbTestCycle(pipe, passive_bps=trial.passive_bps)
+        return AbTestCycle(
+            pipe,
+            passive_bps=trial.passive_bps,
+            bail_naked_s=trial.bail_naked_s,
+        )
 
     def _macd_snap(self) -> dict | None:
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
@@ -661,7 +678,7 @@ class GridRunner:
             "harvest_side": state.harvest_side,
         }
 
-    def _fresh_cross(self, *, min_gap: Decimal | None = None):
+    def _fresh_cross(self, *, min_gap: Decimal | None = None, trial: str = ""):
         """取未用过的金叉/死叉；若 min_gap 给定则要求交叉前柱敞口够大。"""
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
         cross = fetch_macd_cross(url)
@@ -670,6 +687,23 @@ class GridRunner:
         key = f"{cross.kind}:{cross.time}"
         if key == self._last_cross_key:
             return None, f"{cross.label}@{cross.time} 已用过"
+        # 每根交叉只记一次敞口，供后续定 min_gap 门槛
+        if key != self._last_gap_logged:
+            self._last_gap_logged = key
+            self._log(
+                {
+                    "event": "cross_seen",
+                    "trial": trial or None,
+                    "gap_abs": str(cross.gap_abs),
+                    "cross": cross.cross,
+                    "label": cross.label,
+                    "time": cross.time,
+                    "macd": str(cross.macd),
+                    "signal": str(cross.signal),
+                    "hist": str(cross.hist),
+                    "detail": f"{cross.label}@{cross.time} 敞口={cross.gap_abs}",
+                }
+            )
         if min_gap is not None and cross.gap_abs < min_gap:
             # 敞口不够：消费掉这根，避免死等同一根小波动交叉
             self._last_cross_key = key
@@ -680,23 +714,41 @@ class GridRunner:
         return cross, f"{cross.label}@{cross.time} 敞口={cross.gap_abs}"
 
     def run(self) -> None:
+        total = len(self.trials) * self.rounds
         _print(
             f"网格测试启动 #{self.account_no} id={self.account.id} {self.account.name} "
-            f"qty={self.qty} trials={len(self.trials)} → {self.log_path}"
+            f"qty={self.qty} trials={len(self.trials)}×{self.rounds}轮={total} → {self.log_path}"
         )
-        self._log({"event": "grid_start", "trials": len(self.trials), "detail": "开仓→收利→全平循环"})
-        for idx, trial in enumerate(self.trials, start=1):
-            self._run_one(idx, trial)
-        self._log({"event": "grid_done", "detail": f"共 {len(self.trials)} 组，见 --summary"})
+        self._log(
+            {
+                "event": "grid_start",
+                "trials": len(self.trials),
+                "rounds": self.rounds,
+                "detail": f"开仓→收利→全平；每组 {self.rounds} 轮",
+            }
+        )
+        idx = 0
+        for trial in self.trials:
+            for round_i in range(1, self.rounds + 1):
+                idx += 1
+                self._run_one(idx, trial, round_i=round_i)
+        self._log(
+            {
+                "event": "grid_done",
+                "detail": f"共 {len(self.trials)} 组×{self.rounds} 轮，见 --summary",
+            }
+        )
         _print(summarize(self.log_path))
 
-    def _run_one(self, idx: int, trial: TrialParams) -> None:
+    def _run_one(self, idx: int, trial: TrialParams, *, round_i: int = 1) -> None:
         tag = trial.name
         self._trial_metrics = {
             "trial": tag,
             "trial_i": idx,
+            "round": round_i,
             "params": {
                 "passive_bps": str(trial.passive_bps),
+                "bail_naked_s": str(trial.bail_naked_s),
                 "tp_usdt": str(trial.tp_usdt),
                 "min_gap": str(trial.min_gap),
             },
@@ -707,6 +759,7 @@ class GridRunner:
                 "event": "trial_start",
                 "trial": tag,
                 "trial_i": idx,
+                "round": round_i,
                 "params": self._trial_metrics["params"],
             }
         )
@@ -817,6 +870,7 @@ class GridRunner:
                     {
                         "event": "trial_done",
                         "trial": tag,
+                        "round": round_i,
                         "enter_ok": True,
                         "harvest_ok": harvest_ok,
                         "flat_ok": flat_ok,
@@ -853,7 +907,7 @@ class GridRunner:
     def _wait_and_enter(self, cycle: AbTestCycle, trial: TrialParams, tag: str) -> bool:
         deadline = time.monotonic() + self.enter_timeout
         while time.monotonic() < deadline:
-            cross, note = self._fresh_cross(min_gap=trial.min_gap)
+            cross, note = self._fresh_cross(min_gap=trial.min_gap, trial=tag)
             if cross is None:
                 self._log({"event": "wait_enter", "trial": tag, "detail": note, "macd": self._macd_snap()})
                 time.sleep(self.poll_seconds)
@@ -953,7 +1007,7 @@ class GridRunner:
                 continue
 
             # 一律等 MACD 交叉，且敞口 ≥ min_gap
-            cross, note = self._fresh_cross(min_gap=trial.min_gap)
+            cross, note = self._fresh_cross(min_gap=trial.min_gap, trial=tag)
             if cross is None:
                 self._log(
                     {
@@ -1050,12 +1104,11 @@ class GridRunner:
 
 
 def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
-    """按组汇总优势：权益差优先，其次开仓价差、少市价、耗时。"""
+    """按组汇总优势：只排开仓成功的组；并输出交叉敞口分布。"""
     target = path or LOG_PATH
     if not target.exists():
         return f"还没有日志: {target}"
 
-    # 两遍：先标出有 trial_done 的组，再聚合，避免 enter/harvest 与 trial_done 重复计价
     raw_rows: list[dict[str, Any]] = []
     for line in target.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -1065,6 +1118,50 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             raw_rows.append(json.loads(line))
         except json.JSONDecodeError:
             continue
+
+    # 交叉敞口分布（为下一轮定 min_gap）
+    gaps: list[float] = []
+    for row in raw_rows:
+        if row.get("event") not in ("cross_seen", "enter_start", "enter_done", "harvest_start"):
+            continue
+        raw = row.get("gap_abs")
+        if raw is None and isinstance(row.get("macd"), dict):
+            raw = row["macd"].get("gap_abs")
+        if raw is None:
+            continue
+        try:
+            gaps.append(float(raw))
+        except (TypeError, ValueError):
+            pass
+    # cross_seen 优先：若有则只用它，避免同一交叉重复
+    seen_gaps: list[float] = []
+    for row in raw_rows:
+        if row.get("event") != "cross_seen":
+            continue
+        try:
+            seen_gaps.append(float(row["gap_abs"]))
+        except (TypeError, ValueError, KeyError):
+            pass
+    gap_src = seen_gaps if seen_gaps else gaps
+    gap_stats: dict[str, Any] = {"n": len(gap_src)}
+    if gap_src:
+        ordered = sorted(gap_src)
+        def _pct(p: float) -> float:
+            if not ordered:
+                return 0.0
+            i = min(len(ordered) - 1, max(0, int(round((p / 100.0) * (len(ordered) - 1)))))
+            return round(ordered[i], 4)
+        gap_stats.update(
+            {
+                "min": round(ordered[0], 4),
+                "p25": _pct(25),
+                "p50": _pct(50),
+                "p75": _pct(75),
+                "p90": _pct(90),
+                "max": round(ordered[-1], 4),
+                "mean": round(sum(ordered) / len(ordered), 4),
+            }
+        )
 
     trials_with_done: set[str] = {
         str(r["trial"]) for r in raw_rows if r.get("event") == "trial_done" and r.get("trial")
@@ -1125,6 +1222,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             slot["samples"].append(
                 {
                     "ts": row.get("ts"),
+                    "round": row.get("round") or (row.get("metrics") or {}).get("round"),
                     "cycle_equity_delta": row.get("cycle_equity_delta"),
                     "entry_spread_bps": row.get("entry_spread_bps"),
                     "enter_used_market": row.get("enter_used_market"),
@@ -1164,10 +1262,25 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
     lines = [
         f"日志 {target}",
         f"评分卡会写入 {SCORECARD_PATH}",
-        "排序：均权益差 ↓ → 开仓价差(正更好) → 少市价 → 入场更快",
+        "排序（仅开仓成功）：均权益差 ↓ → 少市价 → 开仓价差(正更好) → 入场更快",
         "",
     ]
-    ranked: list[tuple[tuple, dict]] = []
+    if gap_stats.get("n"):
+        lines += [
+            (
+                f"交叉敞口 gap_abs 分布 n={gap_stats['n']}  "
+                f"min={gap_stats['min']} p25={gap_stats['p25']} p50={gap_stats['p50']} "
+                f"p75={gap_stats['p75']} p90={gap_stats['p90']} max={gap_stats['max']} "
+                f"mean={gap_stats['mean']}"
+            ),
+            "（下一轮可按 p50/p75 设 min_gap）",
+            "",
+        ]
+    else:
+        lines += ["交叉敞口：尚无 cross_seen 记录", ""]
+
+    ranked_ok: list[tuple[tuple, dict]] = []
+    ranked_fail: list[tuple[tuple, dict]] = []
     for trial, slot in by_trial.items():
         deltas = slot["equity_deltas"]
         spreads = slot["spreads"]
@@ -1178,11 +1291,13 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
         market_n = slot["enter_market"] + slot["harvest_market"]
         h_ok = slot["harvest_ok"]
         e_ok = slot["enter_ok"]
-        # 综合分：权益差权重大；正价差加分；市价惩罚；耗时轻微惩罚
+        # 市价占比（开仓成功轮次内）
+        market_rate = (slot["enter_market"] / e_ok) if e_ok else 1.0
         score = (
             avg_delta * 100.0
             + avg_spr * 0.05
-            - market_n * 0.02
+            - market_n * 0.05
+            - market_rate * 2.0
             - avg_e * 0.0005
             + h_ok * 0.5
         )
@@ -1199,40 +1314,59 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             "avg_enter_elapsed_s": round(avg_e, 3),
             "avg_harvest_elapsed_s": round(avg_h, 3),
             "enter_market_count": slot["enter_market"],
+            "enter_market_rate": round(market_rate, 3),
             "harvest_market_count": slot["harvest_market"],
-            "score": round(score, 6),
+            "score": round(score, 6) if e_ok > 0 else None,
             "samples": slot["samples"],
         }
         line = (
-            f"{trial}  score={score:.4f}  均权益差={avg_delta:.4f}  "
+            f"{trial}  score={score if e_ok else float('nan'):.4f}  均权益差={avg_delta:.4f}  "
             f"均开仓价差={avg_spr:.2f}bp  入场{e_ok}/{e_ok+slot['enter_fail']}  "
-            f"收利{h_ok}/{h_ok+slot['harvest_fail']}  市价入{slot['enter_market']}/收{slot['harvest_market']}  "
+            f"收利{h_ok}/{h_ok+slot['harvest_fail']}  市价入{slot['enter_market']}"
+            f"({market_rate:.0%})/收{slot['harvest_market']}  "
             f"耗时入{avg_e:.1f}s/收{avg_h:.1f}s"
         )
-        lines.append(line)
-        ranked.append(((score, avg_delta, avg_spr, -market_n, -avg_e), rec))
+        item = ((score, avg_delta, -market_rate, avg_spr, -avg_e), rec)
+        if e_ok > 0:
+            ranked_ok.append(item)
+            lines.append(line)
+        else:
+            ranked_fail.append(item)
 
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    best = ranked[0][1] if ranked else None
+    ranked_ok.sort(key=lambda x: x[0], reverse=True)
+    if ranked_fail:
+        lines += ["", "—— 未开仓成功（不参与排名）——"]
+        for _, rec in ranked_fail:
+            lines.append(
+                f"{rec['trial']}  入场0/{rec['enter_fail']}  params={rec['params']}"
+            )
+
+    best = ranked_ok[0][1] if ranked_ok else None
     if best:
         lines += [
             "",
             f"优势最大: {best['trial']}",
             f"  params={best['params']}",
-            f"  均权益差={best['avg_equity_delta']}  均开仓价差={best['avg_entry_spread_bps']}bp  score={best['score']}",
-            "落地建议：把该组 passive_bps / tp_usdt / min_gap 写回正式自动收利逻辑。",
+            f"  均权益差={best['avg_equity_delta']}  市价入占比={best['enter_market_rate']}  "
+            f"均开仓价差={best['avg_entry_spread_bps']}bp  score={best['score']}",
+            "落地建议：先把该组 passive_bps / bail_naked_s 写回开仓追价；敞口门槛看上方分布。",
         ]
+    else:
+        lines += ["", "尚无开仓成功的组，无法评选优势参数。"]
+
+    ranking = [r[1] for r in ranked_ok] + [r[1] for r in ranked_fail]
 
     if write_scorecard:
         SCORECARD_PATH.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "generated_at": _now(),
             "log_path": str(target),
+            "gap_stats": gap_stats,
             "best": best,
-            "ranking": [r[1] for r in ranked],
+            "ranking": ranking,
         }
         SCORECARD_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        # CSV 方便表格对比
+        GAP_STATS_PATH.write_text(json.dumps(gap_stats, ensure_ascii=False, indent=2), encoding="utf-8")
         csv_path = SCORECARD_PATH.with_suffix(".csv")
         headers = [
             "rank",
@@ -1245,23 +1379,25 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             "harvest_ok",
             "harvest_fail",
             "enter_market_count",
+            "enter_market_rate",
             "harvest_market_count",
             "avg_enter_elapsed_s",
             "avg_harvest_elapsed_s",
             "passive_bps",
+            "bail_naked_s",
             "tp_usdt",
             "min_gap",
         ]
         with csv_path.open("w", encoding="utf-8") as fh:
             fh.write(",".join(headers) + "\n")
-            for i, (_, rec) in enumerate(ranked, start=1):
+            for i, rec in enumerate(ranking, start=1):
                 p = rec.get("params") or {}
                 fh.write(
                     ",".join(
                         [
                             str(i),
                             rec["trial"],
-                            str(rec["score"]),
+                            str(rec["score"] if rec["score"] is not None else ""),
                             str(rec["avg_equity_delta"]),
                             str(rec["avg_entry_spread_bps"]),
                             str(rec["enter_ok"]),
@@ -1269,10 +1405,12 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
                             str(rec["harvest_ok"]),
                             str(rec["harvest_fail"]),
                             str(rec["enter_market_count"]),
+                            str(rec.get("enter_market_rate", "")),
                             str(rec["harvest_market_count"]),
                             str(rec["avg_enter_elapsed_s"]),
                             str(rec["avg_harvest_elapsed_s"]),
                             str(p.get("passive_bps", "")),
+                            str(p.get("bail_naked_s", "")),
                             str(p.get("tp_usdt", "")),
                             str(p.get("min_gap", "")),
                         ]
@@ -1281,8 +1419,10 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
                 )
         lines.append(f"已写评分卡 JSON: {SCORECARD_PATH}")
         lines.append(f"已写评分卡 CSV:  {csv_path}")
+        lines.append(f"已写敞口分布:   {GAP_STATS_PATH}")
 
     return "\n".join(lines)
+
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1293,6 +1433,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--poll", type=float, default=15.0)
     parser.add_argument("--enter-timeout", type=float, default=3600.0, help="单组等开仓最长秒数")
     parser.add_argument("--harvest-timeout", type=float, default=7200.0, help="单组等收利最长秒数")
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=ROUNDS_PER_TRIAL,
+        help=f"每组参数重复轮数（默认 {ROUNDS_PER_TRIAL}）",
+    )
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--summary", action="store_true")
@@ -1306,10 +1452,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     trials = build_trials()
+    rounds = max(1, int(args.rounds))
     if args.list_trials:
-        print(f"共 {len(trials)} 组：")
+        print(f"共 {len(trials)} 组 × {rounds} 轮 = {len(trials) * rounds} 次循环：")
         for i, t in enumerate(trials, 1):
-            print(f"  {i:2d}. {t.name}")
+            print(
+                f"  {i:2d}. {t.name}  "
+                f"pas={t.passive_bps} bail={t.bail_naked_s}s tp={t.tp_usdt} gap>={t.min_gap}"
+            )
         return 0
 
     if not args.live or not args.confirm:
@@ -1341,6 +1491,7 @@ def main(argv: list[str] | None = None) -> int:
         enter_timeout=args.enter_timeout,
         harvest_timeout=args.harvest_timeout,
         trials=trials,
+        rounds=rounds,
     )
     try:
         runner.run()
