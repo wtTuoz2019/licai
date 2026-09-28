@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """MACD 挂单开仓/收利参数网格测试（独立脚本，不改正式流程）。
 
-本轮重点（少市价 + 记敞口分布 + 盘口确认/滑点熔断）：
-  - 一律等 MACD 金叉/死叉；min_gap 固定 0（先收集真实 gap_abs 分布）。
-  - 开仓网格：首挂贴盘(pas) × 单边追价秒数(bail)；拉长追价少用市价。
-  - 交叉后要求连续盘口够紧才挂；连续市价/负价差则暂停开仓（借鉴逐点执行层）。
-  - 止盈固定 0.08；每组参数重复多轮，再看均值。
-  - 评分卡：只把「开仓成功」的组排优势；失败不开仓的不算第一。
+本轮对比三种开仓，且都必须等 MACD 金叉/死叉，并用交叉前柱敞口过滤：
+  - 敞口门槛 0 / 1.3 / 2（上一轮 40 次交叉的大约全样本 / 中位数 / 75% 分位）。
+  - take：买一卖一量够，双边市价直接吃掉盘口上的单。
+  - maker_bail：贴买一/卖一挂单追价，超时再用市价补齐。
+  - maker_flat：只挂单；超时撤单并把已成交的一边平掉，不用市价把对冲补齐。
+  - 收利同样等下一次金叉/死叉，且敞口达到同一门槛。
+  - 止盈固定 0.08。评分按权益差排序，并列出开仓价差和开仓手续费。
 
 固定数量：BTC 0.001（可用 --qty 改）。
 
@@ -55,12 +56,13 @@ ENTER_BAIL_NAKED_SECONDS = 8.0
 # 单边补腿时挂单追价间隔（秒）；越小越勤改价贴盘
 ENTER_CHASE_INTERVAL = 0.12
 
-# 本轮网格：贴盘 × 追价时长（固定 gap0 + tp0.08）
-ENTER_PASSIVE_BPS = (Decimal("0"), Decimal("0.5"))  # 0=直接贴买一/卖一
-ENTER_BAIL_NAKED_GRID = (8.0, 16.0)  # 单边挂单追价秒数，再长才市价
+# 三种开仓 × 实测敞口档。1.3≈中位数，2≈75% 分位（gap10/25 在这套指标上几乎等不到）
+ENTER_MODES = ("take", "maker_bail", "maker_flat")
+MACD_MIN_GAP = (Decimal("0"), Decimal("1.3"), Decimal("2"))
+MAKER_PASSIVE_BPS = Decimal("0")
+MAKER_BAIL_SECONDS = 16.0
 FIXED_TP_USDT = Decimal("0.08")
-FIXED_MIN_GAP = Decimal("0")
-ROUNDS_PER_TRIAL = 3
+ROUNDS_PER_TRIAL = 2
 
 # 借鉴逐点：交叉后盘口确认 + 滑点熔断（只影响测试脚本）
 BOOK_CONFIRM_N = 2  # 连续几次盘口都合格才开仓
@@ -73,22 +75,19 @@ ENTER_PAUSE_SECONDS = 300.0  # 熔断暂停秒数
 
 @dataclass(frozen=True)
 class TrialParams:
-    passive_bps: Decimal
-    bail_naked_s: float
+    mode: str  # take | maker_bail | maker_flat
+    passive_bps: Decimal = MAKER_PASSIVE_BPS
+    bail_naked_s: float = MAKER_BAIL_SECONDS
     tp_usdt: Decimal = FIXED_TP_USDT
-    min_gap: Decimal = FIXED_MIN_GAP
+    min_gap: Decimal = Decimal("0")
 
     @property
     def name(self) -> str:
-        bail = f"{self.bail_naked_s:g}"
-        return f"pas{self.passive_bps}_bail{bail}_tp{self.tp_usdt}"
+        return f"{self.mode}_gap{self.min_gap}_tp{self.tp_usdt}"
 
 
 def build_trials() -> list[TrialParams]:
-    out: list[TrialParams] = []
-    for pas, bail in itertools.product(ENTER_PASSIVE_BPS, ENTER_BAIL_NAKED_GRID):
-        out.append(TrialParams(pas, float(bail)))
-    return out
+    return [TrialParams(mode, min_gap=gap) for mode, gap in itertools.product(ENTER_MODES, MACD_MIN_GAP)]
 
 
 def _now() -> str:
@@ -149,6 +148,86 @@ def estimate_maker_entry_spread_bps(
     long_px = bid * (Decimal("1") - factor) if factor > 0 else bid
     short_px = ask * (Decimal("1") + factor) if factor > 0 else ask
     return (short_px - long_px) / mid * Decimal("10000")
+
+
+def fetch_book_top(symbol: str) -> dict[str, Decimal] | None:
+    """买一/卖一价格和挂单量。市价吃单前用来确认盘口上真有量。"""
+    import requests
+
+    try:
+        resp = requests.get(
+            "https://fapi.binance.com/fapi/v1/ticker/bookTicker",
+            params={"symbol": symbol.upper()},
+            timeout=4,
+            proxies={"http": None, "https": None},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        "bid": d(data.get("bidPrice")),
+        "ask": d(data.get("askPrice")),
+        "bid_qty": d(data.get("bidQty")),
+        "ask_qty": d(data.get("askQty")),
+    }
+
+
+def _commission_usdt(row: dict, bnb_mid: Decimal) -> tuple[Decimal, Decimal]:
+    asset = str(row.get("commissionAsset") or "").upper()
+    commission = abs(d(row.get("commission")))
+    if commission <= 0:
+        return Decimal("0"), bnb_mid
+    if asset in {"USDT", "USDC", "BFUSD", "BUSD", "FDUSD"}:
+        return commission, bnb_mid
+    if asset == "BNB":
+        if bnb_mid <= 0:
+            try:
+                from licai import market
+
+                bb, ba = market.book("BNBUSDT", force=True)
+                bnb_mid = (bb + ba) / 2 if bb > 0 and ba > 0 else Decimal("0")
+            except Exception:
+                bnb_mid = Decimal("0")
+        if bnb_mid <= 0:
+            return Decimal("0"), bnb_mid
+        return commission * bnb_mid, bnb_mid
+    return Decimal("0"), bnb_mid
+
+
+def trade_cursor(cycle: "AbTestCycle") -> int:
+    """最近成交里最大 trade id，用来算本段新增手续费。"""
+    from licai import futures as futures_mod
+
+    futures_mod._TRADES_CACHE.clear()
+    try:
+        rows = cycle.futures.um_user_trades(cycle.symbol, limit=40)
+    except Exception:
+        return 0
+    ids = [int(row.get("id") or 0) for row in rows if isinstance(row, dict)]
+    return max(ids) if ids else 0
+
+
+def fees_since(cycle: "AbTestCycle", after_id: int) -> Decimal:
+    from licai import futures as futures_mod
+
+    futures_mod._TRADES_CACHE.clear()
+    try:
+        rows = cycle.futures.um_user_trades(cycle.symbol, limit=40)
+    except Exception:
+        return Decimal("0")
+    total = Decimal("0")
+    bnb_mid = Decimal("0")
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if int(row.get("id") or 0) <= after_id:
+            continue
+        fee, bnb_mid = _commission_usdt(row, bnb_mid)
+        total += fee
+    return total
 
 
 def _legs_snap(legs: HedgeLegs) -> dict[str, str]:
@@ -330,15 +409,26 @@ class AbTestCycle(HedgeCycle):
             steps.append(StepResult("开仓", False, "数量无效"))
             return steps
 
-        steps.append(
-            StepResult(
-                "紧对冲开仓",
-                True,
-                f"qty={fmt_amount(qty)} 首挂外让 {self.ab_passive_bps}bp；"
-                f"GTX 优先，单边>{self.ab_bail_naked_s}s 或不利>{self.ab_bail_spread_bps}bp 市价补齐",
+        mode = getattr(self, "ab_enter_mode", "maker_bail")
+        if mode == "take":
+            steps.append(StepResult("吃单开仓", True, f"qty={fmt_amount(qty)} 按订单簿买一/卖一市价成交"))
+            steps.extend(self._ab_take_book(qty))
+        else:
+            flat_only = mode == "maker_flat"
+            steps.append(
+                StepResult(
+                    "紧对冲开仓",
+                    True,
+                    f"qty={fmt_amount(qty)} 贴买一/卖一挂单；"
+                    + (
+                        f"单边>{self.ab_bail_naked_s}s 撤单平掉已成交腿"
+                        if flat_only
+                        else f"单边>{self.ab_bail_naked_s}s 或不利>{self.ab_bail_spread_bps}bp 市价补齐"
+                    ),
+                )
             )
-        )
-        steps.extend(self._ab_quote_tight(qty))
+            steps.extend(self._ab_quote_tight(qty, flat_on_timeout=flat_only))
+
         legs = self.futures.legs(self.symbol)
         if legs.missing_side is None and legs.long_qty > 0 and legs.short_qty > 0:
             spr = entry_spread_bps(legs)
@@ -355,14 +445,18 @@ class AbTestCycle(HedgeCycle):
                     )
                 )
             return steps
-        # 仍未齐：最后市价兜底一次
-        steps.append(StepResult("开仓市价兜底", True, "挂单未齐，市价补缺口"))
-        steps.extend(self._market_fill_second_leg(qty, False))
-        legs = self.futures.legs(self.symbol)
-        ok = legs.missing_side is None and legs.long_qty > 0 and legs.short_qty > 0
-        if not ok and (legs.long_qty > 0 or legs.short_qty > 0):
-            steps.extend(self.ensure_flat())
-        steps.append(StepResult("开仓结果", ok, self._legs_text(self.futures.legs(self.symbol))))
+        if mode == "maker_bail":
+            steps.append(StepResult("开仓市价兜底", True, "挂单未齐，市价补缺口"))
+            steps.extend(self._market_fill_second_leg(qty, False))
+            legs = self.futures.legs(self.symbol)
+            ok = legs.missing_side is None and legs.long_qty > 0 and legs.short_qty > 0
+            if not ok and (legs.long_qty > 0 or legs.short_qty > 0):
+                steps.extend(self.ensure_flat())
+            steps.append(StepResult("开仓结果", ok, self._legs_text(self.futures.legs(self.symbol))))
+            return steps
+        if legs.long_qty > 0 or legs.short_qty > 0:
+            steps.extend(self._abort_open("开仓未齐"))
+        steps.append(StepResult("开仓结果", False, self._legs_text(self.futures.legs(self.symbol))))
         return steps
 
     def harvest_tight(self, side: str) -> list[StepResult]:
@@ -437,10 +531,52 @@ class AbTestCycle(HedgeCycle):
         self._enter_order_note = note
         return [StepResult("入场顺序", True, note)]
 
-    def _ab_quote_tight(self, qty: Decimal) -> list[StepResult]:
-        """双边：先 GTX 贴盘追价；仅单边过久/价差过大才市价补齐。"""
+    def _abort_open(self, why: str) -> list[StepResult]:
+        """撤掉未成交挂单，并把已经成交的单腿平掉。"""
+        steps = [StepResult("开仓放弃", True, f"{why}，撤单并平掉已成交腿")]
+        try:
+            self.futures.cancel_open(self.symbol)
+        except BinanceAPIError:
+            pass
+        steps.extend(self.ensure_flat())
+        return steps
+
+    def _ab_take_book(self, qty: Decimal) -> list[StepResult]:
+        """直接吃掉买一上的卖出量和卖一上的买入量。量不够则不成交。"""
         steps: list[StepResult] = []
-        # 4s 裸仓窗口 / 0.12s 一轮 ≈ 30+ 轮追价
+        top = fetch_book_top(self.symbol)
+        if top is None:
+            steps.append(StepResult("吃单失败", False, "读不到订单簿"))
+            return steps
+        if top["bid_qty"] < qty or top["ask_qty"] < qty:
+            steps.append(
+                StepResult(
+                    "吃单跳过",
+                    False,
+                    f"盘口量不足 bid={fmt_amount(top['bid_qty'])} ask={fmt_amount(top['ask_qty'])} need={fmt_amount(qty)}",
+                )
+            )
+            return steps
+        bp = book_spread_bps(top["bid"], top["ask"])
+        steps.append(
+            StepResult(
+                "吃单",
+                True,
+                f"市价打卖一 {fmt_amount(top['ask'])}×{fmt_amount(top['ask_qty'])} "
+                f"打买一 {fmt_amount(top['bid'])}×{fmt_amount(top['bid_qty'])} "
+                f"价差={fmt_amount(bp or 0, 2)}bp",
+            )
+        )
+        steps.append(self._place("BUY", "LONG", qty, top["ask"], False, market=True))
+        steps.append(self._place("SELL", "SHORT", qty, top["bid"], False, market=True))
+        legs = self.futures.legs(self.symbol)
+        if not (legs.missing_side is None and legs.long_qty > 0 and legs.short_qty > 0):
+            steps.extend(self._abort_open("吃单未齐"))
+        return steps
+
+    def _ab_quote_tight(self, qty: Decimal, *, flat_on_timeout: bool = False) -> list[StepResult]:
+        """双边 GTX 贴盘。flat_on_timeout 时超时撤单平腿；否则市价补齐。"""
+        steps: list[StepResult] = []
         tries = max(50, int(self.ab_bail_naked_s / ENTER_CHASE_INTERVAL) + 20)
         wait_dual = 0.25
         wait_naked = ENTER_CHASE_INTERVAL
@@ -466,6 +602,9 @@ class AbTestCycle(HedgeCycle):
                         if elapsed >= self.ab_bail_naked_s
                         else f"不利约 {fmt_amount(adverse or 0, 2)}bp"
                     )
+                    if flat_on_timeout:
+                        steps.extend(self._abort_open(why))
+                        return steps
                     steps.append(StepResult("市价补第二腿", True, f"{why}，市价兜底保证对冲"))
                     steps.extend(self._market_fill_second_leg(qty, False))
                     legs = self.futures.legs(self.symbol)
@@ -477,7 +616,6 @@ class AbTestCycle(HedgeCycle):
             else:
                 naked_since = None
 
-            # 单边：每轮强制贴盘追（aggressive + 高 pass_n）；双边：前几轮略防守
             aggressive = naked or i >= 1
             pass_n = (i + 4) if naked else i
             extra = self._hedge_pass(
@@ -506,6 +644,9 @@ class AbTestCycle(HedgeCycle):
                     steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
                     return steps
 
+        if flat_on_timeout:
+            steps.extend(self._abort_open(f"GTX 追了 {tries} 轮未齐"))
+            return steps
         steps.append(StepResult("挂单超时市价", True, f"GTX 追了 {tries} 轮未齐，市价补齐"))
         steps.extend(self._market_fill_second_leg(qty, False))
         legs = self.futures.legs(self.symbol)
@@ -689,11 +830,13 @@ class GridRunner:
 
     def _cycle(self, trial: TrialParams) -> AbTestCycle:
         pipe = pipeline_for(self.account, self.ops.base, dry_run=False, ops=self.ops)
-        return AbTestCycle(
+        cycle = AbTestCycle(
             pipe,
             passive_bps=trial.passive_bps,
             bail_naked_s=trial.bail_naked_s,
         )
+        cycle.ab_enter_mode = trial.mode
+        return cycle
 
     def _macd_snap(self) -> dict | None:
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
@@ -801,53 +944,17 @@ class GridRunner:
         )
 
     def _note_enter_quality(self, *, ok: bool, used_market: bool, spr: Decimal | None, tag: str) -> None:
-        """更新不利开仓计数；达阈值则熔断暂停。"""
-        if not ok:
-            # 开仓失败也算一轮不利，避免反复硬撞
-            bad = True
-            why = "开仓失败"
-        elif used_market:
-            bad = True
-            why = "使用市价"
-        elif spr is not None and spr < BAD_ENTRY_SPREAD_BPS:
-            bad = True
-            why = f"开仓价差{fmt_amount(spr, 2)}bp<{BAD_ENTRY_SPREAD_BPS}bp"
-        else:
-            bad = False
-            why = ""
-        if bad:
-            self._bad_enter_streak += 1
+        """记下特别差的开仓价差。本轮要跑完三种方式，不因市价暂停。"""
+        if ok and spr is not None and spr < BAD_ENTRY_SPREAD_BPS:
             self._log(
                 {
                     "event": "enter_quality_bad",
                     "trial": tag,
-                    "detail": f"{why}；连续不利 {self._bad_enter_streak}/{BAD_ENTER_STREAK}",
-                    "streak": self._bad_enter_streak,
+                    "detail": f"开仓价差{fmt_amount(spr, 2)}bp<{BAD_ENTRY_SPREAD_BPS}bp",
                     "used_market": used_market,
-                    "entry_spread_bps": str(spr) if spr is not None else None,
+                    "entry_spread_bps": str(spr),
                 }
             )
-            if self._bad_enter_streak >= BAD_ENTER_STREAK:
-                self._pause_until = time.monotonic() + ENTER_PAUSE_SECONDS
-                self._bad_enter_streak = 0
-                self._log(
-                    {
-                        "event": "enter_circuit_break",
-                        "trial": tag,
-                        "detail": f"连续不利达阈值，暂停开仓 {ENTER_PAUSE_SECONDS:.0f}s",
-                        "pause_s": ENTER_PAUSE_SECONDS,
-                    }
-                )
-        else:
-            if self._bad_enter_streak:
-                self._log(
-                    {
-                        "event": "enter_quality_ok",
-                        "trial": tag,
-                        "detail": f"开仓质量恢复，清零不利计数（原 {self._bad_enter_streak}）",
-                    }
-                )
-            self._bad_enter_streak = 0
 
     def run(self) -> None:
         total = len(self.trials) * self.rounds
@@ -894,6 +1001,7 @@ class GridRunner:
             "trial_i": idx,
             "round": round_i,
             "params": {
+                "mode": trial.mode,
                 "passive_bps": str(trial.passive_bps),
                 "bail_naked_s": str(trial.bail_naked_s),
                 "tp_usdt": str(trial.tp_usdt),
@@ -1027,6 +1135,7 @@ class GridRunner:
                         "equity_after_flat": str(eq_after),
                         "cycle_equity_delta": str(delta),
                         "entry_spread_bps": self._trial_metrics.get("entry_spread_bps"),
+                        "enter_fee_usdt": self._trial_metrics.get("enter_fee_usdt"),
                         "enter_used_market": self._trial_metrics.get("enter_used_market"),
                         "harvest_used_market": self._trial_metrics.get("harvest_used_market"),
                         "enter_elapsed_s": self._trial_metrics.get("enter_elapsed_s"),
@@ -1079,6 +1188,35 @@ class GridRunner:
                 time.sleep(self.poll_seconds)
                 continue
 
+            if trial.mode == "take":
+                top = fetch_book_top(cycle.symbol)
+                thin = (
+                    top is None
+                    or top["bid_qty"] < self.qty
+                    or top["ask_qty"] < self.qty
+                )
+                if thin:
+                    self._log(
+                        {
+                            "event": "cross_skip_book",
+                            "trial": tag,
+                            "detail": (
+                                f"{note} → 买一/卖一量不够，不吃单"
+                                if top
+                                else f"{note} → 读不到订单簿"
+                            ),
+                            "gap_abs": str(cross.gap_abs),
+                            "book": None
+                            if top is None
+                            else {
+                                "bid_qty": str(top["bid_qty"]),
+                                "ask_qty": str(top["ask_qty"]),
+                            },
+                        }
+                    )
+                    time.sleep(self.poll_seconds)
+                    continue
+
             if not self.ops.try_begin_action(self.account.id):
                 self._log({"event": "enter_busy", "trial": tag, "detail": "账号忙，稍后重试（本交叉未消费）"})
                 time.sleep(self.poll_seconds)
@@ -1099,11 +1237,13 @@ class GridRunner:
                 }
             )
             t0 = time.monotonic()
+            fee_cursor = trade_cursor(cycle)
             try:
                 steps = cycle.enter_tight(self.qty)
             finally:
                 self.ops.end_action(self.account.id)
             elapsed = time.monotonic() - t0
+            enter_fee = fees_since(cycle, fee_cursor)
             legs = cycle.futures.legs(cycle.symbol)
             ok = legs.missing_side is None and legs.long_qty > 0 and legs.short_qty > 0
             spr = entry_spread_bps(legs) if ok else None
@@ -1113,6 +1253,7 @@ class GridRunner:
                     "enter_elapsed_s": round(elapsed, 3),
                     "enter_used_market": used_market,
                     "entry_spread_bps": str(spr) if spr is not None else None,
+                    "enter_fee_usdt": str(enter_fee),
                     "enter_ok": ok,
                 }
             )
@@ -1123,6 +1264,7 @@ class GridRunner:
                     "ok": ok,
                     "elapsed_s": round(elapsed, 3),
                     "entry_spread_bps": str(spr) if spr is not None else None,
+                    "enter_fee_usdt": str(enter_fee),
                     "used_market": used_market,
                     "gap_abs": str(cross.gap_abs),
                     "equity": str(_read_equity(cycle)),
@@ -1357,6 +1499,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
                 "harvest_elapsed": [],
                 "enter_market": 0,
                 "harvest_market": 0,
+                "fees": [],
                 "samples": [],
             },
         )
@@ -1387,6 +1530,14 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
                 slot["enter_market"] += 1
             if row.get("harvest_used_market"):
                 slot["harvest_market"] += 1
+            fee_raw = row.get("enter_fee_usdt")
+            if fee_raw is None:
+                fee_raw = (row.get("metrics") or {}).get("enter_fee_usdt")
+            if fee_raw is not None:
+                try:
+                    slot["fees"].append(float(fee_raw))
+                except (TypeError, ValueError):
+                    pass
             if row.get("params"):
                 slot["params"] = row["params"]
             slot["samples"].append(
@@ -1432,7 +1583,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
     lines = [
         f"日志 {target}",
         f"评分卡会写入 {SCORECARD_PATH}",
-        "排序（仅开仓成功）：均权益差 ↓ → 少市价 → 开仓价差(正更好) → 入场更快",
+            "排序（仅开仓成功）：均权益差 ↓（损耗小更好）→ 开仓手续费更低 → 开仓价差更好",
         "",
     ]
     if gap_stats.get("n"):
@@ -1454,23 +1605,18 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
     for trial, slot in by_trial.items():
         deltas = slot["equity_deltas"]
         spreads = slot["spreads"]
+        fees = slot["fees"]
         avg_delta = sum(deltas) / len(deltas) if deltas else 0.0
         avg_spr = sum(spreads) / len(spreads) if spreads else 0.0
+        avg_fee = sum(fees) / len(fees) if fees else 0.0
         avg_e = sum(slot["enter_elapsed"]) / len(slot["enter_elapsed"]) if slot["enter_elapsed"] else 0.0
         avg_h = sum(slot["harvest_elapsed"]) / len(slot["harvest_elapsed"]) if slot["harvest_elapsed"] else 0.0
         market_n = slot["enter_market"] + slot["harvest_market"]
         h_ok = slot["harvest_ok"]
         e_ok = slot["enter_ok"]
-        # 市价占比（开仓成功轮次内）
         market_rate = (slot["enter_market"] / e_ok) if e_ok else 1.0
-        score = (
-            avg_delta * 100.0
-            + avg_spr * 0.05
-            - market_n * 0.05
-            - market_rate * 2.0
-            - avg_e * 0.0005
-            + h_ok * 0.5
-        )
+        # 损耗以整轮权益差为准（已含手续费）；开仓费、价差单独列出
+        score = avg_delta * 100.0
         rec = {
             "trial": trial,
             "params": slot["params"],
@@ -1481,6 +1627,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             "harvest_fail": slot["harvest_fail"],
             "avg_equity_delta": round(avg_delta, 6),
             "avg_entry_spread_bps": round(avg_spr, 4),
+            "avg_enter_fee_usdt": round(avg_fee, 6),
             "avg_enter_elapsed_s": round(avg_e, 3),
             "avg_harvest_elapsed_s": round(avg_h, 3),
             "enter_market_count": slot["enter_market"],
@@ -1490,13 +1637,12 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             "samples": slot["samples"],
         }
         line = (
-            f"{trial}  score={score if e_ok else float('nan'):.4f}  均权益差={avg_delta:.4f}  "
+            f"{trial}  均权益差={avg_delta:.4f}  均开仓费={avg_fee:.4f}  "
             f"均开仓价差={avg_spr:.2f}bp  入场{e_ok}/{e_ok+slot['enter_fail']}  "
             f"收利{h_ok}/{h_ok+slot['harvest_fail']}  市价入{slot['enter_market']}"
-            f"({market_rate:.0%})/收{slot['harvest_market']}  "
-            f"耗时入{avg_e:.1f}s/收{avg_h:.1f}s"
+            f"({market_rate:.0%})/收{slot['harvest_market']}"
         )
-        item = ((score, avg_delta, -market_rate, avg_spr, -avg_e), rec)
+        item = ((avg_delta, -avg_fee, avg_spr, -market_n), rec)
         if e_ok > 0:
             ranked_ok.append(item)
             lines.append(line)
@@ -1517,9 +1663,9 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             "",
             f"优势最大: {best['trial']}",
             f"  params={best['params']}",
-            f"  均权益差={best['avg_equity_delta']}  市价入占比={best['enter_market_rate']}  "
-            f"均开仓价差={best['avg_entry_spread_bps']}bp  score={best['score']}",
-            "落地建议：先把该组 passive_bps / bail_naked_s 写回开仓追价；敞口门槛看上方分布。",
+            f"  均权益差={best['avg_equity_delta']}  均开仓费={best['avg_enter_fee_usdt']}  "
+            f"均开仓价差={best['avg_entry_spread_bps']}bp",
+            "这是三种成交方式 × 金叉/死叉敞口的对照，先看损耗和手续费，不要直接写回正式开仓。",
         ]
     else:
         lines += ["", "尚无开仓成功的组，无法评选优势参数。"]
@@ -1544,6 +1690,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             "score",
             "avg_equity_delta",
             "avg_entry_spread_bps",
+            "avg_enter_fee_usdt",
             "enter_ok",
             "enter_fail",
             "harvest_ok",
@@ -1557,6 +1704,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             "bail_naked_s",
             "tp_usdt",
             "min_gap",
+            "mode",
         ]
         with csv_path.open("w", encoding="utf-8") as fh:
             fh.write(",".join(headers) + "\n")
@@ -1570,6 +1718,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
                             str(rec["score"] if rec["score"] is not None else ""),
                             str(rec["avg_equity_delta"]),
                             str(rec["avg_entry_spread_bps"]),
+                            str(rec.get("avg_enter_fee_usdt", "")),
                             str(rec["enter_ok"]),
                             str(rec["enter_fail"]),
                             str(rec["harvest_ok"]),
@@ -1583,6 +1732,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
                             str(p.get("bail_naked_s", "")),
                             str(p.get("tp_usdt", "")),
                             str(p.get("min_gap", "")),
+                            str(p.get("mode", "")),
                         ]
                     )
                     + "\n"
@@ -1626,10 +1776,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_trials:
         print(f"共 {len(trials)} 组 × {rounds} 轮 = {len(trials) * rounds} 次循环：")
         for i, t in enumerate(trials, 1):
-            print(
-                f"  {i:2d}. {t.name}  "
-                f"pas={t.passive_bps} bail={t.bail_naked_s}s tp={t.tp_usdt} gap>={t.min_gap}"
-            )
+            print(f"  {i:2d}. {t.name}  mode={t.mode} gap>={t.min_gap} tp={t.tp_usdt}")
         return 0
 
     if not args.live or not args.confirm:
