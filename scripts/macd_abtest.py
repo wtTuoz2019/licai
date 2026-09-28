@@ -3,7 +3,8 @@
 
 本轮：金叉/死叉，且交叉前柱敞口不能大于上限（上一轮越大越亏）：
   - 敞口上限 1.3 / 2 / 6。1.3≈中位数，2≈75% 分位，6≈盖住实测最大 5.8。
-  - book：IOC 限价只打买一/卖一上已有挂单，不往更差档位扫。
+  - book：仅第一次开仓用 IOC，只打买一/卖一已有挂单；没吃齐就撤掉并平掉单腿。
+  - 收利后的补仓必须市价补到与原腿数量相同，不用 IOC，避免留下敞口。
   - maker_bail：贴盘挂单，超时市价补另一边。
   - maker_flat：只挂单，超时撤单并平掉已成交腿。
   - 收利同样等金叉/死叉，且敞口不超过同一上限。
@@ -466,19 +467,18 @@ class AbTestCycle(HedgeCycle):
         return steps
 
     def harvest_tight(self, side: str) -> list[StepResult]:
-        """平盈利腿 + 补齐对冲；先挂单，不成市价兜底；不理财。"""
+        """平盈利腿后，把对冲腿补到与留下的那一腿相同数量。补仓不用 IOC。"""
         side = side.upper()
         legs = self.futures.legs(self.symbol)
         qty = legs.long_qty if side == "LONG" else legs.short_qty
         pnl = legs.long_pnl if side == "LONG" else legs.short_pnl
         steps: list[StepResult] = [
-            StepResult("测试收利", True, f"平 {side} 浮盈≈{fmt_amount(pnl)}，再补齐对冲")
+            StepResult("测试收利", True, f"平 {side} 浮盈≈{fmt_amount(pnl)}，再按原腿数量市价补齐对冲")
         ]
         steps.extend(self._ab_close_winner(side, qty))
         after = self.futures.legs(self.symbol)
         still = after.long_qty if side == "LONG" else after.short_qty
         if still > 0:
-            # 挂单+侧内市价仍剩：再强制市价扫尾
             steps.append(StepResult("平仓扫尾", True, f"{side} 仍剩 {fmt_amount(still)}，市价扫净"))
             close_side = "SELL" if side == "LONG" else "BUY"
             for _ in range(3):
@@ -504,16 +504,83 @@ class AbTestCycle(HedgeCycle):
             if still > 0:
                 steps.append(StepResult("平仓未净", False, f"{side} 市价后仍剩 {fmt_amount(still)}"))
                 return steps
-        refill_qty = after.short_qty if side == "LONG" else after.long_qty
         refill_pos = "LONG" if side == "LONG" else "SHORT"
         refill_order = "BUY" if refill_pos == "LONG" else "SELL"
-        if refill_qty > 0:
-            steps.extend(self._ab_quote_side(refill_order, refill_pos, refill_qty, reduce_only=False))
+        keep = after.short_qty if side == "LONG" else after.long_qty
+        if keep > 0:
+            steps.extend(self._refill_match(refill_order, refill_pos))
         restored = self.futures.legs(self.symbol)
-        if restored.missing_side is None and restored.long_qty > 0:
+        balanced = restored.missing_side is None and restored.long_qty > 0
+        if balanced:
             steps.append(StepResult("收利完成", True, self._legs_text(restored)))
         else:
             steps.append(StepResult("收利未齐", False, self._legs_text(restored)))
+        return steps
+
+    def _refill_match(self, order_side: str, position_side: str) -> list[StepResult]:
+        """补仓对齐原腿数量。先短挂，差额用市价补满，禁止 IOC 留下缺口。"""
+        steps = [StepResult("补仓对齐", True, "必须与留下的腿同数量；挂不上就市价补差额")]
+        for i in range(6):
+            legs = self.futures.legs(self.symbol)
+            if legs.missing_side is None and legs.long_qty > 0:
+                steps.append(StepResult("已补齐", True, self._legs_text(legs)))
+                return steps
+            other = legs.short_qty if position_side == "LONG" else legs.long_qty
+            current = legs.long_qty if position_side == "LONG" else legs.short_qty
+            need = other - current
+            if other <= 0 or need <= 0:
+                break
+            steps.extend(
+                self._side_pass(
+                    order_side,
+                    position_side,
+                    need,
+                    False,
+                    market=False,
+                    aggressive=True,
+                    pass_n=i + 2,
+                )
+            )
+            if self._wait_until(
+                lambda: (
+                    self.futures.legs(self.symbol).missing_side is None
+                    and self.futures.legs(self.symbol).long_qty > 0
+                ),
+                timeout=0.4,
+                interval=0.08,
+            ):
+                steps.append(StepResult("已补齐", True, self._legs_text(self.futures.legs(self.symbol))))
+                return steps
+        try:
+            self.futures.cancel_open(self.symbol)
+        except BinanceAPIError:
+            pass
+        for _ in range(4):
+            legs = self.futures.legs(self.symbol)
+            if legs.missing_side is None and legs.long_qty > 0:
+                steps.append(StepResult("已补齐", True, self._legs_text(legs)))
+                return steps
+            other = legs.short_qty if position_side == "LONG" else legs.long_qty
+            current = legs.long_qty if position_side == "LONG" else legs.short_qty
+            need = other - current
+            if other <= 0 or need <= 0:
+                steps.append(StepResult("补仓异常", False, self._legs_text(legs)))
+                return steps
+            steps.append(StepResult("市价补差额", True, f"还差 {fmt_amount(need)}，市价补到与原腿相同"))
+            steps.extend(
+                self._side_pass(order_side, position_side, need, False, market=True, aggressive=True)
+            )
+            self._wait_until(
+                lambda: (
+                    self.futures.legs(self.symbol).missing_side is None
+                    and self.futures.legs(self.symbol).long_qty > 0
+                ),
+                timeout=0.8,
+                interval=0.1,
+            )
+        legs = self.futures.legs(self.symbol)
+        ok = legs.missing_side is None and legs.long_qty > 0
+        steps.append(StepResult("补仓结果", ok, self._legs_text(legs)))
         return steps
 
     def _ab_resolve_enter_order(self) -> list[StepResult]:
