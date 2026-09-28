@@ -3,7 +3,7 @@
 
 本轮：金叉/死叉，且交叉前柱敞口不能大于上限（上一轮越大越亏）：
   - 敞口上限 1.3 / 2 / 6。1.3≈中位数，2≈75% 分位，6≈盖住实测最大 5.8。
-  - book：仅第一次开仓，多空同时 IOC 打买一和卖一上已有挂单；没吃齐就撤掉并平掉单腿。
+  - book：仅第一次开仓，多空同时 IOC；没吃齐就市价把少的一边补到和多的一边一样，不平掉已成交腿。
   - 收利后的补仓必须市价补到与原腿数量相同，不用 IOC，避免留下敞口。
   - maker_bail：贴盘挂单，超时市价补另一边。
   - maker_flat：只挂单，超时撤单并平掉已成交腿。
@@ -416,7 +416,7 @@ class AbTestCycle(HedgeCycle):
                 StepResult(
                     "吃单开仓",
                     True,
-                    f"qty={fmt_amount(qty)} IOC 只打买一/卖一已有挂单",
+                    f"qty={fmt_amount(qty)} 多空同时 IOC，未齐则市价补差额",
                 )
             )
             steps.extend(self._ab_take_book(qty))
@@ -460,6 +460,13 @@ class AbTestCycle(HedgeCycle):
             if not ok and (legs.long_qty > 0 or legs.short_qty > 0):
                 steps.extend(self.ensure_flat())
             steps.append(StepResult("开仓结果", ok, self._legs_text(self.futures.legs(self.symbol))))
+            return steps
+        if mode == "book":
+            if legs.long_qty > 0 or legs.short_qty > 0:
+                steps.extend(self._market_align_open())
+                legs = self.futures.legs(self.symbol)
+            ok = legs.missing_side is None and legs.long_qty > 0
+            steps.append(StepResult("开仓结果", ok, self._legs_text(legs)))
             return steps
         if legs.long_qty > 0 or legs.short_qty > 0:
             steps.extend(self._abort_open("开仓未齐"))
@@ -634,8 +641,44 @@ class AbTestCycle(HedgeCycle):
             step.detail = self._order_summary(step.detail)
         return step
 
+    def _market_align_open(self) -> list[StepResult]:
+        """少的一边市价补到与多的一边相同。不平掉已经成交的腿。"""
+        steps: list[StepResult] = []
+        try:
+            self.futures.cancel_open(self.symbol)
+        except BinanceAPIError:
+            pass
+        for _ in range(4):
+            legs = self.futures.legs(self.symbol)
+            if legs.long_qty <= 0 and legs.short_qty <= 0:
+                steps.append(StepResult("两边都未成交", False, self._legs_text(legs)))
+                return steps
+            if legs.missing_side is None and legs.long_qty > 0:
+                steps.append(StepResult("两边已齐", True, self._legs_text(legs)))
+                return steps
+            if legs.long_qty < legs.short_qty:
+                need = legs.short_qty - legs.long_qty
+                steps.append(StepResult("市价补多", True, f"多腿少 {fmt_amount(need)}，市价补齐"))
+                steps.extend(self._side_pass("BUY", "LONG", need, False, market=True, aggressive=True))
+            else:
+                need = legs.long_qty - legs.short_qty
+                steps.append(StepResult("市价补空", True, f"空腿少 {fmt_amount(need)}，市价补齐"))
+                steps.extend(self._side_pass("SELL", "SHORT", need, False, market=True, aggressive=True))
+            self._wait_until(
+                lambda: (
+                    self.futures.legs(self.symbol).missing_side is None
+                    and self.futures.legs(self.symbol).long_qty > 0
+                ),
+                timeout=0.8,
+                interval=0.1,
+            )
+        legs = self.futures.legs(self.symbol)
+        ok = legs.missing_side is None and legs.long_qty > 0
+        steps.append(StepResult("市价对齐结果", ok, self._legs_text(legs)))
+        return steps
+
     def _ab_take_book(self, qty: Decimal) -> list[StepResult]:
-        """针对买一/卖一上已经挂着的单子成交。量不够或 IOC 未齐则放弃，不市价追价。"""
+        """多空同时 IOC 吃买一/卖一。没对齐就市价补少的一边，不平掉已成交腿。"""
         steps: list[StepResult] = []
         top = fetch_book_top(self.symbol)
         if top is None:
@@ -668,8 +711,10 @@ class AbTestCycle(HedgeCycle):
             steps.append(buy_fut.result())
             steps.append(sell_fut.result())
         legs = self.futures.legs(self.symbol)
-        if not (legs.missing_side is None and legs.long_qty > 0 and legs.short_qty > 0):
-            steps.extend(self._abort_open("IOC 未齐"))
+        if legs.missing_side is None and legs.long_qty > 0:
+            return steps
+        if legs.long_qty > 0 or legs.short_qty > 0:
+            steps.extend(self._market_align_open())
         return steps
 
     def _ab_quote_tight(self, qty: Decimal, *, flat_on_timeout: bool = False) -> list[StepResult]:
