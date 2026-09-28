@@ -3,7 +3,7 @@
 
 本轮：金叉/死叉，且交叉前柱敞口不能大于上限（上一轮越大越亏）：
   - 敞口上限 1.3 / 2 / 6。1.3≈中位数，2≈75% 分位，6≈盖住实测最大 5.8。
-  - book：仅第一次开仓用 IOC，只打买一/卖一已有挂单；没吃齐就撤掉并平掉单腿。
+  - book：仅第一次开仓，多空同时 IOC 打买一和卖一上已有挂单；没吃齐就撤掉并平掉单腿。
   - 收利后的补仓必须市价补到与原腿数量相同，不用 IOC，避免留下敞口。
   - maker_bail：贴盘挂单，超时市价补另一边。
   - maker_flat：只挂单，超时撤单并平掉已成交腿。
@@ -655,17 +655,18 @@ class AbTestCycle(HedgeCycle):
             StepResult(
                 "吃单",
                 True,
-                f"IOC 打卖一 {fmt_amount(top['ask'])}×{fmt_amount(top['ask_qty'])} "
+                f"多空同时 IOC 打卖一 {fmt_amount(top['ask'])}×{fmt_amount(top['ask_qty'])} "
                 f"打买一 {fmt_amount(top['bid'])}×{fmt_amount(top['bid_qty'])} "
                 f"价差={fmt_amount(bp or 0, 2)}bp",
             )
         )
-        steps.append(self._place_ioc("BUY", "LONG", qty, top["ask"]))
-        top2 = fetch_book_top(self.symbol) or top
-        if top2["bid_qty"] < qty:
-            steps.extend(self._abort_open("买一量在第二腿前变少"))
-            return steps
-        steps.append(self._place_ioc("SELL", "SHORT", qty, top2["bid"]))
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            buy_fut = pool.submit(self._place_ioc, "BUY", "LONG", qty, top["ask"])
+            sell_fut = pool.submit(self._place_ioc, "SELL", "SHORT", qty, top["bid"])
+            steps.append(buy_fut.result())
+            steps.append(sell_fut.result())
         legs = self.futures.legs(self.symbol)
         if not (legs.missing_side is None and legs.long_qty > 0 and legs.short_qty > 0):
             steps.extend(self._abort_open("IOC 未齐"))
