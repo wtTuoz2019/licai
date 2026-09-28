@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """MACD 挂单开仓/收利参数网格测试（独立脚本，不改正式流程）。
 
-本轮对比三种开仓，且都必须等 MACD 金叉/死叉，并用交叉前柱敞口过滤：
-  - 敞口门槛 0 / 1.3 / 2（上一轮 40 次交叉的大约全样本 / 中位数 / 75% 分位）。
-  - take：买一卖一量够，双边市价直接吃掉盘口上的单。
-  - maker_bail：贴买一/卖一挂单追价，超时再用市价补齐。
-  - maker_flat：只挂单；超时撤单并把已成交的一边平掉，不用市价把对冲补齐。
-  - 收利同样等下一次金叉/死叉，且敞口达到同一门槛。
-  - 止盈固定 0.08。评分按权益差排序，并列出开仓价差和开仓手续费。
+本轮：金叉/死叉，且交叉前柱敞口不能大于上限（上一轮越大越亏）：
+  - 敞口上限 1.3 / 2 / 6。1.3≈中位数，2≈75% 分位，6≈盖住实测最大 5.8。
+  - book：IOC 限价只打买一/卖一上已有挂单，不往更差档位扫。
+  - maker_bail：贴盘挂单，超时市价补另一边。
+  - maker_flat：只挂单，超时撤单并平掉已成交腿。
+  - 收利同样等金叉/死叉，且敞口不超过同一上限。
+  - 止盈 0.08。按权益差、开仓费、开仓价差比较。
 
 固定数量：BTC 0.001（可用 --qty 改）。
 
@@ -56,9 +56,9 @@ ENTER_BAIL_NAKED_SECONDS = 8.0
 # 单边补腿时挂单追价间隔（秒）；越小越勤改价贴盘
 ENTER_CHASE_INTERVAL = 0.12
 
-# 三种开仓 × 实测敞口档。1.3≈中位数，2≈75% 分位（gap10/25 在这套指标上几乎等不到）
-ENTER_MODES = ("take", "maker_bail", "maker_flat")
-MACD_MIN_GAP = (Decimal("0"), Decimal("1.3"), Decimal("2"))
+# 三种开仓 × 敞口上限。超过上限的金叉/死叉直接跳过
+ENTER_MODES = ("book", "maker_bail", "maker_flat")
+MACD_MAX_GAP = (Decimal("1.3"), Decimal("2"), Decimal("6"))
 MAKER_PASSIVE_BPS = Decimal("0")
 MAKER_BAIL_SECONDS = 16.0
 FIXED_TP_USDT = Decimal("0.08")
@@ -75,19 +75,19 @@ ENTER_PAUSE_SECONDS = 300.0  # 熔断暂停秒数
 
 @dataclass(frozen=True)
 class TrialParams:
-    mode: str  # take | maker_bail | maker_flat
+    mode: str  # book | maker_bail | maker_flat
     passive_bps: Decimal = MAKER_PASSIVE_BPS
     bail_naked_s: float = MAKER_BAIL_SECONDS
     tp_usdt: Decimal = FIXED_TP_USDT
-    min_gap: Decimal = Decimal("0")
+    max_gap: Decimal = Decimal("6")
 
     @property
     def name(self) -> str:
-        return f"{self.mode}_gap{self.min_gap}_tp{self.tp_usdt}"
+        return f"{self.mode}_max{self.max_gap}_tp{self.tp_usdt}"
 
 
 def build_trials() -> list[TrialParams]:
-    return [TrialParams(mode, min_gap=gap) for mode, gap in itertools.product(ENTER_MODES, MACD_MIN_GAP)]
+    return [TrialParams(mode, max_gap=gap) for mode, gap in itertools.product(ENTER_MODES, MACD_MAX_GAP)]
 
 
 def _now() -> str:
@@ -410,8 +410,14 @@ class AbTestCycle(HedgeCycle):
             return steps
 
         mode = getattr(self, "ab_enter_mode", "maker_bail")
-        if mode == "take":
-            steps.append(StepResult("吃单开仓", True, f"qty={fmt_amount(qty)} 按订单簿买一/卖一市价成交"))
+        if mode == "book":
+            steps.append(
+                StepResult(
+                    "吃单开仓",
+                    True,
+                    f"qty={fmt_amount(qty)} IOC 只打买一/卖一已有挂单",
+                )
+            )
             steps.extend(self._ab_take_book(qty))
         else:
             flat_only = mode == "maker_flat"
@@ -541,8 +547,28 @@ class AbTestCycle(HedgeCycle):
         steps.extend(self.ensure_flat())
         return steps
 
+    def _place_ioc(self, side: str, position_side: str, qty: Decimal, price: Decimal) -> StepResult:
+        """限价 IOC：只吃该价格上已有的挂单，吃不满就撤，不往更差档扫。"""
+        tick, _ = self.futures.filters(self.symbol)
+        px = self.futures.round_price(price, tick)
+        step = self._mutate(
+            f"开仓 IOC {side} {position_side} {fmt_amount(qty)} @ {fmt_amount(px)}",
+            lambda px=px: self.futures.place_limit(
+                self.symbol,
+                side,
+                position_side,
+                qty,
+                px,
+                False,
+                "IOC",
+            ),
+        )
+        if step.ok and isinstance(step.detail, dict):
+            step.detail = self._order_summary(step.detail)
+        return step
+
     def _ab_take_book(self, qty: Decimal) -> list[StepResult]:
-        """直接吃掉买一上的卖出量和卖一上的买入量。量不够则不成交。"""
+        """针对买一/卖一上已经挂着的单子成交。量不够或 IOC 未齐则放弃，不市价追价。"""
         steps: list[StepResult] = []
         top = fetch_book_top(self.symbol)
         if top is None:
@@ -562,16 +588,20 @@ class AbTestCycle(HedgeCycle):
             StepResult(
                 "吃单",
                 True,
-                f"市价打卖一 {fmt_amount(top['ask'])}×{fmt_amount(top['ask_qty'])} "
+                f"IOC 打卖一 {fmt_amount(top['ask'])}×{fmt_amount(top['ask_qty'])} "
                 f"打买一 {fmt_amount(top['bid'])}×{fmt_amount(top['bid_qty'])} "
                 f"价差={fmt_amount(bp or 0, 2)}bp",
             )
         )
-        steps.append(self._place("BUY", "LONG", qty, top["ask"], False, market=True))
-        steps.append(self._place("SELL", "SHORT", qty, top["bid"], False, market=True))
+        steps.append(self._place_ioc("BUY", "LONG", qty, top["ask"]))
+        top2 = fetch_book_top(self.symbol) or top
+        if top2["bid_qty"] < qty:
+            steps.extend(self._abort_open("买一量在第二腿前变少"))
+            return steps
+        steps.append(self._place_ioc("SELL", "SHORT", qty, top2["bid"]))
         legs = self.futures.legs(self.symbol)
         if not (legs.missing_side is None and legs.long_qty > 0 and legs.short_qty > 0):
-            steps.extend(self._abort_open("吃单未齐"))
+            steps.extend(self._abort_open("IOC 未齐"))
         return steps
 
     def _ab_quote_tight(self, qty: Decimal, *, flat_on_timeout: bool = False) -> list[StepResult]:
@@ -857,8 +887,8 @@ class GridRunner:
             "harvest_side": state.harvest_side,
         }
 
-    def _fresh_cross(self, *, min_gap: Decimal | None = None, trial: str = ""):
-        """取未用过的金叉/死叉；若 min_gap 给定则要求交叉前柱敞口够大。"""
+    def _fresh_cross(self, *, max_gap: Decimal | None = None, trial: str = ""):
+        """取未用过的金叉/死叉；敞口大于上限则跳过并消费这根。"""
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
         cross = fetch_macd_cross(url)
         if cross is None:
@@ -866,7 +896,6 @@ class GridRunner:
         key = f"{cross.kind}:{cross.time}"
         if key == self._last_cross_key:
             return None, f"{cross.label}@{cross.time} 已用过"
-        # 每根交叉只记一次敞口，供后续定 min_gap 门槛
         if key != self._last_gap_logged:
             self._last_gap_logged = key
             self._log(
@@ -883,12 +912,11 @@ class GridRunner:
                     "detail": f"{cross.label}@{cross.time} 敞口={cross.gap_abs}",
                 }
             )
-        if min_gap is not None and cross.gap_abs < min_gap:
-            # 敞口不够：消费掉这根，避免死等同一根小波动交叉
+        if max_gap is not None and cross.gap_abs > max_gap:
             self._last_cross_key = key
             return (
                 None,
-                f"{cross.label}@{cross.time} 敞口{cross.gap_abs}<{min_gap}，跳过",
+                f"{cross.label}@{cross.time} 敞口{cross.gap_abs}>{max_gap}，跳过",
             )
         return cross, f"{cross.label}@{cross.time} 敞口={cross.gap_abs}"
 
@@ -1005,7 +1033,7 @@ class GridRunner:
                 "passive_bps": str(trial.passive_bps),
                 "bail_naked_s": str(trial.bail_naked_s),
                 "tp_usdt": str(trial.tp_usdt),
-                "min_gap": str(trial.min_gap),
+                "max_gap": str(trial.max_gap),
             },
             "qty": str(self.qty),
         }
@@ -1166,7 +1194,7 @@ class GridRunner:
             self._wait_if_paused(tag)
             if time.monotonic() >= deadline:
                 break
-            cross, note = self._fresh_cross(min_gap=trial.min_gap, trial=tag)
+            cross, note = self._fresh_cross(max_gap=trial.max_gap, trial=tag)
             if cross is None:
                 self._log({"event": "wait_enter", "trial": tag, "detail": note, "macd": self._macd_snap()})
                 time.sleep(self.poll_seconds)
@@ -1188,7 +1216,7 @@ class GridRunner:
                 time.sleep(self.poll_seconds)
                 continue
 
-            if trial.mode == "take":
+            if trial.mode == "book":
                 top = fetch_book_top(cycle.symbol)
                 thin = (
                     top is None
@@ -1231,7 +1259,7 @@ class GridRunner:
                     "trial": tag,
                     "detail": f"{note}；{book_note}",
                     "gap_abs": str(cross.gap_abs),
-                    "min_gap": str(trial.min_gap),
+                    "max_gap": str(trial.max_gap),
                     "book": book_meta,
                     "macd": self._macd_snap(),
                 }
@@ -1318,8 +1346,8 @@ class GridRunner:
                 time.sleep(self.poll_seconds)
                 continue
 
-            # 一律等 MACD 交叉，且敞口 ≥ min_gap
-            cross, note = self._fresh_cross(min_gap=trial.min_gap, trial=tag)
+            # 一律等 MACD 交叉，且敞口不超过上限
+            cross, note = self._fresh_cross(max_gap=trial.max_gap, trial=tag)
             if cross is None:
                 self._log(
                     {
@@ -1371,7 +1399,7 @@ class GridRunner:
                     "side": side,
                     "need": str(need),
                     "gap_abs": str(cross.gap_abs),
-                    "min_gap": str(trial.min_gap),
+                    "max_gap": str(trial.max_gap),
                     "macd": self._macd_snap(),
                 }
             )
@@ -1431,7 +1459,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
         except json.JSONDecodeError:
             continue
 
-    # 交叉敞口分布（为下一轮定 min_gap）
+    # 交叉敞口分布
     gaps: list[float] = []
     for row in raw_rows:
         if row.get("event") not in ("cross_seen", "enter_start", "enter_done", "harvest_start"):
@@ -1594,7 +1622,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
                 f"p75={gap_stats['p75']} p90={gap_stats['p90']} max={gap_stats['max']} "
                 f"mean={gap_stats['mean']}"
             ),
-            "（下一轮可按 p50/p75 设 min_gap）",
+            "（敞口是交叉前柱 |hist|）",
             "",
         ]
     else:
@@ -1703,7 +1731,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
             "passive_bps",
             "bail_naked_s",
             "tp_usdt",
-            "min_gap",
+            "max_gap",
             "mode",
         ]
         with csv_path.open("w", encoding="utf-8") as fh:
@@ -1731,7 +1759,7 @@ def summarize(path: Path | None = None, *, write_scorecard: bool = True) -> str:
                             str(p.get("passive_bps", "")),
                             str(p.get("bail_naked_s", "")),
                             str(p.get("tp_usdt", "")),
-                            str(p.get("min_gap", "")),
+                            str(p.get("max_gap", "")),
                             str(p.get("mode", "")),
                         ]
                     )
@@ -1776,7 +1804,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_trials:
         print(f"共 {len(trials)} 组 × {rounds} 轮 = {len(trials) * rounds} 次循环：")
         for i, t in enumerate(trials, 1):
-            print(f"  {i:2d}. {t.name}  mode={t.mode} gap>={t.min_gap} tp={t.tp_usdt}")
+            print(f"  {i:2d}. {t.name}  mode={t.mode} gap<={t.max_gap} tp={t.tp_usdt}")
         return 0
 
     if not args.live or not args.confirm:
