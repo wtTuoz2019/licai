@@ -125,7 +125,7 @@ class Settings:
     taker_fee_rate: Decimal = Decimal("0.0005")
     min_profit_fee_multiple: Decimal = Decimal("8")
     harvest_principal_pct: Decimal = Decimal("0.01")
-    harvest_pos_pct: Decimal = Decimal("0.03")
+    harvest_pos_pct: Decimal = Decimal("0.10")
     harvest_sqrt_coeff: Decimal = Decimal("0.5")
     harvest_min_usdt: Decimal = Decimal("1")
     live_poll_seconds: int = 120
@@ -232,7 +232,7 @@ def load_settings(config_path: str | Path | None = None, dry_run_override: bool 
         taker_fee_rate=d(raw.get("taker_fee_rate", "0.0005")),
         min_profit_fee_multiple=d(raw.get("min_profit_fee_multiple", "8")),
         harvest_principal_pct=d(raw.get("harvest_principal_pct", "0.01")),
-        harvest_pos_pct=d(raw.get("harvest_pos_pct", "0.03")),
+        harvest_pos_pct=d(raw.get("harvest_pos_pct", "0.10")),
         harvest_sqrt_coeff=d(raw.get("harvest_sqrt_coeff", "0.5")),
         harvest_min_usdt=d(raw.get("harvest_min_usdt", "1")),
         live_poll_seconds=int(raw.get("live_poll_seconds", 120)),

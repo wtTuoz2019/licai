@@ -27,8 +27,7 @@ class AutoHarvestWorker:
     """后台轮询（账号开启「自动收利」）：
 
     - 无仓：严平稳时自动双边开仓（不看 MACD）
-    - 有仓：浮盈达标 + 冷却 + MACD 金叉/死叉那一根
-      （金叉收空、死叉收多）+ 收利宽平稳
+    - 有仓：金叉/死叉那一根 + 盈利腿浮盈达到名义比例 + 冷却 + 收利宽平稳
     手动一键入场/收利不受影响。
     """
 
@@ -44,7 +43,11 @@ class AutoHarvestWorker:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="auto-harvest", daemon=True)
         self._thread.start()
-        _print("自动收利后台已启动（无仓严平稳开仓；有仓须金叉/死叉+收利宽平稳）")
+        if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
+            note = "有仓须金叉/死叉，且浮盈达到名义比例"
+        else:
+            note = "有仓按名义比例收盈利腿，价格平稳且过了冷却"
+        _print(f"自动收利后台已启动（无仓严平稳开仓；{note}）")
 
     def stop(self) -> None:
         self._stop.set()

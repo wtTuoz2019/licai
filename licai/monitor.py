@@ -368,9 +368,10 @@ def harvest_advice(
         if custom:
             reason = f"浮盈 {fmt_amount(pnl, 4)}，自定义每次收利 {fmt_amount(min_profit, 4)} USDT"
         else:
+            pos_pct = (settings.harvest_pos_pct or Decimal("0")) * Decimal("100")
             reason = (
-                f"浮盈 {fmt_amount(pnl, 4)}，门槛 {fmt_amount(min_profit, 4)}（仓位 {fmt_amount(notional, 0)}，"
-                f"手续费约 {fmt_amount(fee, 4)}×{fmt_amount(settings.min_profit_fee_multiple, 0)}）。等够了再收，避免磨损"
+                f"浮盈 {fmt_amount(pnl, 4)}，未到收利线 {fmt_amount(min_profit, 4)}"
+                f"（单边名义 {fmt_amount(notional, 0)} 的 {pos_pct:.0f}%）。等够了再收，少付手续费"
             )
     elif not cooldown_ok:
         reason = f"距上次平仓还差 {left} 秒冷却，先别连点"
@@ -401,11 +402,13 @@ def harvest_advice(
 
 
 def schedule_hint(settings: Settings) -> str:
+    pos_pct = (settings.harvest_pos_pct or Decimal("0")) * Decimal("100")
+    macd = "金叉/死叉那一根，且" if getattr(settings, "macd_auto_harvest", True) else ""
     return (
         f"资金/理财一天拉一次，点「刷新」才重拉。"
         f"仓位浮盈大约每 {int(settings.live_poll_seconds)} 秒更新。"
         f"入场要够稳（15 分 ≤ {_pct(settings.stable_range_pct)}%）；"
         f"收利更宽（15 分 ≤ {_pct(getattr(settings, 'harvest_stable_range_pct', None) or settings.stable_range_pct)}%）。"
-        f"收利门槛按仓位名义和约 {fmt_amount(settings.min_profit_fee_multiple, 0)} 倍手续费、"
+        f"自动收利：{macd}盈利腿达到单边名义的 {pos_pct:.0f}% 才收，"
         f"距上次平仓超过 {settings.cooldown_minutes} 分钟。"
     )

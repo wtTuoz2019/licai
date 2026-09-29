@@ -65,10 +65,10 @@ hedge_max_wait_seconds: 0.8  # 第一腿成交后最多再等多久第二腿
 hedge_max_slippage_bps: 3.5  # 相对第一腿成交价，BBO 不利偏离超过此 bp 则立刻市价
 watch_seconds: 60            # 命令行盯盘间隔
 live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
-auto_harvest_seconds: 60     # 开启「自动收利」后后台检查间隔（与 MACD 1 分钟对齐）
-# 自动收利：无仓且严平稳时自动开仓；有仓须 MACD 金叉/死叉 + 收利宽平稳（金叉收空/死叉收多）
+auto_harvest_seconds: 60     # 开启「自动收利」后后台检查间隔
+# 自动收利：无仓且严平稳时自动开仓；有仓须 MACD 金叉/死叉，且浮盈达到 harvest_pos_pct
 # 接口示例 https://c7.pro/capi/indicator
-macd_auto_harvest: true
+macd_auto_harvest: true       # 定稿：等金叉/死叉，且浮盈达到名义的 10% 才收
 macd_indicator_url: "https://c7.pro/capi/indicator"
 min_free_usdt_keep: 0        # 默认不留现货 USDT
 cycle_sweep_all: true        # 启动时把现货闲置 USDT 申购 USDT/BFUSD 活期（仓位继续当保证金）
@@ -78,7 +78,7 @@ maker_fee_rate: 0.0002
 taker_fee_rate: 0.0005
 min_profit_fee_multiple: 8   # 自动门槛：浮盈至少覆盖约 8 倍手续费
 harvest_principal_pct: 0.01  # 还没仓位时，至少为本金的 1%
-harvest_pos_pct: 0.03        # 单边名义约 3% 再收（少收几次，少磨损）
+harvest_pos_pct: 0.10        # 单边名义约 10% 再收。1000U、100x、占用 40% 时单边名义 2 万，约 2000U（2 倍本金）
 harvest_sqrt_coeff: 0.5      # 无仓位时 0.5×√本金兜底
 harvest_min_usdt: 1          # 绝对下限（结算币，USDT/USDC 都适用）
 cooldown_minutes: 15         # 两次平仓最短间隔
