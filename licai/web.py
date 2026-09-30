@@ -14,9 +14,9 @@ from .auth import (
     clear_session_cookie,
     client_ip,
     login_blocked,
+    login_role,
     make_session_token,
     mark_login_fail,
-    password_ok,
     session_cookie,
     valid_session,
     COOKIE_NAME,
@@ -39,6 +39,7 @@ class AccountIn(BaseModel):
     api_secret: str = Field(min_length=8)
     proxy: str = ""
     hedge_symbol: str = "ETHUSDT"
+    hidden: bool = False
 
 
 class AccountPatch(BaseModel):
@@ -51,6 +52,24 @@ class AccountPatch(BaseModel):
     take_profit_custom: bool | None = None
     auto_harvest: bool | None = None
     hedge_leverage: int | None = Field(default=None, ge=1, le=125)
+    hidden: bool | None = None
+
+
+def _role(request: Request) -> str:
+    role = getattr(request.state, "role", "")
+    if role not in {"admin", "super"}:
+        raise HTTPException(401, "未登录")
+    return role
+
+
+def _visible_account(request: Request, account_id: int):
+    try:
+        account = store.get(account_id)
+    except KeyError:
+        raise HTTPException(404, "账号不存在") from None
+    if account.hidden and _role(request) != "super":
+        raise HTTPException(404, "账号不存在")
+    return account
 
 
 class ActionIn(BaseModel):
@@ -87,12 +106,13 @@ def create_app() -> FastAPI:
         ip = client_ip(request)
         if login_blocked(ip):
             raise HTTPException(429, "尝试次数过多，请稍后再试")
-        if not password_ok(body.password):
+        role = login_role(body.password)
+        if not role:
             mark_login_fail(ip)
             raise HTTPException(401, "密码错误")
         clear_login_fails(ip)
-        response = JSONResponse({"ok": True})
-        session_cookie(response, make_session_token())
+        response = JSONResponse({"ok": True, "role": role})
+        session_cookie(response, make_session_token(role))
         return response
 
     @app.post("/api/logout")
@@ -102,22 +122,30 @@ def create_app() -> FastAPI:
         return response
 
     @app.get("/api/session")
-    def session():
-        return {"ok": True}
+    def session(request: Request):
+        role = _role(request)
+        return {"ok": True, "role": role, "super": role == "super"}
 
     @app.get("/api/accounts")
-    def list_accounts():
+    def list_accounts(request: Request):
+        role = _role(request)
+        accounts = store.list_accounts()
+        if role != "super":
+            accounts = [item for item in accounts if not item.hidden]
         return {
-            "accounts": [item.public_dict() for item in store.list_accounts()],
+            "accounts": [item.public_dict() for item in accounts],
             "hedge_symbols": list(ops.base.hedge_symbols),
             "live_poll_seconds": int(ops.base.live_poll_seconds),
+            "role": role,
         }
 
     @app.post("/api/accounts")
-    def add_account(body: AccountIn):
+    def add_account(request: Request, body: AccountIn):
+        role = _role(request)
+        hidden = bool(body.hidden) if role == "super" else False
         try:
             symbol = normalize_hedge_symbol(body.hedge_symbol, ops.base.hedge_symbols)
-            account = store.add(body.name, body.api_key, body.api_secret, body.proxy, symbol)
+            account = store.add(body.name, body.api_key, body.api_secret, body.proxy, symbol, hidden=hidden)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         # 未填代理且配置了 Webshare：自动分配一个未占用的出口
@@ -133,11 +161,8 @@ def create_app() -> FastAPI:
         return ops.webshare_status()
 
     @app.post("/api/accounts/{account_id}/proxy/webshare")
-    def assign_webshare(account_id: int, verify: bool = True):
-        try:
-            account = store.get(account_id)
-        except KeyError:
-            raise HTTPException(404, "账号不存在") from None
+    def assign_webshare(account_id: int, request: Request, verify: bool = True):
+        account = _visible_account(request, account_id)
         try:
             account = ops.assign_webshare_proxy(account, verify=verify)
         except WebshareError as exc:
@@ -145,7 +170,10 @@ def create_app() -> FastAPI:
         return account.public_dict()
 
     @app.patch("/api/accounts/{account_id}")
-    def patch_account(account_id: int, body: AccountPatch):
+    def patch_account(account_id: int, body: AccountPatch, request: Request):
+        account = _visible_account(request, account_id)
+        if "hidden" in body.model_fields_set and _role(request) != "super":
+            raise HTTPException(403, "不能修改")
         try:
             symbol = None
             if body.hedge_symbol is not None:
@@ -167,6 +195,7 @@ def create_app() -> FastAPI:
                 auto_harvest=body.auto_harvest,
                 hedge_leverage=body.hedge_leverage,
                 hedge_leverage_set="hedge_leverage" in body.model_fields_set,
+                hidden=body.hidden if "hidden" in body.model_fields_set else None,
             )
             if assign:
                 account = ops.assign_webshare_proxy(account, verify=True)
@@ -180,7 +209,8 @@ def create_app() -> FastAPI:
         return account.public_dict()
 
     @app.delete("/api/accounts/{account_id}")
-    def delete_account(account_id: int):
+    def delete_account(account_id: int, request: Request):
+        account = _visible_account(request, account_id)
         try:
             store.delete(account_id)
         except KeyError:
@@ -189,44 +219,32 @@ def create_app() -> FastAPI:
         return {"ok": True}
 
     @app.get("/api/accounts/{account_id}/snapshot")
-    def snapshot(account_id: int, force: bool = False):
-        try:
-            account = store.get(account_id)
-        except KeyError:
-            raise HTTPException(404, "账号不存在") from None
+    def snapshot(account_id: int, request: Request, force: bool = False):
+        account = _visible_account(request, account_id)
         try:
             return ops.snapshot(account, force=force)
         except Exception as exc:
             raise HTTPException(500, str(exc)) from exc
 
     @app.get("/api/accounts/{account_id}/monitor")
-    def monitor(account_id: int):
-        try:
-            account = store.get(account_id)
-        except KeyError:
-            raise HTTPException(404, "账号不存在") from None
+    def monitor(account_id: int, request: Request):
+        account = _visible_account(request, account_id)
         try:
             return ops.monitor(account)
         except Exception as exc:
             raise HTTPException(500, str(exc)) from exc
 
     @app.get("/api/accounts/{account_id}/events")
-    def account_events(account_id: int, limit: int = 100, before_id: int | None = None):
-        try:
-            account = store.get(account_id)
-        except KeyError:
-            raise HTTPException(404, "账号不存在") from None
+    def account_events(account_id: int, request: Request, limit: int = 100, before_id: int | None = None):
+        account = _visible_account(request, account_id)
         try:
             return ops.list_events(account, limit=limit, before_id=before_id)
         except Exception as exc:
             raise HTTPException(500, str(exc)) from exc
 
     @app.post("/api/accounts/{account_id}/actions")
-    def run_action(account_id: int, body: ActionIn):
-        try:
-            account = store.get(account_id)
-        except KeyError:
-            raise HTTPException(404, "账号不存在") from None
+    def run_action(account_id: int, body: ActionIn, request: Request):
+        account = _visible_account(request, account_id)
         try:
             return ops.run_action(account, body.action, force=body.force, mode=body.mode)
         except ValueError as exc:

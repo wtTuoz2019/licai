@@ -152,6 +152,11 @@ ensure_env() {
     fi
     chmod 600 "$ROOT/.env"
   fi
+  if [[ -n "${LICAI_SUPER_PASSWORD:-}" ]]; then
+    write_env_key LICAI_SUPER_PASSWORD "$LICAI_SUPER_PASSWORD"
+    chmod 600 "$ROOT/.env"
+    log "超级管理员密码已写入 $ROOT/.env"
+  fi
   if [[ -n "${LICAI_DASHBOARD_PASSWORD:-}" ]]; then
     write_env_key LICAI_DASHBOARD_PASSWORD "$LICAI_DASHBOARD_PASSWORD"
     chmod 600 "$ROOT/.env"

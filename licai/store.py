@@ -28,6 +28,7 @@ class Account:
     take_profit_usdt: float | None = None
     take_profit_custom: bool = False
     auto_harvest: bool = False
+    hidden: bool = False
 
     def public_dict(self) -> dict:
         return {
@@ -44,6 +45,7 @@ class Account:
             "take_profit_usdt": self.take_profit_usdt if self.take_profit_usdt else None,
             "take_profit_custom": bool(self.take_profit_custom),
             "auto_harvest": bool(self.auto_harvest),
+            "hidden": bool(self.hidden),
         }
 
 
@@ -120,6 +122,8 @@ class AccountStore:
                 conn.execute("ALTER TABLE accounts ADD COLUMN auto_harvest INTEGER NOT NULL DEFAULT 0")
             if "hedge_leverage" not in cols:
                 conn.execute("ALTER TABLE accounts ADD COLUMN hedge_leverage INTEGER")
+            if "hidden" not in cols:
+                conn.execute("ALTER TABLE accounts ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
 
     def list_accounts(self) -> list[Account]:
         with self._connect() as conn:
@@ -133,13 +137,21 @@ class AccountStore:
             raise KeyError(account_id)
         return self._account(row)
 
-    def add(self, name: str, api_key: str, api_secret: str, proxy: str | None, hedge_symbol: str = "ETHUSDT") -> Account:
+    def add(
+        self,
+        name: str,
+        api_key: str,
+        api_secret: str,
+        proxy: str | None,
+        hedge_symbol: str = "ETHUSDT",
+        hidden: bool = False,
+    ) -> Account:
         created = _now()
         symbol = normalize_hedge_symbol(hedge_symbol)
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO accounts (name, api_key, api_secret, proxy, hedge_symbol, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (name.strip(), api_key.strip(), api_secret.strip(), (proxy or "").strip() or None, symbol, created),
+                "INSERT INTO accounts (name, api_key, api_secret, proxy, hedge_symbol, created_at, hidden) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name.strip(), api_key.strip(), api_secret.strip(), (proxy or "").strip() or None, symbol, created, 1 if hidden else 0),
             )
             account_id = int(cur.lastrowid)
         return self.get(account_id)
@@ -158,6 +170,7 @@ class AccountStore:
         auto_harvest: bool | None = None,
         hedge_leverage: int | None = None,
         hedge_leverage_set: bool = False,
+        hidden: bool | None = None,
     ) -> Account:
         account = self.get(account_id)
         next_name = name.strip() if name is not None else account.name
@@ -186,9 +199,10 @@ class AccountStore:
         next_lev = account.hedge_leverage
         if hedge_leverage_set:
             next_lev = int(hedge_leverage) if hedge_leverage and int(hedge_leverage) > 0 else None
+        next_hidden = account.hidden if hidden is None else bool(hidden)
         with self._connect() as conn:
             conn.execute(
-                "UPDATE accounts SET name = ?, api_key = ?, api_secret = ?, proxy = ?, hedge_symbol = ?, take_profit_usdt = ?, take_profit_custom = ?, auto_harvest = ?, hedge_leverage = ? WHERE id = ?",
+                "UPDATE accounts SET name = ?, api_key = ?, api_secret = ?, proxy = ?, hedge_symbol = ?, take_profit_usdt = ?, take_profit_custom = ?, auto_harvest = ?, hedge_leverage = ?, hidden = ? WHERE id = ?",
                 (
                     next_name,
                     next_key,
@@ -199,6 +213,7 @@ class AccountStore:
                     1 if next_custom else 0,
                     1 if next_auto else 0,
                     next_lev,
+                    1 if next_hidden else 0,
                     account_id,
                 ),
             )
@@ -314,4 +329,5 @@ class AccountStore:
             take_profit_usdt=tp,
             take_profit_custom=custom,
             auto_harvest=bool(int(raw_auto or 0)),
+            hidden=bool(int(row["hidden"] or 0)) if "hidden" in keys else False,
         )

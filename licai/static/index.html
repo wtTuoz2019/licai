@@ -34,6 +34,29 @@
       padding: 12px 20px;
       border-bottom: 1px solid var(--line);
     }
+    header .tools { display: flex; align-items: center; gap: 8px; }
+    .hidden-features {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin: 8px 0;
+      padding: 8px 10px;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+    }
+    .hidden-features[hidden],
+    #role-chip[hidden] { display: none !important; }
+    .hidden-features label { display: flex; gap: 6px; align-items: center; }
+    .tag-hide {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 0 6px;
+      border-radius: 999px;
+      background: #3d3114;
+      color: var(--warn);
+      font-size: 11px;
+      font-weight: 500;
+    }
     h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: .02em; }
     .layout {
       display: grid;
@@ -407,7 +430,10 @@
 <body>
   <header>
     <h1>理财对冲操作台</h1>
-    <button type="button" id="btn-logout" class="ghost">退出</button>
+    <div class="tools">
+      <span id="role-chip" class="pill wait" hidden>超级管理员</span>
+      <button type="button" id="btn-logout" class="ghost">退出</button>
+    </div>
   </header>
   <div class="layout">
     <aside class="card">
@@ -433,6 +459,9 @@
         <select id="add-base"></select>
         <input type="hidden" name="hedge_symbol" id="add-symbol" value="ETHUSDT" />
         <p class="muted" id="add-symbol-preview">将使用 ETHUSDT</p>
+        <div id="hidden-features-add" class="hidden-features" hidden>
+          <label><input type="checkbox" id="add-conceal" checked /> 对普通管理员隐藏此账户</label>
+        </div>
         <div class="row">
           <button type="button" id="btn-cancel-add">取消</button>
           <button class="primary" type="submit">确认添加</button>
@@ -511,6 +540,12 @@
           </div>
         </div>
         <div id="settings-box" class="edit-box" hidden>
+          <div id="super-features" class="hidden-features" hidden>
+            <label><input type="checkbox" id="sf-conceal" /> 对普通管理员隐藏此账户</label>
+            <div class="row">
+              <button type="button" id="btn-save-hidden" class="primary">保存</button>
+            </div>
+          </div>
           <p class="muted">出口 IP <b id="ip">-</b> · <span id="proxy-mode"></span> · 代理 <b id="proxy-now">默认</b> · <span id="snap-age"></span></p>
           <p class="muted">杠杆 目标 <b id="lev-target">-</b> · 实际 <b id="lev-actual">-</b></p>
           <div class="row">
@@ -603,6 +638,7 @@
   </div>
   <script>
     let selected = null;
+    let isSuper = false;
     let accountsCache = [];
     let loadGen = 0;
     let timer = null;
@@ -669,7 +705,16 @@
       const no = acctNo(id);
       const name = (account && account.name) ? String(account.name) : "";
       const prefix = no != null ? `#${no}` : `#${id}`;
-      el.textContent = name ? `${prefix} ${name}` : prefix;
+      const mark = isSuper && account && account.hidden ? " · 隐藏" : "";
+      el.textContent = (name ? `${prefix} ${name}` : prefix) + mark;
+      syncHiddenToggle(account);
+    }
+
+    function syncHiddenToggle(account) {
+      const box = $("super-features");
+      if (box) box.hidden = !isSuper;
+      const input = $("sf-conceal");
+      if (input && account) input.checked = !!(account.hidden);
     }
 
     function resetPanelSkeleton(account) {
@@ -1185,13 +1230,24 @@
       const box = $("accounts");
       box.innerHTML = "";
       accountsCache = Array.isArray(data.accounts) ? data.accounts.slice() : [];
+      if (selected != null && !accountsCache.some((a) => Number(a.id) === Number(selected))) {
+        selected = null;
+        if (timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+        $("panel").hidden = true;
+        $("empty").hidden = false;
+        $("empty").textContent = "选择账号";
+      }
       accountsCache.forEach((a, i) => {
         const btn = document.createElement("button");
         btn.className = "acct" + (sameAccount(a.id) ? " active" : "");
         const sym = a.hedge_symbol || "ETHUSDT";
         const p = parseHedgeSymbol(sym);
         const no = i + 1;
-        btn.innerHTML = `<b><span class="acct-id">#${no}</span>${esc(a.name)}</b><div class="muted">${esc(p.settle)} · ${esc(p.base)}</div>`;
+        const mark = isSuper && a.hidden ? `<span class="tag-hide">隐藏</span>` : "";
+        btn.innerHTML = `<b><span class="acct-id">#${no}</span>${esc(a.name)}${mark}</b><div class="muted">${esc(p.settle)} · ${esc(p.base)}</div>`;
         btn.onclick = () => selectAccount(a.id);
         box.appendChild(btn);
       });
@@ -1661,9 +1717,11 @@
       const fd = new FormData(e.target);
       const body = Object.fromEntries(fd.entries());
       body.hedge_symbol = sym;
+      if (isSuper) body.hidden = !!$("add-conceal").checked;
       const ok = await confirmAction({
         title: "绑定账号",
-        body: `${body.name || ""} · ${$("add-settle").value} 结算 · ${$("add-base").value} → ${sym}`,
+        body: `${body.name || ""} · ${$("add-settle").value} 结算 · ${$("add-base").value} → ${sym}` +
+          (isSuper && $("add-conceal").checked ? " · 对普通管理员隐藏" : ""),
         okText: "确认",
       });
       if (!ok) return;
@@ -1693,6 +1751,7 @@
     $("btn-show-add").onclick = () => {
       if (busy) return;
       syncHedgePickers($("add-settle"), $("add-base"), $("add-symbol-preview"), $("add-symbol"), "ETHUSDT");
+      $("hidden-features-add").hidden = !isSuper;
       $("add-form").hidden = false;
       $("add-form").querySelector("input[name=name]").focus();
     };
@@ -1974,6 +2033,28 @@
       if (!$("log-overlay").hidden) closeLogDetail();
     });
 
+    $("btn-save-hidden").onclick = async () => {
+      if (!selected || busy || !isSuper) return;
+      busy = true;
+      try {
+        const acc = await api(`/api/accounts/${selected}`, {
+          method: "PATCH",
+          body: JSON.stringify({ hidden: !!$("sf-conceal").checked }),
+        });
+        const cur = accountsCache.find((a) => Number(a.id) === Number(selected));
+        if (cur) Object.assign(cur, acc);
+        if (snapHit(selected) && snapHit(selected).data) {
+          snapHit(selected).data.account = Object.assign(snapHit(selected).data.account || {}, acc);
+          persistFunds();
+        }
+        await loadAccounts();
+        setActionMsg(acc.hidden ? "已隐藏，普通管理员看不到这个账户" : "已对普通管理员显示");
+      } catch (err) {
+        setActionMsg(err.message);
+      } finally {
+        busy = false;
+      }
+    };
     $("btn-logout").onclick = async () => {
       try {
         await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
@@ -1983,7 +2064,12 @@
     bindHedgePickers("add-settle", "add-base", "add-symbol-preview", "add-symbol");
     bindHedgePickers("settle-edit", "base-edit", "symbol-preview", null);
     restoreFunds();
-    loadAccounts();
+    api("/api/session").then((s) => {
+      isSuper = s.role === "super";
+      $("role-chip").hidden = !isSuper;
+      $("hidden-features-add").hidden = !isSuper;
+      $("super-features").hidden = !isSuper;
+    }).catch(() => {}).finally(() => loadAccounts());
   </script>
 </body>
 </html>
