@@ -356,18 +356,25 @@ class FuturesAPI:
             balances[asset] = total
         return {k: v for k, v in balances.items() if v > 0}
 
-    def earn_to_pm_balance(self, asset: str = "LDUSDT") -> Decimal:
+    def earn_asset_transferable(self, asset: str, transfer_type: str) -> Decimal:
+        """EARN_TO_FUTURE / FUTURE_TO_EARN 各自的可转数量，不是统一账户总余额。"""
         data = self.client.signed(
             "GET",
             "/sapi/v1/portfolio/earn-asset-balance",
-            {"asset": asset.upper(), "transferType": "EARN_TO_FUTURE"},
+            {"asset": asset.upper(), "transferType": transfer_type},
         )
         if isinstance(data, list):
             total = Decimal("0")
             for row in data:
-                total += d(row.get("amount") or row.get("balance") or row.get("transferableAmount"))
+                if isinstance(row, dict):
+                    total += d(row.get("amount") or row.get("balance") or row.get("transferableAmount"))
             return total
-        return d(data.get("amount") or data.get("balance") or data.get("transferableAmount"))
+        if isinstance(data, dict):
+            return d(data.get("amount") or data.get("balance") or data.get("transferableAmount"))
+        return Decimal("0")
+
+    def earn_to_pm_balance(self, asset: str = "LDUSDT") -> Decimal:
+        return self.earn_asset_transferable(asset, "EARN_TO_FUTURE")
 
     def earn_to_pm(self, asset: str, amount: Decimal) -> dict:
         self._clear_risk()

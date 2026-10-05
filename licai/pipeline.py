@@ -695,15 +695,25 @@ class Pipeline:
             self.earn.invalidate()
         return step
 
-    def _return_pm_earn(self, asset: str, amount: Decimal) -> list[StepResult]:
-        """LDUSDT 已在统一账户里时，先转回理财，才能赎回再换成更高年化。"""
+    def _return_pm_earn(self, asset: str, amount: Decimal) -> tuple[list[StepResult], Decimal]:
+        """按币安 FUTURE_TO_EARN 可转上限转回。总余额大于这个上限时，多转会 -3020。"""
         try:
-            held = self._pm_balances().get(asset.upper(), Decimal("0"))
-        except Exception:
-            return []
-        if held < SPOT_MIN:
-            return []
-        move = min(held, amount if amount > 0 else held)
+            cap = self.futures.earn_asset_transferable(asset, "FUTURE_TO_EARN")
+        except BinanceAPIError as exc:
+            return [StepResult(f"查询 {asset} 可转出", False, str(exc))], Decimal("0")
+        move = amount if amount > 0 else cap
+        if move > cap:
+            move = cap
+        move = move.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+        if move < SPOT_MIN:
+            return [
+                StepResult(
+                    "暂停换产品",
+                    True,
+                    f"统一账户 {asset} 现在最多能转回理财 {fmt_amount(cap, 8)}。"
+                    "有对冲仓时其余要留作保证金，这次不转。",
+                )
+            ], Decimal("0")
         step = self._mutate(
             f"统一账户 {asset} {fmt_amount(move)} 转回理财，准备换产品",
             lambda qty=move: self.futures.pm_to_earn(asset, qty),
@@ -711,7 +721,9 @@ class Pipeline:
         if step.ok and not step.dry_run:
             time.sleep(max(int(self.settings.settle_seconds or 0), 3))
             self.earn.invalidate()
-        return [step]
+        if not step.ok:
+            return [step], Decimal("0")
+        return [step, StepResult("转回数量", True, move)], move
 
     def _convert_usdc_proceeds(self) -> StepResult | None:
         """RWUSD 赎回有时回到 USDC。申购入口用的是 source_asset，先换过去。"""
@@ -898,10 +910,15 @@ class Pipeline:
                     self._soften_dust_failures(steps)
                     remaining = Decimal("0")
                     break
+                before = len(steps)
                 steps.extend(self._redeem_then_subscribe(product, target, batch))
-                if any(not s.ok for s in steps):
+                fresh = steps[before:]
+                if any(not s.ok for s in fresh):
                     return steps
-                remaining -= batch
+                if any(s.name == "暂停换产品" for s in fresh):
+                    return steps
+                pulled = [s for s in fresh if s.name == "转回数量"]
+                remaining -= d(pulled[-1].detail) if pulled else batch
                 batches += 1
                 if hedge_open and not self.settings.dry_run and self.settings.settle_seconds > 0:
                     time.sleep(self.settings.settle_seconds)
@@ -1050,10 +1067,12 @@ class Pipeline:
                 )
             ]
         if source.asset == "USDT" and source.kind == "flexible":
-            back = self._return_pm_earn("LDUSDT", amount)
+            back, moved = self._return_pm_earn("LDUSDT", amount)
             steps.extend(back)
-            if any(not s.ok for s in back):
+            if any(not s.ok for s in back) or any(s.name == "暂停换产品" for s in back):
                 return steps
+            if source.raw.get("located") == "pm" and moved > 0:
+                amount = moved
         if source.kind == "bfusd":
             redeem = self._mutate(
                 f"赎回 BFUSD {fmt_amount(amount)}（FAST，回现货 USDT）",
