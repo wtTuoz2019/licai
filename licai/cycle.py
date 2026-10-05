@@ -387,7 +387,7 @@ class HedgeCycle:
         return tries, wait
 
     def _refill_maker_room(self) -> tuple[int, float]:
-        """收利补仓：与开仓同级的短改价窗口。"""
+        """收利补仓：优势时不改价，这里只决定检查成交的间隔。"""
         tries = max(16, self._limit_tries() + 8)
         base = float(getattr(self.settings, "quote_refresh_seconds", 0.5) or 0.5)
         wait = max(0.3, min(0.5, base))
@@ -1344,6 +1344,7 @@ class HedgeCycle:
                 start_bid = start_ask = Decimal("0")
 
         i = 0
+        adverse_since: float | None = None
         while True:
             legs = self.futures.legs(self.symbol)
             if finished(legs):
@@ -1351,6 +1352,8 @@ class HedgeCycle:
                 return steps
 
             fav = False
+            slip = Decimal("0")
+            bid = ask = Decimal("0")
             if allow_market and start_bid > 0 and start_ask > 0:
                 try:
                     bid, ask = self.futures.book(self.symbol, force=True)
@@ -1372,9 +1375,36 @@ class HedgeCycle:
                             )
                         )
                         break
+                    if slip > 0:
+                        if adverse_since is None:
+                            adverse_since = time.monotonic()
+                        waited = time.monotonic() - adverse_since
+                        wait_limit = self._hedge_max_wait_seconds()
+                        if waited >= wait_limit:
+                            steps.append(
+                                StepResult(
+                                    "补仓不利",
+                                    True,
+                                    f"{position_side} 不利 {fmt_amount(slip, 2)}bp，已等 {waited:.2f}s，改市价",
+                                )
+                            )
+                            break
+                    else:
+                        adverse_since = None
+                    # 优势或刚转不利：原挂单还是 maker 就留着，不跟着盘口撤了重挂
+                    tick, _step = self.futures.filters(self.symbol)
+                    kept = self._keep_resting_maker(
+                        order_side, position_side, Decimal("0"), bid, ask, tick, any_valid=True
+                    )
+                    if kept is not None:
+                        steps.append(kept)
+                        if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=wait):
+                            steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
+                            return steps
+                        continue
 
-            # 优势时少贴盘口继续挂更优价；不利时积极追价
-            aggressive = (not fav) if allow_market else True
+            # 平仓才追价。补仓首挂放在盘口外，之后上面会把这张单留住
+            aggressive = not allow_market
             extra = self._side_pass(
                 order_side,
                 position_side,
@@ -1496,8 +1526,14 @@ class HedgeCycle:
         bid: Decimal,
         ask: Decimal,
         tick: Decimal,
+        *,
+        any_valid: bool = False,
     ) -> StepResult | None:
-        """盘口目标价未变时保留挂单，保住排队位置（反复撤挂会掉队）。"""
+        """保留仍有效的 maker 挂单。
+
+        any_valid：补仓用。只要买价仍低于卖一、卖价仍高于买一就留着，
+        不因为盘口挪了几档就撤单重挂。
+        """
         try:
             opens = self.futures.um_open_orders(self.symbol)
         except BinanceAPIError:
@@ -1518,8 +1554,8 @@ class HedgeCycle:
                 continue
             if order_side == "SELL" and opx <= bid:
                 continue
-            # 与本轮心理目标价相差不超过 1 档，继续排队
-            if abs(opx - target) <= tick:
+            # 补仓：只要还是 maker 就留着。其它场景仍要求贴近本轮目标价
+            if any_valid or abs(opx - target) <= tick:
                 return StepResult(
                     "挂单排队",
                     True,
