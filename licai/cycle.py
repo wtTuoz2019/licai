@@ -219,16 +219,17 @@ class HedgeCycle:
         steps = list(self.pipeline.switch_to_best(full=False, has_hedge=has_pos))
         if any(not s.ok for s in steps):
             return steps
-        if any(s.name == "暂停换产品" for s in steps):
-            return steps
-        sweep = self.pipeline.sweep_spot_to_earn()
-        steps.extend(sweep)
-        if any(not s.ok for s in sweep):
-            return steps
+        paused = any(s.name == "暂停换产品" for s in steps)
+        if not paused:
+            sweep = self.pipeline.sweep_spot_to_earn()
+            steps.extend(sweep)
+            if any(not s.ok for s in sweep):
+                return steps
         bought = _subscribed(steps)
         if bought and not self.settings.dry_run:
             time.sleep(max(int(self.settings.settle_seconds or 0), 3))
-        steps.extend(self._fund_after_earn(steps, check_idle_ldusdt=True))
+        if bought or self.pipeline.spot_needs_move():
+            steps.extend(self._fund_after_earn(steps, check_idle_ldusdt=not paused))
         return steps
 
     def _bootstrap_funds(self) -> list[StepResult]:

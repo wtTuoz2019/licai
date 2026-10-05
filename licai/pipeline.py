@@ -72,7 +72,7 @@ class Pipeline:
         return self.earn.spot_free((asset or self.settings.source_asset).upper())
 
     def spot_needs_move(self) -> bool:
-        return self.spot_cash("USDT") >= SPOT_MIN or self.spot_cash("BFUSD") >= SPOT_MIN
+        return any(self.spot_cash(asset) >= SPOT_MIN for asset in ("USDT", "BFUSD", "RWUSD"))
 
     def require_keys(self) -> None:
         if not self.settings.api_key or not self.settings.api_secret:
@@ -818,6 +818,13 @@ class Pipeline:
             "reason": reason,
         }
 
+    def _apr_comparison(self) -> str:
+        ranked = [p for p in self.list_products() if self._eligible(p, self.margin_assets())]
+        ranked.sort(key=lambda p: apr_ratio(p.apr), reverse=True)
+        if not ranked:
+            return "没有可比较的产品"
+        return "、".join(f"{p.asset} {apr_percent(p.apr):.2f}%" for p in ranked[:5])
+
     def switch_to_best(self, *, full: bool = False, has_hedge: bool | None = None) -> list[StepResult]:
         """把非目标活期换成当前最高年化产品。
 
@@ -839,17 +846,19 @@ class Pipeline:
                 has_hedge = False
         hedge_open = bool(has_hedge)
         max_batches = 50 if full else self.settings.switch_max_batches
+        compared = self._apr_comparison()
         if full and not hedge_open:
             start_detail = (
                 f"目标 {target.asset} 年化 {apr_percent(target.apr):.2f}%；"
-                f"无对冲仓，其它活期整笔归集（不按 uniMMR 估批），最多 {max_batches} 批"
+                f"无对冲仓，其它活期整笔归集（不按 uniMMR 估批），最多 {max_batches} 批。"
+                f"比较 {compared}"
             )
         else:
             start_detail = (
                 f"目标 {target.asset} 年化 {apr_percent(target.apr):.2f}%；"
                 f"{'入场归集其它活期，' if full else ''}"
                 f"每批按 uniMMR≥{fmt_amount(self.settings.switch_safe_uni_mmr, 4)} 估赎回量，"
-                f"最多 {max_batches} 批"
+                f"最多 {max_batches} 批。比较 {compared}"
             )
         steps = [StepResult("开始分批换产品", True, start_detail)]
         batches = 0
@@ -916,7 +925,8 @@ class Pipeline:
                 if any(not s.ok for s in fresh):
                     return steps
                 if any(s.name == "暂停换产品" for s in fresh):
-                    return steps
+                    # 这一笔转不出来就换下一种持仓，不要把已经申购的产品卡在统一账户外面
+                    break
                 pulled = [s for s in fresh if s.name == "转回数量"]
                 remaining -= d(pulled[-1].detail) if pulled else batch
                 batches += 1

@@ -237,8 +237,21 @@ class EarnAPI:
     def _special_apr(self, path: str) -> Decimal:
         if not self.client.api_key:
             return Decimal("0")
+        now_ms = self.client.timestamp()
+        params = {
+            "current": 1,
+            "size": 10,
+            "startTime": now_ms - 30 * 86400 * 1000,
+            "endTime": now_ms,
+        }
+        apr = self._apr_from_history(path, params)
+        if apr > 0 or not path.endswith("/rateHistory"):
+            return apr
+        return self._apr_from_history(path.replace("/rateHistory", "/rewardsHistory"), params)
+
+    def _apr_from_history(self, path: str, params: dict) -> Decimal:
         try:
-            data = self.client.signed("GET", path, {"current": 1, "size": 10})
+            data = self.client.signed("GET", path, params)
         except BinanceAPIError:
             return Decimal("0")
         rows = data.get("rows") if isinstance(data, dict) else None
