@@ -779,7 +779,7 @@ class Pipeline:
                     "remaining": "0",
                     "reason": (
                         f"还没有理财仓位，钱还在现货。"
-                        f"点「一键入场」会申购 {target.asset}，当前年化 {apr_percent(target.apr):.2f}%"
+                        f"点「换年化」会申购 {target.asset}，当前年化 {apr_percent(target.apr):.2f}%"
                     ),
                 }
             return {

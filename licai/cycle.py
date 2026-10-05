@@ -177,28 +177,11 @@ class HedgeCycle:
             return steps
 
         if hedged:
-            # 已有对冲：仍归集其它活期/现货尘埃；现货闲置或非目标活期都要处理
-            try:
-                idle = self.pipeline.spot_cash()
-            except Exception:
-                idle = Decimal("0")
-            try:
-                target = self.pipeline.pick()
-                other_earn = any(
-                    not self.pipeline._same_product(p, target) and amt > 0
-                    for p, amt in self.pipeline.earn_holdings()
-                )
-            except Exception:
-                other_earn = False
-            if idle >= Decimal("0.01") or other_earn:
-                steps.extend(self._bootstrap_funds())
-                if any(not s.ok for s in steps):
-                    return steps
             steps.append(
                 StepResult(
                     "已有对冲",
                     True,
-                    "对冲已齐。要放大仓位请点「加仓」，这里不再自动加",
+                    "对冲已齐。换理财点「换年化」，放大仓位点「加仓」",
                 )
             )
             return steps
@@ -227,6 +210,25 @@ class HedgeCycle:
             )
             return steps
         steps.extend(self._ensure_hedge())
+        return steps
+
+    def switch_earn(self) -> list[StepResult]:
+        """只换理财：赎回较低年化，申购当前最高，再划回统一账户。不开仓、不加仓。"""
+        legs = self.futures.legs(self.symbol)
+        has_pos = legs.long_qty > 0 or legs.short_qty > 0
+        steps = list(self.pipeline.switch_to_best(full=False, has_hedge=has_pos))
+        if any(not s.ok for s in steps):
+            return steps
+        if any(s.name == "暂停换产品" for s in steps):
+            return steps
+        sweep = self.pipeline.sweep_spot_to_earn()
+        steps.extend(sweep)
+        if any(not s.ok for s in sweep):
+            return steps
+        bought = _subscribed(steps)
+        if bought and not self.settings.dry_run:
+            time.sleep(max(int(self.settings.settle_seconds or 0), 3))
+        steps.extend(self._fund_after_earn(steps, check_idle_ldusdt=True))
         return steps
 
     def _bootstrap_funds(self) -> list[StepResult]:

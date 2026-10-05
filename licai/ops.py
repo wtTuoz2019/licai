@@ -911,7 +911,7 @@ class OpsService:
         elif action == "scale":
             run = lambda: cycle.scale_once(force=force or mode == "force")
         elif action == "switch":
-            run = lambda: pipe.switch_to_best()
+            run = lambda: cycle.switch_earn()
         elif action == "leverage":
             run = lambda: cycle.apply_leverage()
         else:

@@ -793,10 +793,10 @@
       $("harvest-why").textContent = "账号未就绪，仓位不会与其他账号共用";
     }
     const ACTIONS = {
-      enter: { title: "一键入场", hint: "其它活期先换成最高年化，再申购、入金并开对冲。" },
+      enter: { title: "一键入场", hint: "没仓时申购最高年化并开对冲。已经有仓要换理财，点「换年化」。" },
       scale: { title: "加仓", hint: "在 uniMMR 安全线内，两边一起放大仓位。" },
       harvest: { title: "一键收利", hint: "平掉盈利腿并补仓。USDC 本位会先换成 USDT 再买理财。" },
-      switch: { title: "换更高年化", hint: "分批换成更高年化产品。" },
+      switch: { title: "换更高年化", hint: "只换理财：把较低年化赎回，申购当前最高，再划回统一账户。不开仓。" },
       leverage: { title: "设置杠杆", hint: "先按输入倍数去交易所设置；算仓始终用实际落地的倍数。100 不行会落到允许的最高档。" },
     };
 
