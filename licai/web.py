@@ -169,6 +169,14 @@ def create_app() -> FastAPI:
             raise HTTPException(400, str(exc)) from exc
         return account.public_dict()
 
+    @app.get("/api/accounts/{account_id}")
+    def get_account(account_id: int, request: Request):
+        account = _visible_account(request, account_id)
+        data = account.public_dict()
+        data["api_key"] = account.api_key
+        data["api_secret"] = account.api_secret
+        return data
+
     @app.patch("/api/accounts/{account_id}")
     def patch_account(account_id: int, body: AccountPatch, request: Request):
         account = _visible_account(request, account_id)

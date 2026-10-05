@@ -560,11 +560,20 @@
             <label>名称</label>
             <input id="edit-name" autocomplete="off" />
             <label>API Key</label>
-            <input id="edit-key" autocomplete="off" placeholder="留空则不修改" />
-            <p class="muted" id="edit-key-tail"></p>
+            <input id="edit-key" autocomplete="off" />
             <label>API Secret</label>
-            <input id="edit-secret" type="password" autocomplete="off" placeholder="留空则不修改" />
-            <p class="muted">换了币安密钥时，Key 和 Secret 要一起粘贴。权限需勾选：允许读取、启用现货杠杆和股票交易、允许合约、允许万向划转。IP 白名单填服务器出口 IP。</p>
+            <input id="edit-secret" autocomplete="off" />
+            <label>代理</label>
+            <input id="edit-proxy" autocomplete="off" placeholder="留空表示走服务器出口 IP" />
+            <label>① 结算币</label>
+            <select id="edit-settle">
+              <option value="USDT">USDT（默认）</option>
+              <option value="USDC">USDC</option>
+            </select>
+            <label>② 代币</label>
+            <select id="edit-base"></select>
+            <p class="muted" id="edit-symbol-preview">将使用 ETHUSDT</p>
+            <p class="muted">币安权限需勾选：允许读取、启用现货杠杆和股票交易、允许合约、允许万向划转。IP 白名单填服务器出口 IP。</p>
             <div class="row">
               <button type="button" id="btn-cancel-account">取消</button>
               <button type="button" id="btn-save-account" class="primary">保存</button>
@@ -1795,17 +1804,25 @@
       box.hidden = !box.hidden;
       if (box.hidden) hideEditBoxes();
     };
-    $("btn-edit-account").onclick = () => {
+    $("btn-edit-account").onclick = async () => {
       if (!selected || busy) return;
       $("edit-symbol-box").hidden = true;
       $("edit-proxy-box").hidden = true;
-      const acc = currentAccount();
-      $("edit-name").value = acc ? (acc.name || "") : "";
-      $("edit-key").value = "";
-      $("edit-secret").value = "";
-      $("edit-key-tail").textContent = acc && acc.api_key_tail ? "当前 Key " + acc.api_key_tail : "";
-      $("edit-account-box").hidden = false;
-      $("edit-name").focus();
+      showLoading("读取账号", "请稍候");
+      try {
+        const acc = await api(`/api/accounts/${selected}`);
+        $("edit-name").value = acc.name || "";
+        $("edit-key").value = acc.api_key || "";
+        $("edit-secret").value = acc.api_secret || "";
+        $("edit-proxy").value = acc.proxy || "";
+        syncHedgePickers($("edit-settle"), $("edit-base"), $("edit-symbol-preview"), null, acc.hedge_symbol || "ETHUSDT");
+        $("edit-account-box").hidden = false;
+        hideModal();
+        $("edit-name").focus();
+      } catch (err) {
+        hideModal();
+        setActionMsg(err.message);
+      }
     };
     $("btn-cancel-account").onclick = () => {
       $("edit-account-box").hidden = true;
@@ -1815,28 +1832,34 @@
       const name = $("edit-name").value.trim();
       const apiKey = $("edit-key").value.trim();
       const apiSecret = $("edit-secret").value.trim();
+      const sym = composeHedgeSymbol($("edit-base").value, $("edit-settle").value);
       if (!name) {
         setActionMsg("名称不能为空");
         return;
       }
-      if ((apiKey && !apiSecret) || (!apiKey && apiSecret)) {
-        setActionMsg("更换密钥时，API Key 和 API Secret 要一起填写");
+      if (!apiKey || !apiSecret) {
+        setActionMsg("API Key 和 API Secret 不能空");
         return;
       }
       const ok = await confirmAction({
         title: "保存账号",
-        body: name + (apiKey ? " · 同时更新 API Key / Secret" : " · 密钥保持不变"),
+        body: `${name} · ${$("edit-settle").value} 结算 · ${$("edit-base").value} → ${sym}`,
         okText: "保存",
       });
       if (!ok) return;
-      const body = { name };
-      if (apiKey) {
-        body.api_key = apiKey;
-        body.api_secret = apiSecret;
-      }
       showLoading("保存中", "请稍候");
       try {
-        await api(`/api/accounts/${selected}`, { method: "PATCH", body: JSON.stringify(body) });
+        await api(`/api/accounts/${selected}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            name,
+            api_key: apiKey,
+            api_secret: apiSecret,
+            proxy: $("edit-proxy").value.trim(),
+            hedge_symbol: sym,
+          }),
+        });
+        lastSymbol = sym;
         $("edit-account-box").hidden = true;
         await loadAccounts();
         hideModal();
@@ -2146,6 +2169,7 @@
     };
     bindHedgePickers("add-settle", "add-base", "add-symbol-preview", "add-symbol");
     bindHedgePickers("settle-edit", "base-edit", "symbol-preview", null);
+    bindHedgePickers("edit-settle", "edit-base", "edit-symbol-preview", null);
     restoreFunds();
     api("/api/session").then((s) => {
       isSuper = s.role === "super";
