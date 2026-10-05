@@ -17,6 +17,15 @@ def apr_percent(apr: Decimal) -> Decimal:
     return apr if apr > 1 else apr * Decimal("100")
 
 
+def apr_choice_text(product: FlexibleProduct) -> str:
+    """选币用的年化。BFUSD 在 800U 以上用理财页预估，800U 以内的更高一日只写在后面。"""
+    text = f"{apr_percent(product.apr):.2f}%"
+    small = (product.raw or {}).get("small_balance_apr")
+    if small not in (None, "", "0"):
+        text += f"（800U以上；800U以内 {apr_percent(d(small)):.2f}%）"
+    return text
+
+
 def apr_ratio(apr: Decimal) -> Decimal:
     if apr <= 0:
         return Decimal("0")
@@ -779,7 +788,7 @@ class Pipeline:
                     "remaining": "0",
                     "reason": (
                         f"还没有理财仓位，钱还在现货。"
-                        f"点「换年化」会申购 {target.asset}，当前年化 {apr_percent(target.apr):.2f}%"
+                        f"点「换年化」会申购 {target.asset}，当前年化 {apr_choice_text(target)}"
                     ),
                 }
             return {
@@ -791,7 +800,7 @@ class Pipeline:
                 "safe_mmr": fmt_amount(safe, 4),
                 "next_batch": "0",
                 "remaining": "0",
-                "reason": f"理财仓已经在最高年化 {target.asset} {apr_percent(target.apr):.2f}%，不用换",
+                "reason": f"理财仓已经在最高年化 {target.asset} {apr_choice_text(target)}，不用换",
             }
         next_batch = self._next_switch_batch(leftover, mmr, equity)
         can = next_batch > 0
@@ -802,7 +811,7 @@ class Pipeline:
         else:
             from_text = "、".join(f"{p.asset} {fmt_amount(amt, 2)}" for p, amt in sources)
             reason = (
-                f"分批把 {from_text} 换成 {target.asset}（年化 {apr_percent(target.apr):.2f}%）。"
+                f"分批把 {from_text} 换成 {target.asset}（年化 {apr_choice_text(target)}）。"
                 f"本批最多 {fmt_amount(next_batch, 2)} USDT，按赎回瞬间保证金暂时少一块来估，"
                 f"目标 uniMMR ≥ {fmt_amount(safe, 4)}。点一次最多 {self.settings.switch_max_batches} 批。"
             )
@@ -823,7 +832,7 @@ class Pipeline:
         ranked.sort(key=lambda p: apr_ratio(p.apr), reverse=True)
         if not ranked:
             return "没有可比较的产品"
-        return "、".join(f"{p.asset} {apr_percent(p.apr):.2f}%" for p in ranked[:5])
+        return "、".join(f"{p.asset} {apr_choice_text(p)}" for p in ranked[:5])
 
     def switch_to_best(self, *, full: bool = False, has_hedge: bool | None = None) -> list[StepResult]:
         """把非目标活期换成当前最高年化产品。
@@ -849,13 +858,13 @@ class Pipeline:
         compared = self._apr_comparison()
         if full and not hedge_open:
             start_detail = (
-                f"目标 {target.asset} 年化 {apr_percent(target.apr):.2f}%；"
+                f"目标 {target.asset} 年化 {apr_choice_text(target)}；"
                 f"无对冲仓，其它活期整笔归集（不按 uniMMR 估批），最多 {max_batches} 批。"
                 f"比较 {compared}"
             )
         else:
             start_detail = (
-                f"目标 {target.asset} 年化 {apr_percent(target.apr):.2f}%；"
+                f"目标 {target.asset} 年化 {apr_choice_text(target)}；"
                 f"{'入场归集其它活期，' if full else ''}"
                 f"每批按 uniMMR≥{fmt_amount(self.settings.switch_safe_uni_mmr, 4)} 估赎回量，"
                 f"最多 {max_batches} 批。比较 {compared}"

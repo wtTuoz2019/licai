@@ -45,6 +45,47 @@ def _apr_from_row(row: dict) -> Decimal:
     return Decimal("0")
 
 
+_HOMEPAGE_OVERVIEW = (
+    "https://www.binance.com/bapi/earn/v1/friendly/finance-earn/homepage/overview"
+)
+
+
+def _homepage_min_aprs(client: BinanceClient) -> dict[str, Decimal]:
+    """热门产品预估年化。BFUSD / RWUSD 在各币种的 productSummary 里，取 minApr。"""
+    found: dict[str, Decimal] = {}
+    try:
+        response = client.session.get(
+            _HOMEPAGE_OVERVIEW,
+            params={"pageSize": 100, "pageIndex": 1},
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json", "lang": "zh-CN"},
+            timeout=client.timeout,
+        )
+        payload = response.json()
+    except (OSError, ValueError):
+        return found
+    data = payload.get("data") if isinstance(payload, dict) else None
+    items = data.get("list") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return found
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for summary in item.get("productSummary") or []:
+            if not isinstance(summary, dict):
+                continue
+            kind = str(summary.get("productType") or "").upper()
+            if kind not in {"BFUSD", "RWUSD"}:
+                continue
+            aprs = []
+            for key in ("minApr", "maxApr"):
+                apr = _apr(summary.get(key))
+                if Decimal("0") < apr < Decimal("1"):
+                    aprs.append(apr)
+            if aprs:
+                found[kind] = min(aprs)
+    return found
+
+
 def _latest_history_row(rows: list) -> dict:
     stamped = [row for row in rows if isinstance(row, dict)]
     if not stamped:
@@ -260,10 +301,74 @@ class EarnAPI:
         return _apr_from_row(_latest_history_row(rows))
 
     def bfusd_apr(self) -> Decimal:
-        return self._special_apr("/sapi/v1/bfusd/history/rateHistory")
+        rank, _small = self.bfusd_rate_pair()
+        return rank
+
+    def bfusd_rate_pair(self) -> tuple[Decimal, Decimal]:
+        """比较用理财页预估；最近一日更高时，那是 800U 以内的高档。
+
+        理财页 BFUSD 预估年化与近 7 日 rateHistory 均值一致。
+        最近一日（例如 4.27%）只作用在 800U 以内，余额更大时按页面上的较低一档计。
+        """
+        latest, average = self._daily_and_average("/sapi/v1/bfusd/history/rateHistory", days=7)
+        card = self._homepage_apr("BFUSD")
+        rank = card if card > 0 else average if average > 0 else latest
+        small = latest if rank > 0 and latest > rank else Decimal("0")
+        return rank, small
 
     def bfusd_product(self) -> FlexibleProduct:
-        return self._special_product("BFUSD", "bfusd", self.bfusd_apr())
+        rank, small = self.bfusd_rate_pair()
+        extra: dict[str, object] = {}
+        if small > 0:
+            extra["small_balance_apr"] = str(small)
+        return self._special_product("BFUSD", "bfusd", rank, extra)
+
+    def _daily_and_average(self, path: str, days: int) -> tuple[Decimal, Decimal]:
+        if not self.client.api_key:
+            return Decimal("0"), Decimal("0")
+        now_ms = self.client.timestamp()
+        params = {
+            "current": 1,
+            "size": max(days, 10),
+            "startTime": now_ms - 30 * 86400 * 1000,
+            "endTime": now_ms,
+        }
+        try:
+            data = self.client.signed("GET", path, params)
+        except BinanceAPIError:
+            return Decimal("0"), Decimal("0")
+        rows = data.get("rows") if isinstance(data, dict) else None
+        if not rows:
+            return Decimal("0"), Decimal("0")
+        def _stamp(row: dict) -> int:
+            raw = row.get("time") or row.get("timestamp") or 0
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return 0
+
+        ordered = sorted(
+            (row for row in rows if isinstance(row, dict)),
+            key=_stamp,
+            reverse=True,
+        )
+        rates = [apr for row in ordered if (apr := _apr_from_row(row)) > 0]
+        if not rates:
+            return Decimal("0"), Decimal("0")
+        window = rates[:days]
+        average = sum(window) / Decimal(len(window))
+        return rates[0], average
+
+    def _homepage_apr(self, product_type: str) -> Decimal:
+        """币安理财「热门产品」里该产品的预估年化（minApr）。"""
+        now = time.monotonic()
+        cached = getattr(self, "_homepage_aprs", None)
+        cached_at = getattr(self, "_homepage_aprs_at", 0.0)
+        if cached is None or now - cached_at > 60:
+            cached = _homepage_min_aprs(self.client)
+            self._homepage_aprs = cached
+            self._homepage_aprs_at = now
+        return cached.get(product_type.upper(), Decimal("0"))
 
     def subscribe_rwusd(self, amount: Decimal, source_asset: str = "USDT") -> dict:
         self._bust()
@@ -279,7 +384,16 @@ class EarnAPI:
     def rwusd_product(self) -> FlexibleProduct:
         return self._special_product("RWUSD", "rwusd", self.rwusd_apr())
 
-    def _special_product(self, asset: str, kind: SubscribeKind, apr: Decimal) -> FlexibleProduct:
+    def _special_product(
+        self,
+        asset: str,
+        kind: SubscribeKind,
+        apr: Decimal,
+        extra: dict | None = None,
+    ) -> FlexibleProduct:
+        raw: dict[str, object] = {"source": kind}
+        if extra:
+            raw.update(extra)
         return FlexibleProduct(
             product_id=asset,
             asset=asset,
@@ -290,7 +404,7 @@ class EarnAPI:
             min_purchase=Decimal("0.1"),
             status="PURCHASING",
             hot=True,
-            raw={"source": kind},
+            raw=raw,
             kind=kind,
             margin_token=asset,
         )
