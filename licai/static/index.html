@@ -551,9 +551,24 @@
           <div class="row">
             <button type="button" id="btn-set-leverage">设置杠杆</button>
             <input id="lev-edit" type="number" min="1" max="125" step="1" placeholder="100" title="目标杠杆：尝试提到这个倍数；算仓用实际倍数" />
+            <button type="button" id="btn-edit-account">编辑账号</button>
             <button type="button" id="btn-edit-symbol">切换套保</button>
             <button type="button" id="btn-edit-proxy">修改代理</button>
             <button type="button" id="btn-delete">解绑</button>
+          </div>
+          <div id="edit-account-box" class="edit-box" hidden>
+            <label>名称</label>
+            <input id="edit-name" autocomplete="off" />
+            <label>API Key</label>
+            <input id="edit-key" autocomplete="off" placeholder="留空则不修改" />
+            <p class="muted" id="edit-key-tail"></p>
+            <label>API Secret</label>
+            <input id="edit-secret" type="password" autocomplete="off" placeholder="留空则不修改" />
+            <p class="muted">换了币安密钥时，Key 和 Secret 要一起粘贴。权限需勾选：允许读取、启用现货杠杆和股票交易、允许合约、允许万向划转。IP 白名单填服务器出口 IP。</p>
+            <div class="row">
+              <button type="button" id="btn-cancel-account">取消</button>
+              <button type="button" id="btn-save-account" class="primary">保存</button>
+            </div>
           </div>
           <div id="edit-symbol-box" class="edit-box" hidden>
             <label>① 结算币（默认 USDT，可切 USDC）</label>
@@ -785,7 +800,14 @@
       $("error").hidden = false;
       let msg = (s && s.error) || "加载失败";
       if (/Invalid API-key|IP|permissions|-2015/i.test(msg)) {
-        msg += "。此账号未放行当前出口 IP，请在币安 API 白名单加入该 IP，或给本账号绑定可用代理后再刷新。";
+        const hit = msg.match(/request ip:\s*([0-9.]+)/i);
+        const reqIp = hit ? hit[1] : "";
+        const exitIp = (s && s.exit_ip && s.exit_ip !== "未知") ? s.exit_ip : "";
+        if (reqIp && (!exitIp || reqIp === exitIp)) {
+          msg += "。请求已经从 " + reqIp + " 发出，IP 白名单对得上。请到设置里编辑账号，核对 Key / Secret 是否整段保存；币安权限要勾「允许读取」「启用现货、杠杆和股票交易」「允许合约」「允许万向划转」。没勾「允许合约」时，现货能读、刷新仓位会报这个错。";
+        } else {
+          msg += "。此账号未放行当前出口 IP" + (reqIp ? " " + reqIp : "") + "，请在币安 API 白名单加入该 IP，或给本账号绑定可用代理后再刷新。";
+        }
       }
       $("error").textContent = msg;
       $("ip").textContent = (s && s.exit_ip) || "-";
@@ -1579,8 +1601,13 @@
     }
 
     function hideEditBoxes() {
+      $("edit-account-box").hidden = true;
       $("edit-symbol-box").hidden = true;
       $("edit-proxy-box").hidden = true;
+    }
+
+    function currentAccount() {
+      return accountsCache.find((a) => Number(a.id) === Number(selected)) || null;
     }
 
     function setActionMsg(text) {
@@ -1768,8 +1795,61 @@
       box.hidden = !box.hidden;
       if (box.hidden) hideEditBoxes();
     };
+    $("btn-edit-account").onclick = () => {
+      if (!selected || busy) return;
+      $("edit-symbol-box").hidden = true;
+      $("edit-proxy-box").hidden = true;
+      const acc = currentAccount();
+      $("edit-name").value = acc ? (acc.name || "") : "";
+      $("edit-key").value = "";
+      $("edit-secret").value = "";
+      $("edit-key-tail").textContent = acc && acc.api_key_tail ? "当前 Key " + acc.api_key_tail : "";
+      $("edit-account-box").hidden = false;
+      $("edit-name").focus();
+    };
+    $("btn-cancel-account").onclick = () => {
+      $("edit-account-box").hidden = true;
+    };
+    $("btn-save-account").onclick = async () => {
+      if (!selected || busy) return;
+      const name = $("edit-name").value.trim();
+      const apiKey = $("edit-key").value.trim();
+      const apiSecret = $("edit-secret").value.trim();
+      if (!name) {
+        setActionMsg("名称不能为空");
+        return;
+      }
+      if ((apiKey && !apiSecret) || (!apiKey && apiSecret)) {
+        setActionMsg("更换密钥时，API Key 和 API Secret 要一起填写");
+        return;
+      }
+      const ok = await confirmAction({
+        title: "保存账号",
+        body: name + (apiKey ? " · 同时更新 API Key / Secret" : " · 密钥保持不变"),
+        okText: "保存",
+      });
+      if (!ok) return;
+      const body = { name };
+      if (apiKey) {
+        body.api_key = apiKey;
+        body.api_secret = apiSecret;
+      }
+      showLoading("保存中", "请稍候");
+      try {
+        await api(`/api/accounts/${selected}`, { method: "PATCH", body: JSON.stringify(body) });
+        $("edit-account-box").hidden = true;
+        await loadAccounts();
+        hideModal();
+        setActionMsg("账号已保存");
+        await refresh({ force: true, silent: true });
+      } catch (err) {
+        hideModal();
+        setActionMsg(err.message);
+      }
+    };
     $("btn-edit-symbol").onclick = () => {
       if (!selected || busy) return;
+      $("edit-account-box").hidden = true;
       $("edit-proxy-box").hidden = true;
       syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, lastSymbol);
       $("edit-symbol-box").hidden = false;
@@ -1780,6 +1860,7 @@
     };
     $("btn-edit-proxy").onclick = () => {
       if (!selected || busy) return;
+      $("edit-account-box").hidden = true;
       $("edit-symbol-box").hidden = true;
       $("edit-proxy-box").hidden = false;
       api("/api/webshare").then((st) => {
