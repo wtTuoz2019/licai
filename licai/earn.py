@@ -17,7 +17,50 @@ def _apr(value: object) -> Decimal:
     return apr
 
 
-SubscribeKind = Literal["flexible", "bfusd"]
+SubscribeKind = Literal["flexible", "bfusd", "rwusd"]
+
+_APR_KEYS = (
+    "annualPercentageRate",
+    "latestAnnualPercentageRate",
+    "latestAnnualInterestRate",
+    "apr",
+    "rate",
+)
+
+
+def _apr_from_row(row: dict) -> Decimal:
+    for key in _APR_KEYS:
+        if row.get(key) not in (None, ""):
+            apr = _apr(row.get(key))
+            if apr > 0:
+                return apr
+    for key, value in row.items():
+        name = str(key).lower()
+        if any(skip in name for skip in ("time", "amount", "asset", "quota")):
+            continue
+        if any(mark in name for mark in ("apr", "rate", "interest")):
+            apr = _apr(value)
+            if apr > 0:
+                return apr
+    return Decimal("0")
+
+
+def _latest_history_row(rows: list) -> dict:
+    stamped = [row for row in rows if isinstance(row, dict)]
+    if not stamped:
+        return {}
+
+    def stamp(row: dict) -> int:
+        raw = row.get("time") or row.get("timestamp") or row.get("calcTime") or 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    newest = max(stamped, key=stamp)
+    if stamp(newest) == 0:
+        return stamped[0]
+    return newest
 
 _YDAY_REWARD_CACHE: dict[str, tuple[float, dict]] = {}
 _YDAY_REWARD_TTL = 600.0
@@ -93,6 +136,7 @@ class FlexibleProduct:
     hot: bool
     raw: dict
     kind: SubscribeKind = "flexible"
+    margin_token: str = ""
 
     @property
     def purchasable(self) -> bool:
@@ -102,9 +146,11 @@ class FlexibleProduct:
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "FlexibleProduct":
         sold_out = row.get("isSoldOut") if "isSoldOut" in row else row.get("sellOut")
+        asset = str(row.get("asset") or "").upper()
+        token = str(row.get("token") or "").upper()
         return cls(
             product_id=str(row.get("productId") or row.get("id") or ""),
-            asset=str(row.get("asset") or "").upper(),
+            asset=asset,
             apr=_apr(row.get("latestAnnualPercentageRate") or row.get("latestAnnualInterestRate")),
             can_purchase=bool(row.get("canPurchase")),
             can_redeem=bool(row.get("canRedeem", True)),
@@ -113,6 +159,7 @@ class FlexibleProduct:
             status=str(row.get("status") or ""),
             hot=bool(row.get("hot") or row.get("featured") or row.get("hotPush")),
             raw=row,
+            margin_token=token or (f"LD{asset}" if asset else ""),
         )
 
 
@@ -124,11 +171,13 @@ class EarnAPI:
         self._spot: dict[str, Decimal] = {}
         self._positions: dict[str, list[dict]] = {}
         self._bfusd: Decimal | None = None
+        self._rwusd: Decimal | None = None
 
     def _bust(self) -> None:
         self._spot.clear()
         self._positions.clear()
         self._bfusd = None
+        self._rwusd = None
 
     def invalidate(self) -> None:
         self._bust()
@@ -185,31 +234,42 @@ class EarnAPI:
             {"asset": source_asset.upper(), "amount": fmt_amount(amount)},
         )
 
-    def bfusd_apr(self) -> Decimal:
+    def _special_apr(self, path: str) -> Decimal:
+        if not self.client.api_key:
+            return Decimal("0")
         try:
-            data = self.client.signed(
-                "GET",
-                "/sapi/v1/bfusd/history/rateHistory",
-                {"current": 1, "size": 1},
-            )
+            data = self.client.signed("GET", path, {"current": 1, "size": 10})
         except BinanceAPIError:
             return Decimal("0")
-        rows = data.get("rows") or []
+        rows = data.get("rows") if isinstance(data, dict) else None
         if not rows:
             return Decimal("0")
-        row = rows[0]
-        return _apr(
-            row.get("annualPercentageRate")
-            or row.get("latestAnnualPercentageRate")
-            or row.get("apr")
-            or row.get("rate")
-        )
+        return _apr_from_row(_latest_history_row(rows))
+
+    def bfusd_apr(self) -> Decimal:
+        return self._special_apr("/sapi/v1/bfusd/history/rateHistory")
 
     def bfusd_product(self) -> FlexibleProduct:
-        apr = self.bfusd_apr() if self.client.api_key else Decimal("0")
+        return self._special_product("BFUSD", "bfusd", self.bfusd_apr())
+
+    def subscribe_rwusd(self, amount: Decimal, source_asset: str = "USDT") -> dict:
+        self._bust()
+        return self.client.signed(
+            "POST",
+            "/sapi/v1/rwusd/subscribe",
+            {"asset": source_asset.upper(), "amount": fmt_amount(amount)},
+        )
+
+    def rwusd_apr(self) -> Decimal:
+        return self._special_apr("/sapi/v1/rwusd/history/rateHistory")
+
+    def rwusd_product(self) -> FlexibleProduct:
+        return self._special_product("RWUSD", "rwusd", self.rwusd_apr())
+
+    def _special_product(self, asset: str, kind: SubscribeKind, apr: Decimal) -> FlexibleProduct:
         return FlexibleProduct(
-            product_id="BFUSD",
-            asset="BFUSD",
+            product_id=asset,
+            asset=asset,
             apr=apr,
             can_purchase=True,
             can_redeem=True,
@@ -217,8 +277,9 @@ class EarnAPI:
             min_purchase=Decimal("0.1"),
             status="PURCHASING",
             hot=True,
-            raw={"source": "bfusd"},
-            kind="bfusd",
+            raw={"source": kind},
+            kind=kind,
+            margin_token=asset,
         )
 
     def left_quota(self, product_id: str) -> Decimal:
@@ -303,6 +364,25 @@ class EarnAPI:
             {"amount": fmt_amount(amount), "type": redeem_type},
         )
 
+    def rwusd_balance(self) -> Decimal:
+        if self._rwusd is not None:
+            return self._rwusd
+        try:
+            data = self.client.signed("GET", "/sapi/v1/rwusd/account")
+        except BinanceAPIError:
+            self._rwusd = Decimal("0")
+            return self._rwusd
+        self._rwusd = d(data.get("rwusdAmount") or data.get("totalAmount") or data.get("amount"))
+        return self._rwusd
+
+    def redeem_rwusd(self, amount: Decimal, redeem_type: str = "FAST") -> dict:
+        self._bust()
+        return self.client.signed(
+            "POST",
+            "/sapi/v1/rwusd/redeem",
+            {"amount": fmt_amount(amount), "type": redeem_type},
+        )
+
     def earn_margin_usdt(self) -> Decimal:
         total = self.spot_free("USDT")
         try:
@@ -311,6 +391,7 @@ class EarnAPI:
         except BinanceAPIError:
             pass
         total += self.bfusd_balance()
+        total += self.rwusd_balance()
         return total
 
     def yesterday_earn_reward(self) -> dict[str, object]:

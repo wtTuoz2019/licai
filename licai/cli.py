@@ -80,7 +80,8 @@ def _cmd_scan(pipeline: Pipeline, top: int) -> int:
     margin_assets = pipeline.margin_assets()
     ranked = sorted((p for p in products if p.purchasable), key=lambda p: p.apr, reverse=True)
     source = "官方 API" if pipeline.settings.api_key else "公开行情（无需 API Key）"
-    print(f"只看能当合约保证金的保本活期：{', '.join(pipeline.settings.margin_earn_assets)}")
+    ranked = [p for p in ranked if pipeline._eligible(p, margin_assets)]
+    print("所有活期里，能当统一账户保证金去开 USDT/USDC 合约的，按年化从高到低")
     print(f"共 {len(ranked)} 个可申购 | 数据来源: {source}")
     print(f"模式: {'模拟' if pipeline.settings.dry_run else '实盘'} | {'统一账户' if pipeline.settings.unified_account else '经典账户'} | 资金 {pipeline.settings.source_asset}")
     print()
@@ -158,7 +159,7 @@ def _cmd_run(pipeline: Pipeline) -> int:
 
 
 def _row(product: FlexibleProduct, margin_assets: set[str] | None = None) -> str:
-    kind = "BFUSD专项" if product.kind == "bfusd" else "活期"
+    kind = product.asset if product.kind in {"bfusd", "rwusd"} else "活期"
     return (
         f"{apr_percent(product.apr):>7.2f}%  "
         f"{product.asset:<10} "

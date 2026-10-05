@@ -738,6 +738,7 @@ class OpsService:
             "spot_usdt": wallet.get("spot_usdt") or fmt_amount(spot_usdt, 4),
             "earn_total": wallet.get("earn_total") or "0",
             "usdt_flexible": wallet.get("usdt_flexible") or "0",
+            "usdt_flexible_label": wallet.get("usdt_flexible_label") or "USDT 活期",
             "bfusd": wallet.get("bfusd") or "0",
             "earn_yesterday": wallet.get("earn_yesterday") or "0",
             "earn_yesterday_source": wallet.get("earn_yesterday_source") or "none",

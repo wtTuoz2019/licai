@@ -135,14 +135,44 @@ def filters(symbol: str) -> tuple[Decimal, Decimal]:
     raise RuntimeError(f"找不到合约 {symbol}")
 
 
+# 公开抵押率接口失败时，仍承认这几项能进统一账户开 USDT/USDC 合约
+_COLLATERAL_FALLBACK = {
+    "USDT": Decimal("0.9999"),
+    "USDC": Decimal("0.9999"),
+    "LDUSDT": Decimal("0.999"),
+    "BFUSD": Decimal("0.999"),
+    "RWUSD": Decimal("0.999"),
+}
+
+
+def _collateral_rows(data: object) -> list:
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("data") or data.get("collateralRate") or []
+    return rows if isinstance(rows, list) else []
+
+
 def collateral_rates() -> dict[str, Decimal]:
+    """统一账户抵押率。活期要能开 USDT/USDC 合约，申购后的代币必须在这份名单里且抵押率 > 0。"""
     global _rates, _rates_at
     now = time.monotonic()
     with _lock:
         if _rates and now - _rates_at < RATE_TTL:
             return dict(_rates)
-    data = _get(f"{SPOT}/sapi/v1/portfolio/collateralRate")
-    rows = data if isinstance(data, list) else (data.get("collateralRate") or data.get("data") or [] if isinstance(data, dict) else [])
+    data: object = None
+    try:
+        data = _get("https://www.binance.com/bapi/margin/v1/public/margin/portfolio/collateral-rate")
+    except Exception:
+        data = None
+    rows = _collateral_rows(data)
+    if not rows:
+        try:
+            data = _get(f"{SPOT}/sapi/v1/portfolio/collateralRate")
+        except Exception:
+            data = None
+        rows = _collateral_rows(data)
     rates: dict[str, Decimal] = {}
     for row in rows:
         if not isinstance(row, dict):
@@ -151,6 +181,8 @@ def collateral_rates() -> dict[str, Decimal]:
         if not asset:
             continue
         rates[asset] = d(row.get("collateralRate") or row.get("rate") or row.get("collateralRateLevel"))
+    if not rates:
+        rates = dict(_COLLATERAL_FALLBACK)
     with _lock:
         _rates = rates
         _rates_at = time.monotonic()

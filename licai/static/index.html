@@ -498,7 +498,7 @@
         </div>
         <div class="funds">
           <div class="kpi"><span>现货 USDT</span><b id="spot">-</b></div>
-          <div class="kpi" id="usdt-flex-box"><span>USDT 活期</span><b id="usdt-flex">-</b></div>
+          <div class="kpi" id="usdt-flex-box"><span id="usdt-flex-label">USDT 活期</span><b id="usdt-flex">-</b></div>
           <div class="kpi"><span>BFUSD</span><b id="bfusd">-</b></div>
           <div class="kpi"><span>理财合计</span><b id="earn-total">-</b></div>
         </div>
@@ -1476,6 +1476,8 @@
       $("spot").textContent = s.spot_usdt || "-";
       const flexAmt = toNum(s.usdt_flexible);
       $("usdt-flex").textContent = s.usdt_flexible || "0";
+      const flexLabel = $("usdt-flex-label");
+      if (flexLabel) flexLabel.textContent = s.usdt_flexible_label || "USDT 活期";
       const flexBox = $("usdt-flex-box");
       if (flexBox) flexBox.hidden = !(Number.isFinite(flexAmt) && flexAmt > 0);
       $("bfusd").textContent = s.bfusd || "0";
@@ -1509,7 +1511,7 @@
       hideEditBoxes();
       const mg = s.margin || {};
       const box = $("collateral");
-      const rows = (mg.rows || []).filter((r) => Number(r.amount) > 0);
+      const rows = (mg.rows || []).filter((r) => Number(r.amount) > 0 || Number(r.in_pm) > 0);
       box.hidden = rows.length === 0;
       box.innerHTML = "";
       rows.forEach((r) => {

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable
 
@@ -10,6 +10,7 @@ from .config import Settings, d, fmt_amount, is_mmr_sentinel, settle_asset_of
 from .convert import ConvertAPI
 from .earn import EarnAPI, FlexibleProduct
 from .futures import FuturesAPI
+from .market import collateral_rates
 
 
 def apr_percent(apr: Decimal) -> Decimal:
@@ -20,6 +21,19 @@ def apr_ratio(apr: Decimal) -> Decimal:
     if apr <= 0:
         return Decimal("0")
     return apr / Decimal("100") if apr > 1 else apr
+
+
+def earns_as_um_margin(product: FlexibleProduct, rates: dict[str, Decimal]) -> bool:
+    """申购之后实际拿在手里的代币，必须能当统一账户保证金去开 USDT 或 USDC 合约。
+
+    活期仓位看 LD 代币（USDT 活期是 LDUSDT）。BFUSD、RWUSD 本身就是抵押资产。
+    现货 BTC 能做抵押，不代表 BTC 活期锁仓后还能开 U 本位。
+    """
+    if product.kind in {"bfusd", "rwusd"}:
+        token = product.asset.upper()
+    else:
+        token = (product.margin_token or f"LD{product.asset}").upper()
+    return rates.get(token, Decimal("0")) > 0
 
 
 @dataclass
@@ -51,6 +65,7 @@ class Pipeline:
         self.convert_api = ConvertAPI(self.client)
         self.futures = FuturesAPI(self.client, unified_account=settings.unified_account)
         self._product_list: list[FlexibleProduct] | None = None
+        self._product_list_at = 0.0
         self._wallet_transfer_blocked = False
 
     def spot_cash(self, asset: str | None = None) -> Decimal:
@@ -64,27 +79,37 @@ class Pipeline:
             raise SystemExit("请先在 .env 里填写 BINANCE_API_KEY 和 BINANCE_API_SECRET")
 
     def margin_assets(self) -> set[str]:
-        return {a.upper() for a in self.settings.margin_earn_assets}
+        configured = {a.upper() for a in self.settings.margin_earn_assets if a}
+        if configured:
+            return configured
+        return {asset for asset, rate in self._collateral_rate_map().items() if rate > 0}
 
     def list_products(self) -> list[FlexibleProduct]:
-        if self._product_list is not None:
+        now = time.monotonic()
+        if self._product_list is not None and now - self._product_list_at < 60:
             return self._product_list
-        allowed = self.margin_assets()
         if self.settings.api_key and self.settings.api_secret:
             try:
                 products = self.earn.list_flexible()
             except BinanceAPIError:
                 products = self.earn.list_flexible_public()
         else:
-            products = []
-            for asset in allowed:
-                if asset == "BFUSD":
-                    continue
-                products.extend(self.earn.list_flexible_public(asset=asset))
-        filtered = [p for p in products if p.asset in allowed]
-        if "BFUSD" in allowed and not any(p.asset == "BFUSD" for p in filtered):
+            try:
+                products = self.earn.list_flexible_public()
+            except Exception:
+                products = []
+        # BFUSD / RWUSD 走专项接口，不用活期列表里可能缺年化、不可申购的那一行
+        filtered = [p for p in products if p.asset not in {"BFUSD", "RWUSD"}]
+        for product in filtered:
+            if not product.margin_token:
+                product.margin_token = f"LD{product.asset}"
+        rates = self._collateral_rate_map()
+        if rates.get("BFUSD", Decimal("0")) > 0:
             filtered.append(self.earn.bfusd_product())
+        if rates.get("RWUSD", Decimal("0")) > 0:
+            filtered.append(self.earn.rwusd_product())
         self._product_list = filtered
+        self._product_list_at = now
         return filtered
 
     def pick(self, products: list[FlexibleProduct] | None = None, margin_assets: set[str] | None = None) -> FlexibleProduct:
@@ -92,23 +117,31 @@ class Pipeline:
         margin_assets = margin_assets if margin_assets is not None else self.margin_assets()
         candidates = [p for p in products if self._eligible(p, margin_assets)]
         if self._wallet_transfer_blocked:
-            no_bfusd = [p for p in candidates if p.kind != "bfusd"]
-            if no_bfusd:
-                candidates = no_bfusd
+            # 现货划不进统一账户时，只留申购后能用理财代币转入的产品（LDUSDT 这类）
+            via_earn = [p for p in candidates if (p.margin_token or "").upper().startswith("LD")]
+            if via_earn:
+                candidates = via_earn
         if not candidates:
-            raise RuntimeError("没有可作合约保证金的保本活期，请检查 margin_earn_assets")
+            raise RuntimeError("没有可作统一账户保证金、用来开 USDT/USDC 合约的活期")
         candidates.sort(key=lambda p: apr_ratio(p.apr), reverse=True)
         return candidates[0]
 
+    def _collateral_rate_map(self) -> dict[str, Decimal]:
+        try:
+            rates = collateral_rates()
+        except Exception:
+            rates = {}
+        return rates
+
     def _eligible(self, product: FlexibleProduct, margin_assets: set[str]) -> bool:
+        del margin_assets
         if not product.purchasable:
             return False
         if product.asset in self.settings.asset_denylist:
             return False
-        allowed = set(self.settings.asset_allowlist or self.settings.margin_earn_assets)
-        if product.asset not in allowed:
+        if self.settings.asset_allowlist and product.asset not in self.settings.asset_allowlist:
             return False
-        if product.asset not in margin_assets and not self._is_margin_asset(product.asset, margin_assets):
+        if not earns_as_um_margin(product, self._collateral_rate_map()):
             return False
         percent = apr_percent(product.apr)
         if percent < self.settings.min_apr:
@@ -141,7 +174,7 @@ class Pipeline:
                 f"金额 {fmt_amount(amount)} 低于最小申购额 {fmt_amount(product.min_purchase)} {product.asset}"
             )
         try:
-            if product.kind == "bfusd":
+            if product.kind in {"bfusd", "rwusd"}:
                 quota = amount
             else:
                 quota = self.earn.left_quota(product.product_id)
@@ -156,11 +189,12 @@ class Pipeline:
     def buy(self, product: FlexibleProduct, amount: Decimal) -> list[StepResult]:
         steps: list[StepResult] = []
         subscribe_amount = amount
-        if product.kind == "bfusd":
+        if product.kind in {"bfusd", "rwusd"}:
             pay_asset = self.settings.source_asset
+            subscribe_fn = self.earn.subscribe_bfusd if product.kind == "bfusd" else self.earn.subscribe_rwusd
             subscribe = self._mutate(
-                f"申购 BFUSD（用 {pay_asset}）数量={fmt_amount(subscribe_amount)}",
-                lambda: self.earn.subscribe_bfusd(subscribe_amount, pay_asset),
+                f"申购 {product.asset}（用 {pay_asset}）数量={fmt_amount(subscribe_amount)}",
+                lambda fn=subscribe_fn: fn(subscribe_amount, pay_asset),
             )
             steps.append(subscribe)
             steps.append(StepResult("subscribe_amount", True, subscribe_amount))
@@ -242,7 +276,7 @@ class Pipeline:
             )
         )
         steps.extend(self.buy(product, amount))
-        if any(not s.ok for s in steps) and product.kind == "bfusd":
+        if any(not s.ok for s in steps) and product.kind in {"bfusd", "rwusd"}:
             alt = self._best_usdt_flexible()
             leftover = self.earn.spot_free(self.settings.source_asset)
             if alt is not None and leftover > 0:
@@ -252,7 +286,7 @@ class Pipeline:
                     StepResult(
                         "改申购 USDT 活期",
                         True,
-                        f"BFUSD 申购失败（{fail.detail if fail else '未知'}），改买 USDT 活期",
+                        f"{product.asset} 申购失败（{fail.detail if fail else '未知'}），改买 USDT 活期",
                     )
                 )
                 steps.extend(self.buy(alt, leftover))
@@ -266,7 +300,7 @@ class Pipeline:
     def earn_holdings(self) -> list[tuple[FlexibleProduct, Decimal]]:
         holdings: list[tuple[FlexibleProduct, Decimal]] = []
         try:
-            rows = self.earn.positions("USDT")
+            rows = self.earn.positions()
         except BinanceAPIError:
             rows = []
         for row in rows:
@@ -274,29 +308,109 @@ class Pipeline:
             if amount <= 0:
                 continue
             product = FlexibleProduct.from_row(row)
-            if not product.product_id:
+            if not product.product_id or product.asset in {"BFUSD", "RWUSD"}:
                 continue
-            product.asset = "USDT"
+            if not product.margin_token:
+                product.margin_token = f"LD{product.asset}"
             product.kind = "flexible"
             holdings.append((product, amount))
         bfusd = max(self.earn.bfusd_balance(), self.earn.spot_free("BFUSD"))
         if bfusd > 0:
             holdings.append((self.earn.bfusd_product(), bfusd))
+        rwusd = max(self.earn.rwusd_balance(), self.earn.spot_free("RWUSD"))
+        if rwusd > 0:
+            holdings.append((self.earn.rwusd_product(), rwusd))
+        return self._overlay_pm_balances(holdings)
+
+    def _pm_balances(self) -> dict[str, Decimal]:
+        try:
+            return self.futures.papi_balances()
+        except BinanceAPIError:
+            return {}
+
+    def _overlay_pm_balances(
+        self, holdings: list[tuple[FlexibleProduct, Decimal]]
+    ) -> list[tuple[FlexibleProduct, Decimal]]:
+        """转入统一账户后，活期接口经常变成 0，余额在 LDUSDT / BFUSD / RWUSD 上。"""
+        pm = self._pm_balances()
+
+        def split(asset: str, kind: str) -> tuple[list[tuple[FlexibleProduct, Decimal]], Decimal]:
+            kept: list[tuple[FlexibleProduct, Decimal]] = []
+            total = Decimal("0")
+            for product, amount in holdings:
+                if product.asset == asset and product.kind == kind:
+                    total += amount
+                else:
+                    kept.append((product, amount))
+            return kept, total
+
+        holdings, usdt_amt = split("USDT", "flexible")
+        ld = pm.get("LDUSDT", Decimal("0"))
+        show = max(usdt_amt, ld)
+        if show > 0:
+            product = self._usdt_flex_product()
+            if ld > 0 and ld >= usdt_amt:
+                product = replace(product, margin_token="LDUSDT", raw={**product.raw, "located": "pm"})
+            holdings.append((product, show))
+
+        holdings, bfusd_amt = split("BFUSD", "bfusd")
+        bfusd_show = max(bfusd_amt, pm.get("BFUSD", Decimal("0")))
+        if bfusd_show > 0:
+            product = self.earn.bfusd_product()
+            if pm.get("BFUSD", Decimal("0")) >= bfusd_amt and pm.get("BFUSD", Decimal("0")) > 0:
+                product = replace(product, raw={**product.raw, "located": "pm"})
+            holdings.append((product, bfusd_show))
+
+        holdings, rw_amt = split("RWUSD", "rwusd")
+        rw_show = max(rw_amt, pm.get("RWUSD", Decimal("0")))
+        if rw_show > 0:
+            product = self.earn.rwusd_product()
+            if pm.get("RWUSD", Decimal("0")) >= rw_amt and pm.get("RWUSD", Decimal("0")) > 0:
+                product = replace(product, raw={**product.raw, "located": "pm"})
+            holdings.append((product, rw_show))
         return holdings
+
+    def _usdt_flex_product(self) -> FlexibleProduct:
+        for product in self.list_products():
+            if product.asset == "USDT" and product.kind == "flexible":
+                return product
+        return FlexibleProduct(
+            product_id="USDT001",
+            asset="USDT",
+            apr=Decimal("0"),
+            can_purchase=True,
+            can_redeem=True,
+            is_sold_out=False,
+            min_purchase=Decimal("0.1"),
+            status="PURCHASING",
+            hot=False,
+            raw={},
+            kind="flexible",
+            margin_token="LDUSDT",
+        )
 
     def wallet_view(self) -> dict:
         spot = self.earn.spot_free("USDT")
         holdings_raw = self.earn_holdings()
         usdt_flex = Decimal("0")
         bfusd = Decimal("0")
+        other = Decimal("0")
+        flex_label = "USDT 活期"
         holdings = []
         for product, amount in holdings_raw:
             if product.kind == "bfusd":
                 bfusd += amount
                 label = "BFUSD"
-            else:
+            elif product.kind == "rwusd":
+                other += amount
+                label = "RWUSD"
+            elif product.asset == "USDT":
                 usdt_flex += amount
-                label = "USDT 活期"
+                label = "LDUSDT" if product.raw.get("located") == "pm" else "USDT 活期"
+                flex_label = label
+            else:
+                other += amount
+                label = product.margin_token or product.asset
             holdings.append(
                 {
                     "label": label,
@@ -314,12 +428,12 @@ class Pipeline:
                 next_buy = {
                     "asset": target.asset,
                     "apr": str(apr_percent(target.apr)),
-                    "kind": "BFUSD" if target.kind == "bfusd" else "USDT 活期",
+                    "kind": target.asset if target.kind in {"bfusd", "rwusd"} else f"{target.asset} 活期",
                     "amount": fmt_amount(spot, 4),
                 }
             except Exception:
                 next_buy = None
-        if usdt_flex + bfusd <= 0 and spot > 0:
+        if usdt_flex + bfusd + other <= 0 and spot > 0:
             status = f"还没理财。{fmt_amount(spot, 2)} USDT 在现货闲着，不会生息。"
         elif spot > 0:
             status = f"已有理财仓位，现货还闲着 {fmt_amount(spot, 2)} USDT，可再申购。"
@@ -334,8 +448,9 @@ class Pipeline:
         return {
             "spot_usdt": fmt_amount(spot, 4),
             "usdt_flexible": fmt_amount(usdt_flex, 4),
+            "usdt_flexible_label": flex_label,
             "bfusd": fmt_amount(bfusd, 4),
-            "earn_total": fmt_amount(usdt_flex + bfusd, 4),
+            "earn_total": fmt_amount(usdt_flex + bfusd + other, 4),
             "earn_yesterday": fmt_amount(yday_amt, 4) if yday_amt > 0 else "0",
             "earn_yesterday_source": str(yday.get("source") or "none"),
             "earn_yesterday_error": "; ".join(str(x) for x in yday_errs[:3]) if yday_errs else "",
@@ -347,7 +462,7 @@ class Pipeline:
     def margin_status(self, *, equity: Decimal | None = None) -> dict:
         spot = self.earn.spot_free("USDT")
         holdings = self.earn_holdings()
-        usdt_flex = sum((amt for p, amt in holdings if p.kind != "bfusd"), Decimal("0"))
+        usdt_flex = sum((amt for p, amt in holdings if p.asset == "USDT" and p.kind == "flexible"), Decimal("0"))
         bfusd = sum((amt for p, amt in holdings if p.kind == "bfusd"), Decimal("0"))
         try:
             rates = self.futures.collateral_rates()
@@ -481,6 +596,9 @@ class Pipeline:
         bfusd_spot = self.spot_cash("BFUSD")
         if bfusd_spot >= SPOT_MIN:
             steps.extend(self._fund_spot_asset("BFUSD", bfusd_spot))
+        rwusd_spot = self.spot_cash("RWUSD")
+        if rwusd_spot >= SPOT_MIN:
+            steps.extend(self._fund_spot_asset("RWUSD", rwusd_spot))
         already_ld = any("LDUSDT" in s.name and s.ok for s in steps)
         if check_ldusdt and not already_ld:
             try:
@@ -519,10 +637,11 @@ class Pipeline:
 
     def _spot_via_ldusdt(self, asset: str, amount: Decimal) -> list[StepResult]:
         steps: list[StepResult] = []
-        if asset == "BFUSD":
+        if asset in {"BFUSD", "RWUSD"}:
+            redeem_fn = self.earn.redeem_bfusd if asset == "BFUSD" else self.earn.redeem_rwusd
             redeem = self._mutate(
-                f"赎回 BFUSD {fmt_amount(amount)}（FAST，回现货 USDT）",
-                lambda: self.earn.redeem_bfusd(amount, "FAST"),
+                f"赎回 {asset} {fmt_amount(amount)}（FAST，回到现货）",
+                lambda fn=redeem_fn: fn(amount, "FAST"),
             )
             steps.append(redeem)
             if not redeem.ok:
@@ -530,6 +649,11 @@ class Pipeline:
             if not self.settings.dry_run:
                 time.sleep(max(int(self.settings.settle_seconds or 0), 3))
                 self.earn.invalidate()
+                converted = self._convert_usdc_proceeds()
+                if converted is not None:
+                    steps.append(converted)
+                    if not converted.ok:
+                        return steps
             amount = self.spot_cash("USDT")
         steps.extend(self._subscribe_usdt_and_move_ld(amount))
         return steps
@@ -566,6 +690,42 @@ class Pipeline:
         step = self._mutate(
             f"现货 {asset} {fmt_amount(amount)} 划入统一账户全仓（不是 U 本位合约）",
             lambda: self.futures.spot_to_unified(asset, amount),
+        )
+        if step.ok and not step.dry_run:
+            self.earn.invalidate()
+        return step
+
+    def _return_pm_earn(self, asset: str, amount: Decimal) -> list[StepResult]:
+        """LDUSDT 已在统一账户里时，先转回理财，才能赎回再换成更高年化。"""
+        try:
+            held = self._pm_balances().get(asset.upper(), Decimal("0"))
+        except Exception:
+            return []
+        if held < SPOT_MIN:
+            return []
+        move = min(held, amount if amount > 0 else held)
+        step = self._mutate(
+            f"统一账户 {asset} {fmt_amount(move)} 转回理财，准备换产品",
+            lambda qty=move: self.futures.pm_to_earn(asset, qty),
+        )
+        if step.ok and not step.dry_run:
+            time.sleep(max(int(self.settings.settle_seconds or 0), 3))
+            self.earn.invalidate()
+        return [step]
+
+    def _convert_usdc_proceeds(self) -> StepResult | None:
+        """RWUSD 赎回有时回到 USDC。申购入口用的是 source_asset，先换过去。"""
+        if self.settings.dry_run or self.settings.source_asset == "USDC":
+            return None
+        try:
+            usdc = self.earn.spot_free("USDC")
+        except BinanceAPIError:
+            return None
+        if usdc < SPOT_MIN:
+            return None
+        step = self._mutate(
+            f"兑换 {fmt_amount(usdc)} USDC -> {self.settings.source_asset}",
+            lambda amt=usdc: self.convert_api.convert("USDC", self.settings.source_asset, amt),
         )
         if step.ok and not step.dry_run:
             self.earn.invalidate()
@@ -881,7 +1041,7 @@ class Pipeline:
         redeem_all: bool = False,
     ) -> list[StepResult]:
         steps: list[StepResult] = []
-        if not source.can_redeem and source.kind != "bfusd":
+        if not source.can_redeem and source.kind not in {"bfusd", "rwusd"}:
             return [
                 StepResult(
                     f"赎回活期 {source.asset}",
@@ -889,10 +1049,20 @@ class Pipeline:
                     f"交易所标记不可赎回 canRedeem=false，productId={source.product_id}",
                 )
             ]
+        if source.asset == "USDT" and source.kind == "flexible":
+            back = self._return_pm_earn("LDUSDT", amount)
+            steps.extend(back)
+            if any(not s.ok for s in back):
+                return steps
         if source.kind == "bfusd":
             redeem = self._mutate(
                 f"赎回 BFUSD {fmt_amount(amount)}（FAST，回现货 USDT）",
                 lambda: self.earn.redeem_bfusd(amount, "FAST"),
+            )
+        elif source.kind == "rwusd":
+            redeem = self._mutate(
+                f"赎回 RWUSD {fmt_amount(amount)}（FAST，回到现货）",
+                lambda: self.earn.redeem_rwusd(amount, "FAST"),
             )
         elif redeem_all:
             redeem = self._mutate(
@@ -915,10 +1085,20 @@ class Pipeline:
             return steps
         if not self.settings.dry_run and self.settings.settle_seconds > 0:
             time.sleep(self.settings.settle_seconds)
+            converted = self._convert_usdc_proceeds()
+            if converted is not None:
+                steps.append(converted)
+                if not converted.ok:
+                    return steps
         free = amount if self.settings.dry_run else self.earn.spot_free("USDT")
         buy_amount = min(amount, free) if free > 0 else (free if redeem_all else amount)
         if redeem_all and not self.settings.dry_run:
             self.earn.invalidate()
+            converted = self._convert_usdc_proceeds()
+            if converted is not None:
+                steps.append(converted)
+                if not converted.ok:
+                    return steps
             free = self.earn.spot_free("USDT")
             buy_amount = free if free > 0 else Decimal("0")
         if buy_amount <= 0:

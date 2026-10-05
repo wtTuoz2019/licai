@@ -419,8 +419,10 @@ class HedgeCycle:
                     f"理财保证金约 {fmt_amount(collateral)} USDT，按 {margin_use_pct(self.settings)} 占用、{self.settings.hedge_leverage}x、双边各占保证金，开 "
                     f"两边先挂单（GTX，首挂买一/卖一外约 {getattr(self.settings, 'maker_passive_bps', 2)}bp/"
                     f"{getattr(self.settings, 'maker_passive_ticks', 2)} 档），按 MACD 涨跌决定先多/先空；"
-                    f"单边后最多等 {getattr(self.settings, 'hedge_max_wait_seconds', 0.8)}s 或滑点 "
-                    f"{getattr(self.settings, 'hedge_max_slippage_bps', 3.5)}bp 即市价补齐  数量={fmt_amount(qty)} {self.symbol}",
+                    f"第二腿价格优势（补多更低/补空更高）一直挂；不利超 "
+                    f"{getattr(self.settings, 'hedge_max_slippage_bps', 3.5)}bp 或不利超 "
+                    f"{getattr(self.settings, 'hedge_max_wait_seconds', 0.8)}s 才市价  "
+                    f"数量={fmt_amount(qty)} {self.symbol}",
                     dry_run=True,
                 )
             ]
@@ -741,14 +743,15 @@ class HedgeCycle:
         """双边挂单直到对冲齐。
 
         双腿都未成：GTX 首挂 + 短间隔追价；-5022 则撤双侧外退重挂。
-        单边已成：100ms 高频盯盘；超时或滑点超限 → 立刻市价补齐（不再 maker 追价）。
+        单边已成：价格仍优势（补多更低 / 补空更高）一直挂；不利超限或不利超时才市价。
         """
         steps: list[StepResult] = []
         tries, wait = self._open_maker_room()
         naked_since: float | None = None
         anchor = Decimal("0")  # 第一腿成交均价
+        i = 0
 
-        for i in range(tries):
+        while True:
             legs = self.futures.legs(self.symbol)
             if legs.missing_side is None:
                 steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
@@ -771,14 +774,24 @@ class HedgeCycle:
 
             # 双边未成时前几轮保持偏防守，少贴盘口；单边补缺才积极追价
             dual_open = legs.long_qty <= 0 and legs.short_qty <= 0
-            aggressive = naked or (i > 2 and not dual_open) or (i > 4)
+            # 单边且价格优势：停在更优挂单价，不往盘口追
+            fav = False
+            if naked and not reduce_only and naked_since is not None:
+                slip, _, _ = self._second_leg_slip(legs, anchor)
+                fav = slip is not None and slip <= 0
+            if fav:
+                aggressive = False
+                quote_pass = 0
+            else:
+                aggressive = naked or (i > 2 and not dual_open) or (i > 4)
+                quote_pass = i + (2 if naked else 0)
             extra = self._hedge_pass(
                 qty,
                 reduce_only,
                 market=False,
                 aggressive=aggressive,
                 flatten=False,
-                pass_n=i + (2 if naked else 0),
+                pass_n=quote_pass,
             )
             steps.extend(extra)
             if (not reduce_only) and any(_no_margin(item) for item in extra):
@@ -796,8 +809,15 @@ class HedgeCycle:
                 naked_since = time.monotonic()
                 anchor = legs.long_entry if legs.long_qty > 0 else legs.short_entry
 
-            # 等待期间轮询：平衡 / 时间 / 滑点（单边 100ms）
-            round_wait = wait if not naked else min(wait, self._hedge_max_wait_seconds())
+            # 等待期间轮询：平衡 / 优势继续挂 / 不利才兜底
+            if naked and not reduce_only:
+                slip, _, _ = self._second_leg_slip(legs, anchor)
+                if slip is not None and slip <= 0:
+                    round_wait = wait
+                else:
+                    round_wait = min(wait, self._hedge_max_wait_seconds())
+            else:
+                round_wait = wait
             done, bail = self._wait_second_leg(
                 timeout=round_wait,
                 reduce_only=reduce_only,
@@ -818,11 +838,28 @@ class HedgeCycle:
                 if naked_since is None:
                     naked_since = time.monotonic()
                 anchor = legs.long_entry if legs.long_qty > 0 else legs.short_entry
+                if not reduce_only:
+                    slip, _, _ = self._second_leg_slip(legs, anchor)
+                    fav = slip is not None and slip <= 0
             else:
                 naked_since = None
                 anchor = Decimal("0")
+                fav = False
 
-        steps.append(StepResult("挂单未齐", True, f"限价挂了 {tries} 次仍有缺口，改市价补另一边"))
+            i += 1
+            # 双边未成：主 tries 用尽后市价；单边且仍优势：一直挂
+            if i >= tries:
+                if naked and not reduce_only and fav:
+                    continue
+                if naked and not reduce_only:
+                    reason = self._second_leg_bailout_reason(legs, naked_since, anchor)
+                    if reason:
+                        steps.append(StepResult("单边兜底", True, reason))
+                        steps.extend(self._market_fill_second_leg(qty, reduce_only))
+                        return self._finish_hedge_or_flatten(steps, reduce_only)
+                break
+
+        steps.append(StepResult("挂单未齐", True, f"限价挂了 {i} 次仍有缺口，改市价补另一边"))
         steps.extend(self._market_fill_second_leg(qty, reduce_only))
         return self._finish_hedge_or_flatten(steps, reduce_only)
 
@@ -833,46 +870,59 @@ class HedgeCycle:
         raw = d(getattr(self.settings, "hedge_max_slippage_bps", None) or "3.5")
         return raw if raw > 0 else Decimal("3.5")
 
+    def _second_leg_slip(
+        self, legs: HedgeLegs, anchor: Decimal
+    ) -> tuple[Decimal | None, str, Decimal]:
+        """相对第一腿：正数=第二腿不利（补多变贵/补空变便宜），负数或 0=仍优势。"""
+        try:
+            bid, ask = self.futures.book(self.symbol, force=True)
+        except BinanceAPIError:
+            return None, "", Decimal("0")
+        ref = anchor
+        if ref <= 0:
+            ref = legs.long_entry if legs.long_qty > 0 else legs.short_entry
+        if ref <= 0:
+            return None, "", Decimal("0")
+        if legs.long_qty <= 0 and legs.short_qty > 0:
+            cost = ask
+            slip = (cost - ref) / ref * Decimal("10000")
+            return slip, "补多", cost
+        if legs.short_qty <= 0 and legs.long_qty > 0:
+            cost = bid
+            slip = (ref - cost) / ref * Decimal("10000")
+            return slip, "补空", cost
+        return None, "", Decimal("0")
+
     def _second_leg_bailout_reason(
         self,
         legs: HedgeLegs,
         naked_since: float | None,
         anchor: Decimal,
     ) -> str | None:
-        """单边已成：超时或 BBO 不利偏离超限 → 立刻市价（不再 maker 追价）。"""
-        if naked_since is not None:
-            elapsed = time.monotonic() - naked_since
-            limit = self._hedge_max_wait_seconds()
-            if elapsed >= limit:
-                return (
-                    f"第二腿超时 {elapsed:.2f}s≥{limit:.2f}s，立刻市价补齐"
-                    f"（{'补空' if legs.long_qty > 0 else '补多'}）"
-                )
-        try:
-            bid, ask = self.futures.book(self.symbol, force=True)
-        except BinanceAPIError:
+        """单边已成：价格仍优势继续挂；不利逃逸或不利超时才市价。"""
+        slip, side, cost = self._second_leg_slip(legs, anchor)
+        if slip is None:
             return None
-        ref = anchor
-        if ref <= 0:
-            ref = legs.long_entry if legs.long_qty > 0 else legs.short_entry
-        if ref <= 0:
-            return None
+        ref = anchor if anchor > 0 else (
+            legs.long_entry if legs.long_qty > 0 else legs.short_entry
+        )
         max_bps = self._hedge_max_slippage_bps()
-        # 缺多：成本=卖一；缺空：成本=买一。不利偏离相对第一腿成交价。
-        if legs.long_qty <= 0 and legs.short_qty > 0:
-            cost = ask
-            slip = (cost - ref) / ref * Decimal("10000")
-            side = "补多"
-        elif legs.short_qty <= 0 and legs.long_qty > 0:
-            cost = bid
-            slip = (ref - cost) / ref * Decimal("10000")
-            side = "补空"
-        else:
-            return None
+        elapsed = (time.monotonic() - naked_since) if naked_since is not None else 0.0
+        # 不利偏离超限：立刻市价
         if slip >= max_bps:
             return (
                 f"第二腿价格逃逸 {fmt_amount(slip, 2)}bp≥{fmt_amount(max_bps, 2)}bp，"
                 f"锚={fmt_amount(ref)} 现成本={fmt_amount(cost)}，{side}立刻市价"
+            )
+        # 仍优势（补多成本更低 / 补空卖价更高）：一直挂，不因时间市价
+        if slip <= 0:
+            return None
+        # 已不利但未超滑点：按短超时市价，避免裸腿拖着
+        wait_limit = self._hedge_max_wait_seconds()
+        if naked_since is not None and elapsed >= wait_limit:
+            return (
+                f"第二腿不利 {fmt_amount(slip, 2)}bp，已等 {elapsed:.2f}s≥{wait_limit:.2f}s，"
+                f"锚={fmt_amount(ref)} 现成本={fmt_amount(cost)}，{side}市价补齐"
             )
         return None
 
@@ -1045,8 +1095,8 @@ class HedgeCycle:
                 bid,
                 ask,
                 tick,
-                improve=(aggressive or naked or pass_n > 0) and not dual_open,
-                pass_n=max(int(pass_n), 2 if naked else 0),
+                improve=(aggressive or pass_n > 0) and not dual_open,
+                pass_n=max(int(pass_n), 2 if (naked and aggressive) else 0),
                 retreat_n=0,
             )
             # 双边齐开时即使追价也保持至少 2 档间距，避免 84129.2/84129.3 贴死
@@ -1269,7 +1319,7 @@ class HedgeCycle:
     def _quote_side(self, order_side: str, position_side: str, qty: Decimal, reduce_only: bool) -> list[StepResult]:
         """
         平仓(reduce_only)：只挂 GTX，绝不市价；长窗口追价直到成交或超时失败。
-        补仓：更长挂单追价，仍不成交再市价，避免长时间单边。
+        补仓：价格往优势走（补多更低/补空更高）一直挂；不利逃逸再市价。
         """
         steps: list[StepResult] = []
         done_name = f"已平 {position_side}" if reduce_only else f"已补 {position_side}"
@@ -1281,18 +1331,55 @@ class HedgeCycle:
         if reduce_only:
             tries, wait = self._close_maker_room()
             allow_market = False
+            start_bid = start_ask = Decimal("0")
         else:
             tries, wait = self._refill_maker_room()
             allow_market = True
+            try:
+                start_bid, start_ask = self.futures.book(self.symbol, force=True)
+            except BinanceAPIError:
+                start_bid = start_ask = Decimal("0")
 
-        for i in range(tries):
+        i = 0
+        while True:
             legs = self.futures.legs(self.symbol)
             if finished(legs):
                 steps.append(StepResult(done_name, True, self._legs_text(legs)))
                 return steps
-            # 始终往盘口内侧松一点挂；轮次越高越靠近对手价，仍保持 GTX
+
+            fav = False
+            if allow_market and start_bid > 0 and start_ask > 0:
+                try:
+                    bid, ask = self.futures.book(self.symbol, force=True)
+                except BinanceAPIError:
+                    bid = ask = Decimal("0")
+                if bid > 0 and ask > 0:
+                    # 补多：卖一更低=优势；补空：买一更高=优势
+                    if order_side == "BUY":
+                        slip = (ask - start_ask) / start_ask * Decimal("10000")
+                    else:
+                        slip = (start_bid - bid) / start_bid * Decimal("10000")
+                    fav = slip <= 0
+                    if slip >= self._hedge_max_slippage_bps():
+                        steps.append(
+                            StepResult(
+                                "补仓逃逸",
+                                True,
+                                f"{position_side} 相对开始不利 {fmt_amount(slip, 2)}bp，改市价",
+                            )
+                        )
+                        break
+
+            # 优势时少贴盘口继续挂更优价；不利时积极追价
+            aggressive = (not fav) if allow_market else True
             extra = self._side_pass(
-                order_side, position_side, qty, reduce_only, market=False, aggressive=True, pass_n=i
+                order_side,
+                position_side,
+                qty,
+                reduce_only,
+                market=False,
+                aggressive=aggressive,
+                pass_n=i if aggressive else 0,
             )
             steps.extend(extra)
             if any(_order_filled_hint(item) for item in extra):
@@ -1303,6 +1390,13 @@ class HedgeCycle:
             if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=wait):
                 steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
                 return steps
+
+            i += 1
+            # 平仓：tries 用尽就停；补仓仍优势：一直挂；补仓已不利：市价
+            if i >= tries:
+                if allow_market and fav:
+                    continue
+                break
 
         if not allow_market:
             try:
@@ -1319,7 +1413,7 @@ class HedgeCycle:
             )
             return steps
 
-        steps.append(StepResult("挂单未齐", True, f"{position_side} 已挂单 {tries} 次未完成，改市价补仓（尽量少用）"))
+        steps.append(StepResult("挂单未齐", True, f"{position_side} 已挂单未完成，改市价补仓（尽量少用）"))
         for _ in range(2):
             steps.extend(self._side_pass(order_side, position_side, qty, reduce_only, market=True, aggressive=True))
             if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=0.8):

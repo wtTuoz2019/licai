@@ -13,14 +13,12 @@ source_account: SPOT
 # 统一账户（Portfolio Margin）：申购后仓位直接计入保证金，无需划转到合约
 unified_account: true
 
-# 只看 USDT 名下能当合约保证金的保本活期：USDT 活期 + BFUSD
-margin_earn_assets:
-  - USDT
-  - BFUSD
+# 选币：所有活期都参与。申购后的代币必须在统一账户抵押名单里，且抵押率 > 0，
+# 才能拿去开 USDT 或 USDC 合约，再取年化最高的。
+# 下面两个名单留空就是这条规则。要临时只允许某几个资产，再写进 asset_allowlist。
+margin_earn_assets: []
 
-asset_allowlist:
-  - USDT
-  - BFUSD
+asset_allowlist: []
 
 # 申购后留在活期。统一账户下必须为 true
 keep_earn: true
@@ -60,8 +58,8 @@ hedge_quote_retries: 8       # 挂单轮数：入场/补仓约 12+，平仓更�
 maker_improve_bps: 1         # 追价时相对现价最多往里靠 1bp；仍留 1 档，GTX 不吃单
 maker_passive_bps: 2         # 首挂：买/卖相对买一/卖一往外约 2bp，少贴盘口少 -5022
 maker_passive_ticks: 2       # 首挂至少离买一/卖一 2 档（与 bp 取更远）
-# 第二腿（单边成交后）：100ms 高频盯盘；超时或滑点超限立刻市价，不再 maker 追价
-hedge_max_wait_seconds: 0.8  # 第一腿成交后最多再等多久第二腿
+# 第二腿（单边成交后）：100ms 高频盯盘。价格往优势走一直挂；不利偏离超限才市价
+hedge_max_wait_seconds: 0.8  # 第二腿相对第一腿不利时，最多再等多久就市价
 hedge_max_slippage_bps: 3.5  # 相对第一腿成交价，BBO 不利偏离超过此 bp 则立刻市价
 watch_seconds: 60            # 命令行盯盘间隔
 live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤

@@ -377,6 +377,14 @@ class FuturesAPI:
             {"asset": asset.upper(), "transferType": "EARN_TO_FUTURE", "amount": fmt_amount(amount)},
         )
 
+    def pm_to_earn(self, asset: str, amount: Decimal) -> dict:
+        self._clear_risk()
+        return self.client.signed(
+            "POST",
+            "/sapi/v1/portfolio/earn-asset-transfer",
+            {"asset": asset.upper(), "transferType": "FUTURE_TO_EARN", "amount": fmt_amount(amount)},
+        )
+
     def _post_first(self, attempts: list[tuple[str, dict]], fail: str) -> dict:
         errors: list[str] = []
         for path, params in attempts:

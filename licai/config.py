@@ -92,9 +92,9 @@ class Settings:
     keep_earn: bool = True
     min_apr: Decimal = Decimal("0")
     max_apr: Decimal = Decimal("200")
-    asset_allowlist: list[str] = field(default_factory=lambda: ["USDT", "BFUSD"])
+    asset_allowlist: list[str] = field(default_factory=list)
     asset_denylist: list[str] = field(default_factory=list)
-    margin_earn_assets: list[str] = field(default_factory=lambda: ["USDT", "BFUSD"])
+    margin_earn_assets: list[str] = field(default_factory=list)
     settle_seconds: int = 3
     recv_window: int = 5000
     hedge_symbol: str = "ETHUSDT"
@@ -160,6 +160,13 @@ class Settings:
         return seen
 
 
+def _upper_list(raw: dict, key: str) -> list[str]:
+    """配置里缺这个键、或写成空列表，都表示不额外限制。"""
+    if key not in raw or raw.get(key) is None:
+        return []
+    return [str(x).upper() for x in (raw.get(key) or []) if str(x).strip()]
+
+
 def load_settings(config_path: str | Path | None = None, dry_run_override: bool | None = None) -> Settings:
     load_dotenv(ROOT / ".env")
     path = Path(config_path) if config_path else ROOT / "config.yaml"
@@ -202,9 +209,9 @@ def load_settings(config_path: str | Path | None = None, dry_run_override: bool 
         keep_earn=keep_earn,
         min_apr=d(raw.get("min_apr", "0")),
         max_apr=d(raw.get("max_apr", "200")),
-        asset_allowlist=[str(x).upper() for x in (raw.get("asset_allowlist") or raw.get("margin_earn_assets") or ["USDT", "BFUSD"])],
+        asset_allowlist=_upper_list(raw, "asset_allowlist"),
         asset_denylist=[str(x).upper() for x in (raw.get("asset_denylist") or [])],
-        margin_earn_assets=[str(x).upper() for x in (raw.get("margin_earn_assets") or ["USDT", "BFUSD"])],
+        margin_earn_assets=_upper_list(raw, "margin_earn_assets"),
         settle_seconds=int(raw.get("settle_seconds", 3)),
         hedge_symbol=normalize_hedge_symbol(str(raw.get("hedge_symbol", "ETHUSDT")), allowed),
         hedge_symbols=allowed,
