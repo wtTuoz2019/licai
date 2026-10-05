@@ -17,12 +17,24 @@ def apr_percent(apr: Decimal) -> Decimal:
     return apr if apr > 1 else apr * Decimal("100")
 
 
+_BFUSD_TIER_USDT = Decimal("800")
+
+
 def apr_choice_text(product: FlexibleProduct) -> str:
-    """选币用的年化。BFUSD 在 800U 以上用理财页预估，800U 以内的更高一日只写在后面。"""
+    """BFUSD：账户资金不超过 800U 用高档，超过则用理财页年化。"""
     text = f"{apr_percent(product.apr):.2f}%"
-    small = (product.raw or {}).get("small_balance_apr")
-    if small not in (None, "", "0"):
-        text += f"（800U以上；800U以内 {apr_percent(d(small)):.2f}%）"
+    raw = product.raw or {}
+    tier = raw.get("apr_tier")
+    funds = d(raw.get("account_funds") or 0)
+    fund_text = f"资金 {fmt_amount(funds, 2)}U" if funds > 0 else "资金未知"
+    base = raw.get("base_apr")
+    small = raw.get("small_balance_apr")
+    if tier == "under_800":
+        return text + f"（{fund_text}，800U以内）"
+    if tier == "over_800" and small not in (None, "", "0"):
+        return text + f"（{fund_text}，800U以上；800U以内 {apr_percent(d(small)):.2f}%）"
+    if small not in (None, "", "0") and base not in (None, "", "0"):
+        return text + f"（800U以上 {apr_percent(d(base)):.2f}%，800U以内 {apr_percent(d(small)):.2f}%）"
     return text
 
 
@@ -93,6 +105,34 @@ class Pipeline:
             return configured
         return {asset for asset, rate in self._collateral_rate_map().items() if rate > 0}
 
+    def _account_funds(self) -> Decimal:
+        """统一账户权益，加上还在现货、没进统一账户的稳定币。"""
+        equity = Decimal("0")
+        try:
+            if self.settings.unified_account:
+                equity = self.futures.account_equity()
+        except BinanceAPIError:
+            equity = Decimal("0")
+        spot = Decimal("0")
+        for asset in ("USDT", "USDC", "BFUSD", "RWUSD"):
+            try:
+                spot += self.earn.spot_free(asset)
+            except BinanceAPIError:
+                continue
+        return equity + spot
+
+    def _bfusd_product(self) -> FlexibleProduct:
+        product = self.earn.bfusd_product()
+        raw = dict(product.raw or {})
+        base = d(raw.get("base_apr") or product.apr)
+        small = d(raw.get("small_balance_apr") or 0)
+        funds = self._account_funds()
+        raw["account_funds"] = str(funds)
+        raw["base_apr"] = str(base)
+        use_small = small > base and funds > 0 and funds <= _BFUSD_TIER_USDT
+        raw["apr_tier"] = "under_800" if use_small else "over_800"
+        return replace(product, apr=small if use_small else base, raw=raw)
+
     def list_products(self) -> list[FlexibleProduct]:
         now = time.monotonic()
         if self._product_list is not None and now - self._product_list_at < 60:
@@ -114,7 +154,7 @@ class Pipeline:
                 product.margin_token = f"LD{product.asset}"
         rates = self._collateral_rate_map()
         if rates.get("BFUSD", Decimal("0")) > 0:
-            filtered.append(self.earn.bfusd_product())
+            filtered.append(self._bfusd_product())
         if rates.get("RWUSD", Decimal("0")) > 0:
             filtered.append(self.earn.rwusd_product())
         self._product_list = filtered
@@ -325,7 +365,7 @@ class Pipeline:
             holdings.append((product, amount))
         bfusd = max(self.earn.bfusd_balance(), self.earn.spot_free("BFUSD"))
         if bfusd > 0:
-            holdings.append((self.earn.bfusd_product(), bfusd))
+            holdings.append((self._bfusd_product(), bfusd))
         rwusd = max(self.earn.rwusd_balance(), self.earn.spot_free("RWUSD"))
         if rwusd > 0:
             holdings.append((self.earn.rwusd_product(), rwusd))
@@ -365,7 +405,7 @@ class Pipeline:
         holdings, bfusd_amt = split("BFUSD", "bfusd")
         bfusd_show = max(bfusd_amt, pm.get("BFUSD", Decimal("0")))
         if bfusd_show > 0:
-            product = self.earn.bfusd_product()
+            product = self._bfusd_product()
             if pm.get("BFUSD", Decimal("0")) >= bfusd_amt and pm.get("BFUSD", Decimal("0")) > 0:
                 product = replace(product, raw={**product.raw, "located": "pm"})
             holdings.append((product, bfusd_show))

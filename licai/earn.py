@@ -305,23 +305,23 @@ class EarnAPI:
         return rank
 
     def bfusd_rate_pair(self) -> tuple[Decimal, Decimal]:
-        """比较用理财页预估；最近一日更高时，那是 800U 以内的高档。
+        """返回 (800U以上的页面年化, 800U以内的更高一日)。
 
-        理财页 BFUSD 预估年化与近 7 日 rateHistory 均值一致。
-        最近一日（例如 4.27%）只作用在 800U 以内，余额更大时按页面上的较低一档计。
+        理财页预估与近 7 日均值一致，给余额超过 800U 的账户用。
+        最近一日更高时，那是 800U 以内的高档。用哪一档由账户资金决定。
         """
         latest, average = self._daily_and_average("/sapi/v1/bfusd/history/rateHistory", days=7)
         card = self._homepage_apr("BFUSD")
-        rank = card if card > 0 else average if average > 0 else latest
-        small = latest if rank > 0 and latest > rank else Decimal("0")
-        return rank, small
+        base = card if card > 0 else average if average > 0 else latest
+        small = latest if base > 0 and latest > base else Decimal("0")
+        return base, small
 
     def bfusd_product(self) -> FlexibleProduct:
-        rank, small = self.bfusd_rate_pair()
-        extra: dict[str, object] = {}
+        base, small = self.bfusd_rate_pair()
+        extra: dict[str, object] = {"base_apr": str(base)}
         if small > 0:
             extra["small_balance_apr"] = str(small)
-        return self._special_product("BFUSD", "bfusd", rank, extra)
+        return self._special_product("BFUSD", "bfusd", base, extra)
 
     def _daily_and_average(self, path: str, days: int) -> tuple[Decimal, Decimal]:
         if not self.client.api_key:
