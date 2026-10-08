@@ -785,12 +785,14 @@ class HedgeCycle:
 
             # 双边未成时前几轮保持偏防守，少贴盘口；单边补缺才积极追价
             dual_open = legs.long_qty <= 0 and legs.short_qty <= 0
-            # 单边且价格优势：停在更优挂单价，不往盘口追
+            # 单边：优势或轻微不利（<2bp）贴盘口挂着，不追价撤挂
             fav = False
+            mild = False
             if naked and not reduce_only and naked_since is not None:
                 slip, _, _ = self._second_leg_slip(legs, anchor)
                 fav = slip is not None and slip <= 0
-            if fav:
+                mild = slip is not None and Decimal("0") < slip < Decimal("2")
+            if fav or mild:
                 aggressive = False
                 quote_pass = 0
             else:
@@ -820,11 +822,13 @@ class HedgeCycle:
                 naked_since = time.monotonic()
                 anchor = legs.long_entry if legs.long_qty > 0 else legs.short_entry
 
-            # 等待期间轮询：平衡 / 优势继续挂 / 不利才兜底
+            # 等待期间轮询：平衡 / 优势或轻微不利继续挂 / 较大不利才短等兜底
             if naked and not reduce_only:
                 slip, _, _ = self._second_leg_slip(legs, anchor)
                 if slip is not None and slip <= 0:
                     round_wait = wait
+                elif slip is not None and slip < Decimal("2"):
+                    round_wait = max(wait, 1.0)
                 else:
                     round_wait = min(wait, self._hedge_max_wait_seconds())
             else:
@@ -928,8 +932,8 @@ class HedgeCycle:
         # 仍优势（补多成本更低 / 补空卖价更高）：一直挂，不因时间市价
         if slip <= 0:
             return None
-        # 已不利但未超滑点：按短超时市价，避免裸腿拖着
-        wait_limit = self._hedge_max_wait_seconds()
+        # 轻微不利多挂一会儿；接近滑点上限才用短超时，少吃单
+        wait_limit = 3.0 if slip < Decimal("2") else self._hedge_max_wait_seconds()
         if naked_since is not None and elapsed >= wait_limit:
             return (
                 f"第二腿不利 {fmt_amount(slip, 2)}bp，已等 {elapsed:.2f}s≥{wait_limit:.2f}s，"
