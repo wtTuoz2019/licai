@@ -35,6 +35,13 @@ def _post_only_reject(step: StepResult) -> bool:
     return "-5022" in text or "post only" in text or "could not be executed as maker" in text
 
 
+def _reduce_only_reject(step: StepResult) -> bool:
+    if step.ok:
+        return False
+    text = str(step.detail or "").lower()
+    return "-2022" in text or "reduceonly" in text or "reduce only" in text
+
+
 def _order_filled_hint(step: StepResult) -> bool:
     text = str(step.detail or "")
     if "已挂未成交" in text:
@@ -1322,10 +1329,9 @@ class HedgeCycle:
 
     def _quote_side(self, order_side: str, position_side: str, qty: Decimal, reduce_only: bool) -> list[StepResult]:
         """
-        平仓(reduce_only)：只挂 GTX，绝不市价；长窗口追价直到成交或超时失败。
-        补仓：挂在盘口内侧 1 档（价差只有 1 档就排在买一/卖一）。
-        优势方向上价格继续走，这张单先留 2 秒再跟着改，吃到价差又少撤单。
-        不利达到滑点上限立刻市价；刚转不利则先贴盘口，超过短等待再市价。
+        平仓 / 补仓都挂在盘口内侧 1 档（价差只有 1 档就排买一/卖一）。
+        贴着盘口就留着；盘口挪了先留满 2 秒再跟着改，少撤单、多排队。
+        平仓只挂不市价，超时交给外层继续；补仓不利超过滑点或短等待才市价。
         """
         steps: list[StepResult] = []
         done_name = f"已平 {position_side}" if reduce_only else f"已补 {position_side}"
@@ -1357,82 +1363,88 @@ class HedgeCycle:
 
             fav = False
             slip = Decimal("0")
-            bid = ask = Decimal("0")
-            if allow_market and start_bid > 0 and start_ask > 0:
-                try:
-                    bid, ask = self.futures.book(self.symbol, force=True)
-                except BinanceAPIError:
-                    bid = ask = Decimal("0")
-                if bid > 0 and ask > 0:
-                    # 补多：卖一更低=优势；补空：买一更高=优势
-                    if order_side == "BUY":
-                        slip = (ask - start_ask) / start_ask * Decimal("10000")
-                    else:
-                        slip = (start_bid - bid) / start_bid * Decimal("10000")
-                    fav = slip <= 0
-                    if slip >= self._hedge_max_slippage_bps():
+            try:
+                bid, ask = self.futures.book(self.symbol, force=True)
+            except BinanceAPIError:
+                bid = ask = Decimal("0")
+
+            if allow_market and start_bid > 0 and start_ask > 0 and bid > 0 and ask > 0:
+                # 补多：卖一更低=优势；补空：买一更高=优势
+                if order_side == "BUY":
+                    slip = (ask - start_ask) / start_ask * Decimal("10000")
+                else:
+                    slip = (start_bid - bid) / start_bid * Decimal("10000")
+                fav = slip <= 0
+                if slip >= self._hedge_max_slippage_bps():
+                    steps.append(
+                        StepResult(
+                            "补仓逃逸",
+                            True,
+                            f"{position_side} 相对开始不利 {fmt_amount(slip, 2)}bp，改市价",
+                        )
+                    )
+                    break
+                if slip > 0:
+                    if adverse_since is None:
+                        adverse_since = time.monotonic()
+                    waited = time.monotonic() - adverse_since
+                    # 轻微不利（<2bp）多等一会儿；接近滑点上限才用短超时
+                    wait_limit = 3.0 if slip < Decimal("2") else self._hedge_max_wait_seconds()
+                    if waited >= wait_limit:
                         steps.append(
                             StepResult(
-                                "补仓逃逸",
+                                "补仓不利",
                                 True,
-                                f"{position_side} 相对开始不利 {fmt_amount(slip, 2)}bp，改市价",
+                                f"{position_side} 不利 {fmt_amount(slip, 2)}bp，已等 {waited:.2f}s，改市价",
                             )
                         )
                         break
-                    if slip > 0:
-                        if adverse_since is None:
-                            adverse_since = time.monotonic()
-                        waited = time.monotonic() - adverse_since
-                        wait_limit = self._hedge_max_wait_seconds()
-                        if waited >= wait_limit:
-                            steps.append(
-                                StepResult(
-                                    "补仓不利",
-                                    True,
-                                    f"{position_side} 不利 {fmt_amount(slip, 2)}bp，已等 {waited:.2f}s，改市价",
-                                )
-                            )
-                            break
-                    else:
-                        adverse_since = None
-                    tick, _step = self.futures.filters(self.symbol)
-                    target = self._touch_maker_price(order_side, bid, ask, tick)
-                    resting = self._open_maker_px(order_side, position_side, bid, ask)
-                    now = time.monotonic()
-                    if resting is not None and quote_at <= 0:
-                        quote_at = now
-                    age = (now - quote_at) if quote_at > 0 else 0.0
-                    at_touch = resting is not None and abs(resting - target) <= tick
-                    # 还贴着盘口就留着；优势方向上盘口挪了，也先等满 2 秒再改价
-                    if resting is not None and (at_touch or (fav and age < REFILL_QUOTE_DWELL)):
-                        steps.append(
-                            StepResult(
-                                "挂单排队",
-                                True,
-                                f"已挂未成交 @ {fmt_amount(resting)}，贴盘目标 {fmt_amount(target)}，"
-                                f"已等 {age:.1f}s",
-                            )
-                        )
-                        if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=wait):
-                            steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
-                            return steps
-                        continue
-                    quote_at = now
+                else:
+                    adverse_since = None
 
-            # 平仓才向外追价。补仓贴着买一/卖一内侧 1 档
-            aggressive = not allow_market
+            if bid > 0 and ask > 0:
+                tick, _step = self.futures.filters(self.symbol)
+                target = self._touch_maker_price(order_side, bid, ask, tick)
+                resting = self._open_maker_px(order_side, position_side, bid, ask)
+                now = time.monotonic()
+                if resting is not None and quote_at <= 0:
+                    quote_at = now
+                age = (now - quote_at) if quote_at > 0 else 0.0
+                at_touch = resting is not None and abs(resting - target) <= tick
+                # 贴着盘口就留着；盘口挪了也先等满 2 秒再改（平仓、补仓一样）
+                hold = resting is not None and (at_touch or age < REFILL_QUOTE_DWELL)
+                if hold and allow_market and (not fav) and slip > 0:
+                    # 补仓已不利：不再死守旧价，尽快贴新盘口
+                    hold = at_touch
+                if hold:
+                    steps.append(
+                        StepResult(
+                            "挂单排队",
+                            True,
+                            f"已挂未成交 @ {fmt_amount(resting)}，贴盘目标 {fmt_amount(target)}，"
+                            f"已等 {age:.1f}s",
+                        )
+                    )
+                    if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=wait):
+                        steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
+                        return steps
+                    continue
+                quote_at = now
+
             extra = self._side_pass(
                 order_side,
                 position_side,
                 qty,
                 reduce_only,
                 market=False,
-                aggressive=aggressive,
-                pass_n=i if aggressive else 0,
-                touch=allow_market,
+                aggressive=False,
+                pass_n=0,
+                touch=True,
             )
             steps.extend(extra)
-            if any(_order_filled_hint(item) for item in extra):
+            if any(_order_filled_hint(item) for item in extra) or any(
+                _reduce_only_reject(item) for item in extra
+            ):
                 legs = self.futures.legs(self.symbol)
                 if finished(legs):
                     steps.append(StepResult(done_name, True, self._legs_text(legs)))
@@ -1449,15 +1461,20 @@ class HedgeCycle:
                 break
 
         if not allow_market:
+            legs = self.futures.legs(self.symbol)
+            if finished(legs):
+                steps.append(StepResult(done_name, True, self._legs_text(legs)))
+                return steps
             try:
                 self.futures.cancel_open(self.symbol)
             except BinanceAPIError:
                 pass
+            # 外层还会继续平剩余，中间超时不算整单失败
             steps.append(
                 StepResult(
-                    f"{position_side} 未完成",
-                    False,
-                    f"平仓只允许挂单，已追价 {tries} 次仍未成交，已撤单。请等盘口更稳后再收。"
+                    "本轮平仓挂单超时",
+                    True,
+                    f"已追价 {tries} 次仍未成交，已撤单，外层继续。"
                     f" {self._legs_text(self.futures.legs(self.symbol))}",
                 )
             )
@@ -1519,6 +1536,18 @@ class HedgeCycle:
             market=market,
             price_match="QUEUE" if use_queue else None,
         )
+        # 平仓单刚成交后仓位已空，再挂 ReduceOnly 会 -2022，按已平成功处理
+        if reduce_only and _reduce_only_reject(placed):
+            legs = self.futures.legs(self.symbol)
+            current = legs.long_qty if position_side == "LONG" else legs.short_qty
+            if current <= 0:
+                return [
+                    StepResult(
+                        f"已平 {position_side}",
+                        True,
+                        f"ReduceOnly 被拒时仓位已空：{self._legs_text(legs)}",
+                    )
+                ]
         # GTX 被盘口吃掉（-5022）：向外退一档再挂，禁止同价重试
         if (not market) and _post_only_reject(placed):
             self._cancel_open_clean()

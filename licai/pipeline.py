@@ -671,6 +671,9 @@ class Pipeline:
     def _fund_spot_asset(self, asset: str, amount: Decimal) -> list[StepResult]:
         if self._wallet_transfer_blocked:
             return self._spot_via_ldusdt(asset, amount)
+        # BFUSD / RWUSD 不能走 MAIN_PORTFOLIO_MARGIN（会 -3027），优先用理财代币转入
+        if asset in {"BFUSD", "RWUSD"}:
+            return self._fund_earn_token(asset, amount)
         step = self._move_spot(asset, amount)
         if step.ok:
             return [step]
@@ -683,6 +686,50 @@ class Pipeline:
             "API 没有现货↔统一账户划转权限（-1002）。不划 U 本位，改用 USDT 活期 LDUSDT 入金。",
         )
         return [note, *self._spot_via_ldusdt(asset, amount)]
+
+    def _fund_earn_token(self, asset: str, amount: Decimal) -> list[StepResult]:
+        """BFUSD / RWUSD：先试 EARN_TO_FUTURE；现货划转会 -3027；再不行就赎回走 LDUSDT。"""
+        steps: list[StepResult] = []
+        try:
+            cap = self.futures.earn_to_pm_balance(asset)
+        except BinanceAPIError as exc:
+            cap = Decimal("0")
+            steps.append(StepResult(f"查询 {asset} 可转入", True, str(exc)))
+        move = min(amount, cap) if cap > 0 else Decimal("0")
+        move = move.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+        if move >= SPOT_MIN:
+            step = self._mutate(
+                f"{asset} {fmt_amount(move)} 从理财转入统一账户",
+                lambda qty=move: self.futures.earn_to_pm(asset, qty),
+            )
+            steps.append(step)
+            if step.ok and not step.dry_run:
+                self.earn.invalidate()
+            if step.ok:
+                leftover = self.spot_cash(asset)
+                if leftover < SPOT_MIN:
+                    return steps
+                amount = leftover
+        # 仍在现货、万向划转又不认这个币：赎回成稳定币再走 LDUSDT
+        note = StepResult(
+            f"{asset} 改走赎回",
+            True,
+            f"现货 {asset} 不能直接划入统一账户（-3027），先赎回再申购 USDT 活期入金。",
+        )
+        via = self._spot_via_ldusdt(asset, amount)
+        if any(not s.ok for s in via):
+            # 仓位已齐时，理财代币入金失败不盖掉收利；留着下次换年化/入场再处理
+            via = [
+                s
+                if s.ok
+                else StepResult(
+                    s.name,
+                    True,
+                    f"{s.detail}（{asset} 暂留现货，对冲已齐，下次再入统一账户）",
+                )
+                for s in via
+            ]
+        return [*steps, note, *via]
 
     def _spot_via_ldusdt(self, asset: str, amount: Decimal) -> list[StepResult]:
         steps: list[StepResult] = []

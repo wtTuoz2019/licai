@@ -50,7 +50,13 @@ def _action_ok(steps: list[StepResult], *, error: Exception | None = None) -> bo
                 continue
             if _post_only_fail(s):
                 continue
-            if s.name in {"PostOnly 改价", "第二腿追价", "单边兜底", "挂单未齐"}:
+            if s.name in {"PostOnly 改价", "第二腿追价", "单边兜底", "挂单未齐", "本轮平仓挂单超时"}:
+                continue
+            text = str(s.detail or "").lower()
+            # ReduceOnly 拒单但仓位已平，或理财代币划转失败但仓位已齐，不盖掉收利成功
+            if "-2022" in text or "reduceonly" in text:
+                continue
+            if "-3027" in text or "not a valid margin asset" in text:
                 continue
             # 其它失败（保证金不够、异常等）仍算失败
             return False
