@@ -64,9 +64,9 @@ hedge_max_slippage_bps: 3.5  # 相对第一腿成交价，BBO 不利偏离超过
 watch_seconds: 60            # 命令行盯盘间隔
 live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
 auto_harvest_seconds: 60     # 开启「自动收利」后后台检查间隔
-# 自动收利：无仓且严平稳时自动开仓；有仓须 MACD 金叉/死叉，且浮盈达到 harvest_pos_pct
+# 自动收利：无仓须金叉/死叉 + 严平稳才开仓；有仓须金叉/死叉，且浮盈达到 harvest_pos_pct
 # 接口示例 https://c7.pro/capi/indicator
-macd_auto_harvest: true       # 定稿：等金叉/死叉，且浮盈达到名义的 10% 才收
+macd_auto_harvest: true       # 定稿：开仓/收利都等金叉或死叉；收利还要浮盈达到名义的 10%
 macd_indicator_url: "https://c7.pro/capi/indicator"
 min_free_usdt_keep: 0        # 默认不留现货 USDT
 cycle_sweep_all: true        # 启动时把现货闲置 USDT 申购 USDT/BFUSD 活期（仓位继续当保证金）

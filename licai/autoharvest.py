@@ -26,7 +26,7 @@ def _qty(legs: dict, key: str):
 class AutoHarvestWorker:
     """后台轮询（账号开启「自动收利」）：
 
-    - 无仓：严平稳时自动双边开仓（不看 MACD）
+    - 无仓：金叉/死叉那一根 + 严平稳，才自动双边开仓（上涨先多、下跌先空）
     - 有仓：金叉/死叉那一根 + 盈利腿浮盈达到名义比例 + 冷却 + 收利宽平稳
     手动一键入场/收利不受影响。
     """
@@ -44,10 +44,10 @@ class AutoHarvestWorker:
         self._thread = threading.Thread(target=self._loop, name="auto-harvest", daemon=True)
         self._thread.start()
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
-            note = "有仓须金叉/死叉，且浮盈达到名义比例"
+            note = "无仓/有仓都须金叉或死叉；有仓还要浮盈达到名义比例"
         else:
-            note = "有仓按名义比例收盈利腿，价格平稳且过了冷却"
-        _print(f"自动收利后台已启动（无仓严平稳开仓；{note}）")
+            note = "MACD 过滤已关：无仓严平稳开仓；有仓按名义比例收"
+        _print(f"自动收利后台已启动（{note}）")
 
     def stop(self) -> None:
         self._stop.set()
@@ -111,7 +111,7 @@ class AutoHarvestWorker:
             self.ops.end_action(account.id)
 
     def _maybe_enter(self, account, live: dict) -> None:
-        """无仓：价格平稳则自动双边开仓，不要求 MACD。"""
+        """无仓：金叉/死叉那一根 + 严平稳，才自动双边开仓。"""
         stability = live.get("stability") or {}
         enter = live.get("enter") or {}
         if not stability.get("stable"):
@@ -120,7 +120,12 @@ class AutoHarvestWorker:
             return
         if not enter.get("stable_ok", stability.get("stable")):
             return
-        _print(f"自动开仓触发 account={account.id} 价格平稳，双边挂单入场")
+        macd_note = "未启用 MACD 过滤"
+        if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
+            side, macd_note = self._macd_side()
+            if not side:
+                return
+        _print(f"自动开仓触发 account={account.id} 严平稳 · {macd_note}，双边挂单入场")
         result = self.ops.run_action(
             account,
             "enter",
@@ -136,6 +141,10 @@ class AutoHarvestWorker:
             fails = [s for s in steps if not s.get("ok")]
             pick = fails or steps[-4:]
             detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+        if ok and bool(getattr(self.ops.base, "macd_auto_harvest", True)):
+            cross = fetch_macd_cross(getattr(self.ops.base, "macd_indicator_url", None))
+            if cross:
+                self._last_cross_key = f"{cross.kind}:{cross.time}"
         _print(f"自动开仓结束 account={account.id} ok={ok} {detail[:500]}")
 
     def _maybe_harvest(self, account, live: dict) -> None:

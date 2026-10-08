@@ -409,6 +409,7 @@ def schedule_hint(settings: Settings) -> str:
         f"仓位浮盈大约每 {int(settings.live_poll_seconds)} 秒更新。"
         f"入场要够稳（15 分 ≤ {_pct(settings.stable_range_pct)}%）；"
         f"收利更宽（15 分 ≤ {_pct(getattr(settings, 'harvest_stable_range_pct', None) or settings.stable_range_pct)}%）。"
+        f"自动开仓：{macd or '严平稳即可；'}无仓时双边入场。"
         f"自动收利：{macd}盈利腿达到单边名义的 {pos_pct:.0f}% 才收，"
         f"距上次平仓超过 {settings.cooldown_minutes} 分钟。"
     )

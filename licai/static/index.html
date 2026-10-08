@@ -530,7 +530,7 @@
             <span class="muted">USDT</span>
             <button type="button" id="btn-save-tp">保存</button>
             <button type="button" id="btn-tp-auto" hidden>恢复自动</button>
-            <label class="auto-toggle" title="无仓须严平稳才自动开仓；有仓须金叉收空/死叉收多，并用更宽的收利平稳。手动入场/收利不受影响">
+            <label class="auto-toggle" title="无仓须金叉/死叉那一根且严平稳才自动开仓；有仓须金叉收空/死叉收多，并用更宽的收利平稳。手动入场/收利不受影响">
               <input type="checkbox" id="auto-harvest" />
               自动收利
             </label>
@@ -1393,8 +1393,8 @@
         const flat = toNum(legs.long_qty) <= 0 && toNum(legs.short_qty) <= 0;
         if (flat) {
           why = ((s.stability && s.stability.stable)
-            ? "自动开仓待命：无仓且已平稳，后台会双边入场。 "
-            : "自动开仓已开：无仓，等价格平稳后自动双边开仓。 ") + why;
+            ? "自动开仓待命：无仓且已平稳，等金叉/死叉那一根会双边入场。 "
+            : "自动开仓已开：无仓，须金叉/死叉 + 严平稳才双边开仓。 ") + why;
         } else {
           why = (h.can_click
             ? "自动收利待命：浮盈/冷却/收利平稳已够，等 MACD 金叉收空或死叉收多。 "
@@ -2025,7 +2025,7 @@
           persistFunds();
         }
         setActionMsg(on
-          ? "已开启自动：无仓严平稳开仓；有仓须金叉/死叉+收利宽平稳"
+          ? "已开启自动：无仓须金叉/死叉+严平稳开仓；有仓须金叉/死叉+收利宽平稳"
           : "已关闭自动收利");
         await pollLive();
       } catch (err) {
