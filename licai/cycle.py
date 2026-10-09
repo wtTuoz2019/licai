@@ -1391,18 +1391,6 @@ class HedgeCycle:
                 if slip > 0:
                     if adverse_since is None:
                         adverse_since = time.monotonic()
-                    waited = time.monotonic() - adverse_since
-                    # 轻微不利（<2bp）多等一会儿；接近滑点上限才用短超时
-                    wait_limit = 3.0 if slip < Decimal("2") else self._hedge_max_wait_seconds()
-                    if waited >= wait_limit:
-                        steps.append(
-                            StepResult(
-                                "补仓不利",
-                                True,
-                                f"{position_side} 不利 {fmt_amount(slip, 2)}bp，已等 {waited:.2f}s，改市价",
-                            )
-                        )
-                        break
                 else:
                     adverse_since = None
 
@@ -1414,6 +1402,27 @@ class HedgeCycle:
                 if resting is not None and quote_at <= 0:
                     quote_at = now
                 age = (now - quote_at) if quote_at > 0 else 0.0
+                # 不利改市价：当前这张挂单至少留满 2 秒，避免刚改价就被市价 sweep
+                if (
+                    allow_market
+                    and slip > 0
+                    and adverse_since is not None
+                    and resting is not None
+                ):
+                    waited = now - adverse_since
+                    wait_limit = 3.0 if slip < Decimal("2") else max(
+                        self._hedge_max_wait_seconds(), REFILL_QUOTE_DWELL
+                    )
+                    if waited >= wait_limit and age >= REFILL_QUOTE_DWELL:
+                        steps.append(
+                            StepResult(
+                                "补仓不利",
+                                True,
+                                f"{position_side} 不利 {fmt_amount(slip, 2)}bp，"
+                                f"累计 {waited:.2f}s、本挂 {age:.1f}s，改市价",
+                            )
+                        )
+                        break
                 at_touch = resting is not None and abs(resting - target) <= tick
                 # 贴着盘口就留着；盘口挪了也先等满 2 秒再改（平仓、补仓一样）
                 hold = resting is not None and (at_touch or age < REFILL_QUOTE_DWELL)
