@@ -66,7 +66,7 @@ live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
 auto_harvest_seconds: 60     # 开启「自动收利」后后台检查间隔
 # 自动收利：无仓须金叉/死叉 + 严平稳才开仓；有仓须金叉/死叉，且浮盈达到 harvest_pos_pct
 # 接口示例 https://c7.pro/capi/indicator
-macd_auto_harvest: true       # 定稿：开仓/收利都等金叉或死叉；收利还要浮盈达到名义的 10%
+macd_auto_harvest: true       # 定稿：开仓/收利都等金叉或死叉；收利还要浮盈达到名义比例
 macd_indicator_url: "https://c7.pro/capi/indicator"
 min_free_usdt_keep: 0        # 默认不留现货 USDT
 cycle_sweep_all: true        # 启动时把现货闲置 USDT 申购 USDT/BFUSD 活期（仓位继续当保证金）
@@ -76,7 +76,8 @@ maker_fee_rate: 0.0002
 taker_fee_rate: 0.0005
 min_profit_fee_multiple: 8   # 自动门槛：浮盈至少覆盖约 8 倍手续费
 harvest_principal_pct: 0.01  # 还没仓位时，至少为本金的 1%
-harvest_pos_pct: 0.10        # 单边名义约 10% 再收。1000U、100x、占用 40% 时单边名义 2 万，约 2000U（2 倍本金）
+# 回测（BTCUSDC 90d、贴盘 maker）：转入理财净额在名义约 3% 最高；1.5%–3% 为平台区
+harvest_pos_pct: 0.03        # 单边名义 3% 再收。1000U、100x、占用 40% → 名义约 2 万，每次约 600U
 harvest_sqrt_coeff: 0.5      # 无仓位时 0.5×√本金兜底
 harvest_min_usdt: 1          # 绝对下限（结算币，USDT/USDC 都适用）
 cooldown_minutes: 15         # 两次平仓最短间隔

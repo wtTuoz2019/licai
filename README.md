@@ -36,7 +36,7 @@ python -m licai cycle --live --confirm
 - `scale_min_add_pct: 0.03` 目标仓位大 3% 以上才加
 - `hedge_qty: 0` 自动按理财仓位算；写成固定数量则不加仓
 - 每个账号可单独选套保币对：ETHUSDT / BTCUSDT / SOLUSDT / BNBUSDT，默认 ETHUSDT
-- `harvest_pos_pct: 0.025` 每次收利默认建议值 = 单边仓位名义 × 2.5%
+- `harvest_pos_pct: 0.03` 每次收利默认建议值 = 单边仓位名义 × 3%（回测转入理财最优）
 
 ## 服务器一键部署
 
