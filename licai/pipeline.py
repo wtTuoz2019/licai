@@ -619,6 +619,21 @@ class Pipeline:
             }
         )
 
+        rwusd = sum((amt for p, amt in holdings if p.kind == "rwusd"), Decimal("0"))
+        rw_in_pm = pm.get("RWUSD", Decimal("0"))
+        rw_rate = rate_of("RWUSD")
+        if rwusd > 0:
+            rows.append(
+                {
+                    "name": "RWUSD",
+                    "amount": fmt_amount(rwusd, 4),
+                    "in_pm": fmt_amount(rw_in_pm, 4),
+                    "rate": fmt_amount(rw_rate, 4) if rw_rate is not None else "-",
+                    "ok": rw_in_pm > 0 or equity > 0,
+                    "note": "RWUSD 可作为统一账户保证金。" if rwusd > 0 else "还没买 RWUSD。",
+                }
+            )
+
         if equity > 0:
             summary = f"统一账户权益约 {fmt_amount(equity, 4)} USDT，这部分已经能开合约。"
         else:

@@ -496,11 +496,8 @@
           <div class="kpi"><span>昨日收益</span><b id="earn-yesterday">-</b></div>
           <div class="kpi"><span>uniMMR</span><b id="mmr">-</b></div>
         </div>
-        <div class="funds">
+        <div class="funds" id="wallet-funds">
           <div class="kpi"><span>现货 USDT</span><b id="spot">-</b></div>
-          <div class="kpi" id="usdt-flex-box"><span id="usdt-flex-label">USDT 活期</span><b id="usdt-flex">-</b></div>
-          <div class="kpi"><span>BFUSD</span><b id="bfusd">-</b></div>
-          <div class="kpi"><span>理财合计</span><b id="earn-total">-</b></div>
         </div>
         <div class="chips" id="collateral" hidden></div>
         <div class="pos-row">
@@ -763,11 +760,7 @@
       $("earn-yesterday").textContent = "-";
       setMmr("-");
       $("spot").textContent = "-";
-      $("usdt-flex").textContent = "-";
-      const flexBox = $("usdt-flex-box");
-      if (flexBox) flexBox.hidden = true;
-      $("bfusd").textContent = "-";
-      $("earn-total").textContent = "-";
+      renderEarnKpis([]);
       $("long-qty").textContent = "-";
       $("short-qty").textContent = "-";
       $("long-entry").textContent = "仓位价 -";
@@ -1492,6 +1485,30 @@
       }
     }
 
+    function renderEarnKpis(holdings) {
+      const box = $("wallet-funds");
+      if (!box) return;
+      [...box.querySelectorAll(".kpi.earn-token")].forEach((el) => el.remove());
+      const rows = (holdings || []).filter((h) => toNum(h.amount) > 0);
+      if (!rows.length) {
+        const empty = document.createElement("div");
+        empty.className = "kpi earn-token";
+        empty.innerHTML = "<span>理财</span><b>0</b>";
+        box.appendChild(empty);
+        return;
+      }
+      rows.forEach((h) => {
+        const el = document.createElement("div");
+        el.className = "kpi earn-token";
+        const name = esc(h.label || h.asset || "理财");
+        const amt = esc(h.amount || "0");
+        const apr = toNum(h.apr);
+        const aprText = Number.isFinite(apr) && apr > 0 ? ` · ${esc(String(h.apr))}%` : "";
+        el.innerHTML = `<span>${name}${aprText}</span><b>${amt}</b>`;
+        box.appendChild(el);
+      });
+    }
+
     function render(s) {
       if (!s || !sameAccount(s.account && s.account.id)) return;
       if (s.ok === false || (s.error && !s.legs)) {
@@ -1505,14 +1522,7 @@
       $("ip").textContent = s.exit_ip || "-";
       $("proxy-mode").textContent = s.proxy_mode || "";
       $("spot").textContent = s.spot_usdt || "-";
-      const flexAmt = toNum(s.usdt_flexible);
-      $("usdt-flex").textContent = s.usdt_flexible || "0";
-      const flexLabel = $("usdt-flex-label");
-      if (flexLabel) flexLabel.textContent = s.usdt_flexible_label || "USDT 活期";
-      const flexBox = $("usdt-flex-box");
-      if (flexBox) flexBox.hidden = !(Number.isFinite(flexAmt) && flexAmt > 0);
-      $("bfusd").textContent = s.bfusd || "0";
-      $("earn-total").textContent = s.earn_total || "0";
+      renderEarnKpis(s.holdings || []);
       $("equity").textContent = s.account_total || s.pm_equity || "-";
       $("earn-yesterday").textContent = s.earn_yesterday || "0";
       $("mid-price").textContent = s.price || (s.stability && s.stability.mid) || "-";
@@ -1542,7 +1552,8 @@
       hideEditBoxes();
       const mg = s.margin || {};
       const box = $("collateral");
-      const rows = (mg.rows || []).filter((r) => Number(r.amount) > 0 || Number(r.in_pm) > 0);
+      // 理财代币已在上方 KPI 展示；这里只留有余额的抵押明细，避免灰尘现货刷屏
+      const rows = (mg.rows || []).filter((r) => toNum(r.amount) >= 1);
       box.hidden = rows.length === 0;
       box.innerHTML = "";
       rows.forEach((r) => {
