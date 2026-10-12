@@ -15,6 +15,9 @@ LIMIT_FILL_TRIES = 3
 FILL_POLL = 0.25
 SECOND_LEG_POLL = 0.1  # 单边敞口时 100ms 高频盯盘口/仓位
 REFILL_QUOTE_DWELL = 2.0  # 补仓：贴着盘口的挂单至少留 2 秒，再跟着改价
+CLOSE_QUEUE_BUMP_S = 12.0  # 平仓贴盘排队这么久未成：往对手价再靠一档（仍 GTX）
+CLOSE_QUEUE_MARKET_S = 25.0  # 平仓再挂这么久：市价扫尾，缩短单边敞口
+QUEUE_LOG_EVERY_S = 3.0  # 挂单排队日志节流，避免刷屏
 
 
 def _subscribed(steps: list[StepResult]) -> bool:
@@ -1360,6 +1363,9 @@ class HedgeCycle:
         i = 0
         adverse_since: float | None = None
         quote_at = 0.0
+        queue_since: float | None = None  # 贴盘连续排队起点（平仓专用）
+        last_queue_log = 0.0
+        close_bumped = False
         while True:
             legs = self.futures.legs(self.symbol)
             if finished(legs):
@@ -1398,6 +1404,17 @@ class HedgeCycle:
             if bid > 0 and ask > 0:
                 tick, _step = self.futures.filters(self.symbol)
                 target = self._touch_maker_price(order_side, bid, ask, tick)
+                # 平仓贴盘久等未成：改挂更靠对手价的一档（仍不穿价）
+                if reduce_only and close_bumped:
+                    tight = self._touch_maker_price(order_side, bid, ask, tick, inside=True)
+                    if order_side == "BUY":
+                        alt = self.futures.round_price(ask - tick, tick)
+                        if alt > tight and alt < ask:
+                            target = alt
+                    else:
+                        alt = self.futures.round_price(bid + tick, tick)
+                        if alt < tight and alt > bid:
+                            target = alt
                 resting = self._open_maker_px(order_side, position_side, bid, ask)
                 now = time.monotonic()
                 if resting is not None and quote_at <= 0:
@@ -1431,18 +1448,47 @@ class HedgeCycle:
                     # 补仓已不利：不再死守旧价，尽快贴新盘口
                     hold = at_touch
                 if hold:
-                    steps.append(
-                        StepResult(
-                            "挂单排队",
-                            True,
-                            f"已挂未成交 @ {fmt_amount(resting)}，贴盘目标 {fmt_amount(target)}，"
-                            f"已等 {age:.1f}s",
+                    if queue_since is None:
+                        queue_since = now
+                    queued = now - queue_since
+                    # 平仓：贴盘干等太久 → 先靠对手价，再久市价扫尾（缩短单边敞口）
+                    if reduce_only and queued >= CLOSE_QUEUE_MARKET_S:
+                        steps.append(
+                            StepResult(
+                                "平仓排队超时",
+                                True,
+                                f"{position_side} 贴盘已等 {queued:.1f}s 未成，改市价扫尾",
+                            )
                         )
-                    )
+                        allow_market = True
+                        break
+                    if reduce_only and (not close_bumped) and queued >= CLOSE_QUEUE_BUMP_S:
+                        close_bumped = True
+                        quote_at = 0.0
+                        queue_since = now
+                        steps.append(
+                            StepResult(
+                                "平仓加价排队",
+                                True,
+                                f"{position_side} 贴盘已等 {queued:.1f}s，往对手价靠一档继续挂",
+                            )
+                        )
+                        continue
+                    if now - last_queue_log >= QUEUE_LOG_EVERY_S or last_queue_log <= 0:
+                        last_queue_log = now
+                        steps.append(
+                            StepResult(
+                                "挂单排队",
+                                True,
+                                f"已挂未成交 @ {fmt_amount(resting)}，贴盘目标 {fmt_amount(target)}，"
+                                f"已等 {age:.1f}s",
+                            )
+                        )
                     if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=wait):
                         steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
                         return steps
                     continue
+                queue_since = None
                 quote_at = now
 
             extra = self._side_pass(
