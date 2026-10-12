@@ -95,6 +95,8 @@ switch_min_batch: 10         # 小于这个就并进本批或留到下次
 switch_max_batches: 5        # 点一次最多换几批，剩下再点
 switch_min_apr_gap: 0.1      # 目标年化至少高出 0.1 个百分点才自动/建议换（避免无意义抖动）
 auto_switch_earn: true       # 每日拉收益时，自动把可赎回的低收益理财换成当前最高（山寨活期会先兑 USDT）
+auto_sweep_spot: true        # 现货闲置 USDT/USDC 自动申购理财并入保证金
+auto_scale: true             # 有对冲且可加仓时，等金叉/死叉+平稳自动加仓（与自动开仓同一时机）
 
 # ---- Webshare 代理（秘钥优先放 .env 的 WEBSHARE_API_TOKEN）----
 # webshare_api_token: ""     # 一般不要写进 yaml，用环境变量

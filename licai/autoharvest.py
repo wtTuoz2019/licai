@@ -51,9 +51,15 @@ class AutoHarvestWorker:
             note = "无仓/有仓都须金叉或死叉；有仓还要浮盈达到名义比例"
         else:
             note = "MACD 过滤已关：无仓严平稳开仓；有仓按名义比例收"
-        switch_on = bool(getattr(self.ops.base, "auto_switch_earn", True))
-        switch_note = "每日拉收益后自动换低收益稳定币理财" if switch_on else "每日只拉收益、不自动换理财"
-        _print(f"自动收利后台已启动（{note}；{switch_note}）")
+        extras = []
+        if bool(getattr(self.ops.base, "auto_switch_earn", True)):
+            extras.append("每日换低收益理财")
+        if bool(getattr(self.ops.base, "auto_sweep_spot", True)):
+            extras.append("闲置现货自动申购")
+        if bool(getattr(self.ops.base, "auto_scale", True)):
+            extras.append("金叉/死叉自动加仓")
+        extra = "；".join(extras) if extras else "无额外理财自动化"
+        _print(f"自动收利后台已启动（{note}；{extra}）")
 
     def stop(self) -> None:
         self._stop.set()
@@ -175,14 +181,90 @@ class AutoHarvestWorker:
             live = self.ops.monitor(account)
             if not live.get("ok"):
                 return
+            # 现货加了 U：先申购理财入保证金（不等交叉）
+            if self._maybe_sweep_spot(account, live):
+                # 申购后权益变了，重拉再决定开仓/加仓
+                live = self.ops.monitor(account)
+                if not live.get("ok"):
+                    return
             legs = live.get("legs") or {}
             flat = _qty(legs, "long_qty") <= 0 and _qty(legs, "short_qty") <= 0
             if flat:
                 self._maybe_enter(account, live)
             else:
-                self._maybe_harvest(account, live)
+                # 有仓：优先收利；否则在好时机自动加仓
+                if not self._maybe_harvest(account, live):
+                    self._maybe_scale(account, live)
         finally:
             self.ops.end_action(account.id)
+
+    def _maybe_sweep_spot(self, account, live: dict) -> bool:
+        """现货闲置稳定币 → 申购理财并入统一账户。返回是否实际跑过申购。"""
+        if not bool(getattr(self.ops.base, "auto_sweep_spot", True)):
+            return False
+        spot = d(live.get("spot_usdt") or "0")
+        # 其它稳定币闲置也从 wallet_status / holdings 难直接读；现货 USDT 是主路径
+        if spot < 1:
+            return False
+        _print(f"自动归集现货 account={account.id} spot_usdt={spot}")
+        result = self.ops.run_action(
+            account,
+            "enter",
+            force=False,
+            mode="earn_only",
+            _locked=True,
+            auto=True,
+        )
+        ok = bool(result.get("ok"))
+        detail = result.get("reason") or ""
+        steps = result.get("steps") or []
+        if steps:
+            fails = [s for s in steps if not s.get("ok")]
+            pick = fails or steps[-4:]
+            detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+        _print(f"自动归集现货结束 account={account.id} ok={ok} {detail[:500]}")
+        return True
+
+    def _maybe_scale(self, account, live: dict) -> bool:
+        """有对冲且还能加：等金叉/死叉 + 入场级平稳，自动加仓。"""
+        if not bool(getattr(self.ops.base, "auto_scale", True)):
+            return False
+        enter = live.get("enter") or {}
+        stability = live.get("stability") or {}
+        if not enter.get("scale_ok"):
+            return False
+        if not enter.get("stable_ok", stability.get("stable")):
+            return False
+        macd_note = "未启用 MACD 过滤"
+        if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
+            side, macd_note = self._macd_side()
+            if not side:
+                return False
+        _print(
+            f"自动加仓触发 account={account.id} add={enter.get('add_qty')} "
+            f"target={enter.get('target_qty')} · {macd_note}"
+        )
+        result = self.ops.run_action(
+            account,
+            "scale",
+            force=False,
+            mode=None,
+            _locked=True,
+            auto=True,
+        )
+        ok = bool(result.get("ok"))
+        detail = result.get("reason") or ""
+        steps = result.get("steps") or []
+        if steps:
+            fails = [s for s in steps if not s.get("ok")]
+            pick = fails or steps[-4:]
+            detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+        if ok and bool(getattr(self.ops.base, "macd_auto_harvest", True)):
+            cross = fetch_macd_cross(getattr(self.ops.base, "macd_indicator_url", None))
+            if cross:
+                self._last_cross_key = f"{cross.kind}:{cross.time}"
+        _print(f"自动加仓结束 account={account.id} ok={ok} {detail[:500]}")
+        return True
 
     def _maybe_enter(self, account, live: dict) -> None:
         """无仓：金叉/死叉那一根 + 严平稳，才自动双边开仓。"""
@@ -221,26 +303,26 @@ class AutoHarvestWorker:
                 self._last_cross_key = f"{cross.kind}:{cross.time}"
         _print(f"自动开仓结束 account={account.id} ok={ok} {detail[:500]}")
 
-    def _maybe_harvest(self, account, live: dict) -> None:
+    def _maybe_harvest(self, account, live: dict) -> bool:
         harvest = live.get("harvest") or {}
         legs = live.get("legs") or {}
 
         side, macd_note = self._macd_side()
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
             if not side:
-                return
+                return False
             # 必须交叉那一根 + 收利平稳(更宽) + 浮盈 + 冷却
             if not harvest.get("stable_ok") or not harvest.get("cooldown_ok"):
-                return
+                return False
             if legs.get("missing"):
-                return
+                return False
             min_profit = d(harvest.get("min_profit") or "0")
             pnl = d(legs.get("long_pnl" if side == "LONG" else "short_pnl") or "0")
             if pnl <= 0 or pnl < min_profit:
-                return
+                return False
         else:
             if not harvest.get("can_click"):
-                return
+                return False
             side = None
             macd_note = "未启用 MACD 过滤"
 
@@ -269,3 +351,4 @@ class AutoHarvestWorker:
             if cross and cross.harvest_side == side:
                 self._last_cross_key = f"{cross.kind}:{cross.time}"
         _print(f"自动收利结束 account={account.id} ok={ok} {detail[:500]}")
+        return True

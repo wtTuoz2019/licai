@@ -146,6 +146,8 @@ class Settings:
     switch_max_batches: int = 5
     switch_min_apr_gap: Decimal = Decimal("0.1")
     auto_switch_earn: bool = True
+    auto_sweep_spot: bool = True
+    auto_scale: bool = True
     webshare_api_token: str = ""
     webshare_mode: str = "direct"
     webshare_country: str = ""
@@ -261,6 +263,8 @@ def load_settings(config_path: str | Path | None = None, dry_run_override: bool 
         switch_max_batches=int(raw.get("switch_max_batches", 5)),
         switch_min_apr_gap=d(raw.get("switch_min_apr_gap", "0.1")),
         auto_switch_earn=bool(raw.get("auto_switch_earn", True)),
+        auto_sweep_spot=bool(raw.get("auto_sweep_spot", True)),
+        auto_scale=bool(raw.get("auto_scale", True)),
         webshare_api_token=(
             os.getenv("WEBSHARE_API_TOKEN", "").strip()
             or str(raw.get("webshare_api_token") or "").strip()
