@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from . import earn as earn_mod
 from .config import d
 from .macd import fetch_macd_cross
 
@@ -24,10 +26,10 @@ def _qty(legs: dict, key: str):
 
 
 class AutoHarvestWorker:
-    """后台轮询（账号开启「自动收利」）：
+    """后台轮询：
 
-    - 无仓：金叉/死叉那一根 + 严平稳，才自动双边开仓（上涨先多、下跌先空）
-    - 有仓：金叉/死叉那一根 + 盈利腿浮盈达到名义比例 + 冷却 + 收利宽平稳
+    - 每日：拉全部理财奖励记录；若开启 auto_switch_earn，把可赎回的低收益稳定币理财换成当前最高
+    - 账号开启「自动收利」时：无仓等金叉/死叉+严平稳开仓；有仓等交叉+浮盈达标收利
     手动一键入场/收利不受影响。
     """
 
@@ -36,6 +38,8 @@ class AutoHarvestWorker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_cross_key = ""
+        # account_id -> UTC 日期，每日理财检查只跑一次
+        self._earn_day_done: dict[int, str] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -47,7 +51,9 @@ class AutoHarvestWorker:
             note = "无仓/有仓都须金叉或死叉；有仓还要浮盈达到名义比例"
         else:
             note = "MACD 过滤已关：无仓严平稳开仓；有仓按名义比例收"
-        _print(f"自动收利后台已启动（{note}）")
+        switch_on = bool(getattr(self.ops.base, "auto_switch_earn", True))
+        switch_note = "每日拉收益后自动换低收益稳定币理财" if switch_on else "每日只拉收益、不自动换理财"
+        _print(f"自动收利后台已启动（{note}；{switch_note}）")
 
     def stop(self) -> None:
         self._stop.set()
@@ -69,16 +75,84 @@ class AutoHarvestWorker:
             except Exception:
                 log.exception("自动收利轮询异常")
 
+    def _utc_day(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     def _tick(self) -> None:
         for account in self.ops.store.list_accounts():
             if self._stop.is_set():
                 return
+            try:
+                self._maybe_daily_earn(account)
+            except Exception:
+                log.exception("账号 %s 每日理财检查失败", account.id)
             if not account.auto_harvest:
                 continue
             try:
                 self._maybe_act(account)
             except Exception:
                 log.exception("账号 %s 自动开仓/收利失败", account.id)
+
+    def _maybe_daily_earn(self, account) -> None:
+        """每日拉一次全部理财奖励；有低收益稳定币仓且安全时自动换到最高年化。"""
+        day = self._utc_day()
+        if self._earn_day_done.get(account.id) == day:
+            return
+        if not self.ops.try_begin_action(account.id):
+            return
+        try:
+            # 清奖励缓存，强制走接口记录（不是年化粗算）
+            earn_mod._YDAY_REWARD_CACHE.clear()
+            self.ops.invalidate_snapshot(account.id)
+            live = self.ops.snapshot(account, force=True)
+            if not live.get("ok"):
+                _print(f"每日理财检查跳过 account={account.id}：{live.get('error') or '快照失败'}")
+                return
+            yday = live.get("earn_yesterday") or "0"
+            src = live.get("earn_yesterday_source") or ""
+            _print(f"每日理财收益 account={account.id} 昨日={yday} source={src}")
+
+            if not bool(getattr(self.ops.base, "auto_switch_earn", True)):
+                self._earn_day_done[account.id] = day
+                return
+
+            switch = live.get("switch") or {}
+            if not switch.get("needed"):
+                _print(f"每日换年化跳过 account={account.id}：已是最高或无需换")
+                self._earn_day_done[account.id] = day
+                return
+            if not switch.get("can_click"):
+                _print(
+                    f"每日换年化暂缓 account={account.id}："
+                    f"{switch.get('reason') or 'uniMMR/批次不够'}"
+                )
+                # 今天仍算检查过，避免每分钟重试打爆；安全线恢复后次日再换
+                self._earn_day_done[account.id] = day
+                return
+
+            _print(
+                f"每日自动换年化 account={account.id} "
+                f"→ {switch.get('target')} {switch.get('target_apr')}% · {switch.get('reason')}"
+            )
+            result = self.ops.run_action(
+                account,
+                "switch",
+                force=False,
+                mode=None,
+                _locked=True,
+                auto=True,
+            )
+            ok = bool(result.get("ok"))
+            detail = result.get("reason") or ""
+            steps = result.get("steps") or []
+            if steps:
+                fails = [s for s in steps if not s.get("ok")]
+                pick = fails or steps[-4:]
+                detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+            _print(f"每日自动换年化结束 account={account.id} ok={ok} {detail[:500]}")
+            self._earn_day_done[account.id] = day
+        finally:
+            self.ops.end_action(account.id)
 
     def _macd_side(self) -> tuple[str | None, str]:
         """仅金叉/死叉那一根才返回腿；否则 None。"""

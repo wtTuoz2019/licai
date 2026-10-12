@@ -859,13 +859,40 @@ class Pipeline:
         text = str(step.detail or "").lower()
         return "-1002" in text or "not authorized" in text
 
+    def _switch_sources(
+        self,
+        target: FlexibleProduct,
+        holdings: list[tuple[FlexibleProduct, Decimal]] | None = None,
+        *,
+        stable_only: bool = False,
+    ) -> list[tuple[FlexibleProduct, Decimal]]:
+        """低于目标年化、可赎回的仓位。stable_only 时只动稳定币理财（自动换年化用）。"""
+        holdings = holdings if holdings is not None else self.earn_holdings()
+        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.1")
+        if gap < 0:
+            gap = Decimal("0")
+        target_pct = apr_percent(target.apr)
+        stable = {"USDT", "USDC", "BFUSD", "RWUSD", "FDUSD", "TUSD", "BUSD", "USD1", "USDE"}
+        out: list[tuple[FlexibleProduct, Decimal]] = []
+        for product, amount in holdings:
+            if amount <= 0 or self._same_product(product, target):
+                continue
+            if stable_only and product.kind not in {"bfusd", "rwusd"} and product.asset.upper() not in stable:
+                continue
+            src_pct = apr_percent(product.apr)
+            # 源年化未知/为 0 也视为可换；要比目标低出 gap 个百分点才动
+            if src_pct > 0 and src_pct + gap >= target_pct:
+                continue
+            out.append((product, amount))
+        return out
+
     def switch_advice(self, *, mmr: Decimal | None = None, equity: Decimal | None = None) -> dict:
         try:
             target = self.pick()
         except Exception as exc:
             return {"needed": False, "can_click": False, "reason": str(exc)}
         holdings = self.earn_holdings()
-        sources = [(p, amt) for p, amt in holdings if not self._same_product(p, target)]
+        sources = self._switch_sources(target, holdings, stable_only=False)
         if mmr is None or equity is None:
             try:
                 got_mmr, got_equity = self._mmr_equity() if self.settings.unified_account else (Decimal("0"), Decimal("0"))
@@ -946,7 +973,9 @@ class Pipeline:
             target = self.pick()
         except RuntimeError as exc:
             return [StepResult("换产品", False, str(exc))]
-        sources = [(p, amt) for p, amt in self.earn_holdings() if not self._same_product(p, target)]
+        # 自动换年化只动稳定币低收益仓；手动点「换年化」可清其它活期
+        stable_only = bool(getattr(self, "_switch_stable_only", False))
+        sources = self._switch_sources(target, stable_only=stable_only)
         if not sources:
             return [StepResult("换产品", True, f"已经在 {target.asset}，不用换")]
         if has_hedge is None:

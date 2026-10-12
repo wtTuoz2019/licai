@@ -220,11 +220,15 @@ class HedgeCycle:
         steps.extend(self._ensure_hedge())
         return steps
 
-    def switch_earn(self) -> list[StepResult]:
+    def switch_earn(self, *, stable_only: bool = False) -> list[StepResult]:
         """只换理财：赎回较低年化，申购当前最高，再划回统一账户。不开仓、不加仓。"""
         legs = self.futures.legs(self.symbol)
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
-        steps = list(self.pipeline.switch_to_best(full=False, has_hedge=has_pos))
+        self.pipeline._switch_stable_only = bool(stable_only)
+        try:
+            steps = list(self.pipeline.switch_to_best(full=False, has_hedge=has_pos))
+        finally:
+            self.pipeline._switch_stable_only = False
         if any(not s.ok for s in steps):
             return steps
         paused = any(s.name == "暂停换产品" for s in steps)
