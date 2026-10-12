@@ -917,8 +917,7 @@ class OpsService:
         elif action == "scale":
             run = lambda: cycle.scale_once(force=force or mode == "force")
         elif action == "switch":
-            # 自动：只换稳定币低收益仓；手动点「换年化」可清全部低收益活期
-            run = lambda: cycle.switch_earn(stable_only=bool(auto))
+            run = lambda: cycle.switch_earn()
         elif action == "leverage":
             run = lambda: cycle.apply_leverage()
         else:

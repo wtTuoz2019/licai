@@ -838,21 +838,44 @@ class Pipeline:
 
     def _convert_usdc_proceeds(self) -> StepResult | None:
         """RWUSD 赎回有时回到 USDC。申购入口用的是 source_asset，先换过去。"""
-        if self.settings.dry_run or self.settings.source_asset == "USDC":
+        return self._convert_spot_to_source("USDC")
+
+    def _convert_spot_to_source(self, asset: str) -> StepResult | None:
+        """把现货里的某资产兑成申购用的 source_asset（默认 USDT）。"""
+        asset = (asset or "").upper()
+        target = (self.settings.source_asset or "USDT").upper()
+        if not asset or asset == target or self.settings.dry_run:
             return None
         try:
-            usdc = self.earn.spot_free("USDC")
+            free = self.earn.spot_free(asset)
         except BinanceAPIError:
             return None
-        if usdc < SPOT_MIN:
+        # 灰尘也尽量兑；兑换所下限不够时由调用方软化失败
+        if free <= 0:
             return None
         step = self._mutate(
-            f"兑换 {fmt_amount(usdc)} USDC -> {self.settings.source_asset}",
-            lambda amt=usdc: self.convert_api.convert("USDC", self.settings.source_asset, amt),
+            f"兑换 {fmt_amount(free)} {asset} -> {target}",
+            lambda amt=free, a=asset, t=target: self.convert_api.convert(a, t, amt),
         )
         if step.ok and not step.dry_run:
             self.earn.invalidate()
         return step
+
+    @staticmethod
+    def _is_stable_earn_asset(product: FlexibleProduct) -> bool:
+        if product.kind in {"bfusd", "rwusd"}:
+            return True
+        return product.asset.upper() in {
+            "USDT",
+            "USDC",
+            "BFUSD",
+            "RWUSD",
+            "FDUSD",
+            "TUSD",
+            "BUSD",
+            "USD1",
+            "USDE",
+        }
 
     @staticmethod
     def _unauthorized(step: StepResult) -> bool:
@@ -973,9 +996,7 @@ class Pipeline:
             target = self.pick()
         except RuntimeError as exc:
             return [StepResult("换产品", False, str(exc))]
-        # 自动换年化只动稳定币低收益仓；手动点「换年化」可清其它活期
-        stable_only = bool(getattr(self, "_switch_stable_only", False))
-        sources = self._switch_sources(target, stable_only=stable_only)
+        sources = self._switch_sources(target, stable_only=False)
         if not sources:
             return [StepResult("换产品", True, f"已经在 {target.asset}，不用换")]
         if has_hedge is None:
@@ -1005,6 +1026,18 @@ class Pipeline:
         dust_cut = Decimal("1")  # 入场：小于 1 的非目标活期直接 redeemAll，避免 0.01 取整漏尾
         for product, amount in sources:
             remaining = amount
+            # 山寨活期数量单位不是 U，不能按 USDT 批次估；一律整笔赎→兑 USDT→申购
+            if remaining > 0 and not self._is_stable_earn_asset(product):
+                steps.append(
+                    StepResult(
+                        "清山寨活期",
+                        True,
+                        f"{product.asset} {fmt_amount(remaining)} 整笔赎回并兑成 {self.settings.source_asset} 再申购 {target.asset}",
+                    )
+                )
+                steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                self._soften_dust_failures(steps)
+                continue
             if full and remaining > 0 and remaining < dust_cut:
                 steps.append(
                     StepResult(
@@ -1129,11 +1162,11 @@ class Pipeline:
 
     @staticmethod
     def _soften_dust_failures(steps: list[StepResult]) -> None:
-        """尾数赎回/申购失败不阻断入场；币安常有最小赎回额。"""
+        """尾数赎回/兑换/申购失败不阻断；币安常有最小赎回额或兑换下限。"""
         for s in steps:
             if s.ok:
                 continue
-            if any(k in s.name for k in ("赎回", "申购", "subscribe")):
+            if any(k in s.name for k in ("赎回", "申购", "subscribe", "兑换")):
                 s.ok = True
                 s.detail = f"尾数未成（可忽略，可能低于交易所最小额）：{s.detail}"
 
@@ -1254,21 +1287,28 @@ class Pipeline:
             return steps
         if not self.settings.dry_run and self.settings.settle_seconds > 0:
             time.sleep(self.settings.settle_seconds)
-            converted = self._convert_usdc_proceeds()
-            if converted is not None:
+        # 赎回物可能是 USDC / 山寨币：先兑成申购资产再买目标理财
+        if not self.settings.dry_run:
+            self.earn.invalidate()
+            for asset in ("USDC", source.asset.upper()):
+                if asset in {"", "USDT"} or asset == (self.settings.source_asset or "USDT").upper():
+                    continue
+                converted = self._convert_spot_to_source(asset)
+                if converted is None:
+                    continue
                 steps.append(converted)
                 if not converted.ok:
-                    return steps
-        free = amount if self.settings.dry_run else self.earn.spot_free("USDT")
+                    # 灰尘兑换常因低于币安最小额失败，不当整笔换产品失败
+                    if redeem_all or amount < SPOT_MIN:
+                        converted.ok = True
+                        converted.detail = f"尾数过小未兑换：{converted.detail}"
+                    else:
+                        return steps
+        free = amount if self.settings.dry_run else self.earn.spot_free(self.settings.source_asset or "USDT")
         buy_amount = min(amount, free) if free > 0 else (free if redeem_all else amount)
         if redeem_all and not self.settings.dry_run:
             self.earn.invalidate()
-            converted = self._convert_usdc_proceeds()
-            if converted is not None:
-                steps.append(converted)
-                if not converted.ok:
-                    return steps
-            free = self.earn.spot_free("USDT")
+            free = self.earn.spot_free(self.settings.source_asset or "USDT")
             buy_amount = free if free > 0 else Decimal("0")
         if buy_amount <= 0:
             if redeem_all:
