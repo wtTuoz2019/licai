@@ -152,16 +152,22 @@ def _rewards_by_day(rows: list) -> dict[str, Decimal]:
     return by_day
 
 
-def _latest_day_totals(flex_rows: list, bfusd_rows: list) -> tuple[Decimal, Decimal, Decimal]:
+def _latest_day_totals(
+    flex_rows: list,
+    bfusd_rows: list,
+    rwusd_rows: list | None = None,
+) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     flex_days = _rewards_by_day(flex_rows)
     bfusd_days = _rewards_by_day(bfusd_rows)
-    days = set(flex_days) | set(bfusd_days)
+    rwusd_days = _rewards_by_day(rwusd_rows or [])
+    days = set(flex_days) | set(bfusd_days) | set(rwusd_days)
     if not days:
-        return Decimal("0"), Decimal("0"), Decimal("0")
+        return Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0")
     latest = max(days)
     flex = flex_days.get(latest, Decimal("0"))
     bfusd = bfusd_days.get(latest, Decimal("0"))
-    return flex, bfusd, flex + bfusd
+    rwusd = rwusd_days.get(latest, Decimal("0"))
+    return flex, bfusd, rwusd, flex + bfusd + rwusd
 
 
 @dataclass
@@ -533,6 +539,7 @@ class EarnAPI:
         start30 = end_ms - 30 * 86400 * 1000
         flex_rows: list = []
         bfusd_rows: list = []
+        rwusd_rows: list = []
         errors: list[str] = []
 
         def _pull_flex(start: int, end: int) -> list:
@@ -571,15 +578,30 @@ class EarnAPI:
                 errors.append(f"bfusd: {exc}")
                 return []
 
+        def _pull_rwusd(start: int, end: int) -> list:
+            try:
+                data = self.client.signed(
+                    "GET",
+                    "/sapi/v1/rwusd/history/rewardsHistory",
+                    {"startTime": start, "endTime": end, "size": 100, "current": 1},
+                )
+                rows = data.get("rows") if isinstance(data, dict) else []
+                return rows if isinstance(rows, list) else []
+            except BinanceAPIError as exc:
+                errors.append(f"rwusd: {exc}")
+                return []
+
         flex_rows = _pull_flex(start_ms, end_ms)
         bfusd_rows = _pull_bfusd(start_ms, end_ms)
-        if not flex_rows and not bfusd_rows:
+        rwusd_rows = _pull_rwusd(start_ms, end_ms)
+        if not flex_rows and not bfusd_rows and not rwusd_rows:
             flex_rows = _pull_flex(start30, end_ms)
             bfusd_rows = _pull_bfusd(start30, end_ms)
+            rwusd_rows = _pull_rwusd(start30, end_ms)
 
-        # 兜底：资金分红里可能有 BFUSD/USDT 利息入账
+        # 兜底：资金分红里可能有 BFUSD/USDT/RWUSD 利息入账
         dividend_rows: list = []
-        for asset in ("USDT", "BFUSD"):
+        for asset in ("USDT", "BFUSD", "RWUSD"):
             try:
                 data = self.client.signed(
                     "GET",
@@ -592,7 +614,7 @@ class EarnAPI:
             except BinanceAPIError as exc:
                 errors.append(f"dividend/{asset}: {exc}")
 
-        flex, bfusd, total = _latest_day_totals(flex_rows, bfusd_rows)
+        flex, bfusd, rwusd, total = _latest_day_totals(flex_rows, bfusd_rows, rwusd_rows)
         if total <= 0 and dividend_rows:
             div_amt = _rewards_by_day(dividend_rows)
             if div_amt:
@@ -600,11 +622,20 @@ class EarnAPI:
                 total = div_amt[latest]
                 bfusd = total
 
-        source = "records" if total > 0 else ("error" if errors and not flex_rows and not bfusd_rows else "none")
+        source = (
+            "records"
+            if total > 0
+            else (
+                "error"
+                if errors and not flex_rows and not bfusd_rows and not rwusd_rows
+                else "none"
+            )
+        )
         out = {
             "amount": total,
             "flex": flex,
             "bfusd": bfusd,
+            "rwusd": rwusd,
             "source": source,
             "text": fmt_amount(total, 4) if total > 0 else "0",
             "errors": errors[:6],
