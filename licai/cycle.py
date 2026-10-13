@@ -8,6 +8,7 @@ from .config import d, fmt_amount, is_mmr_sentinel, settle_asset_of
 from .futures import FuturesAPI, HedgeLegs
 from .macd import fetch_macd_state
 from .monitor import min_harvest_profit, price_stability, resolve_harvest_fee
+from .earn import FlexibleProduct
 from .pipeline import Pipeline, StepResult
 
 
@@ -118,10 +119,10 @@ class HedgeCycle:
     """
     理财仓位当保证金，多空对冲。
 
-    一键收利（顺序固定，不可改成先补后转）：
-    平掉浮盈腿（半平则继续平净，必要时市价扫尾）→ 最大可转出转到现货 → 补回对冲
-    → 缺口/数量不等则继续补齐或削平，最终双腿等量（实在不行双平）
-    →（USDC 则先换成 USDT）买理财 → 划入统一账户。
+    一键收利：
+    平仓前预选理财代币 → 平掉浮盈腿（半平则继续平净）→ 最大可转出到现货
+    →（USDC 先兑 USDT）按预选申购理财 → 划入统一账户并确认已计入保证金
+    → 再补回对冲 → 缺口则继续补齐或削平（实在不行双平）。
     平仓后可转额度本身已扣手续费等，约等于本次实现盈利。
     """
 
@@ -136,6 +137,7 @@ class HedgeCycle:
         self.leverage_cap_changed = False
         self._enter_first_side: str | None = None  # LONG|SHORT，入场按 MACD 决定先挂哪边
         self._enter_order_note: str = ""
+        self._harvest_earn_product: FlexibleProduct | None = None
 
     def _limit_tries(self) -> int:
         return max(1, int(getattr(self.settings, "hedge_quote_retries", None) or LIMIT_FILL_TRIES))
@@ -516,9 +518,18 @@ class HedgeCycle:
                 "触发止盈",
                 True,
                 f"平掉 {side} 浮盈约 {fmt_amount(pnl)} {self.settle_asset}，"
-                f"半平则继续平净，再转出补仓；尽量等平稳后挂单，最终保持对冲平衡",
+                f"半平则继续平净；转出后先申购理财计入保证金，再补仓",
             )
         ]
+        # 平仓前先查好目标理财，避免平完再扫产品列表
+        planned, plan_step = self.pipeline.plan_earn_target()
+        self._harvest_earn_product = planned
+        steps.append(plan_step)
+        try:
+            before_pm = self.futures.papi_balances() if not self.settings.dry_run else {}
+        except Exception:
+            before_pm = {}
+
         if wait_stable:
             steps.extend(self._wait_until_stable("平仓前"))
         steps.extend(self._close_winner_for_harvest(side, qty, wait_stable=wait_stable))
@@ -540,24 +551,41 @@ class HedgeCycle:
             steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
             return steps
 
-        # 顺序固定：先转出再补仓
+        # 转出 → 申购理财 → 确认计入保证金 → 再补仓（避免现货闲置时 -2019）
         steps.extend(self._profit_to_spot(pnl))
+        earn_steps = self._spot_profit_to_earn(product=planned)
+        steps.extend(earn_steps)
+        bought = _subscribed(earn_steps)
+        if bought and not self.settings.dry_run:
+            time.sleep(max(int(self.settings.settle_seconds or 0), 2))
+        steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
+        steps.extend(self._confirm_harvest_margin(planned, before_pm=before_pm, realized=pnl))
+
         refill_qty = after.short_qty if side == "LONG" else after.long_qty
         refill_pos = "LONG" if side == "LONG" else "SHORT"
         refill_order = "BUY" if refill_pos == "LONG" else "SELL"
         if refill_qty > 0:
             if wait_stable:
                 steps.extend(self._wait_until_stable("补仓前"))
-            steps.extend(self._quote_side(refill_order, refill_pos, refill_qty, reduce_only=False))
-        # 补不齐或数量不一致：再补一轮 / 削平多余，最终必须平衡或双平
-        steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
+            refill_steps = self._quote_side(refill_order, refill_pos, refill_qty, reduce_only=False)
+            steps.extend(refill_steps)
+            if any(_no_margin(item) for item in refill_steps):
+                steps.append(StepResult("补仓未完成", False, "保证金不足（-2019），平掉单边避免裸仓"))
+                steps.extend(self._flatten_if_naked())
+            else:
+                steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
+        else:
+            steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
         restored = self.futures.legs(self.symbol)
 
-        earn_steps = self._spot_profit_to_earn()
-        steps.extend(earn_steps)
-        if not self.settings.dry_run:
-            time.sleep(max(int(self.settings.settle_seconds or 0), 2))
-        steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
+        # 补仓后若现货仍有残留，再扫一次（用同一预选产品）
+        if self.pipeline.spot_needs_move() or self._spot_settle_left():
+            residual = self._spot_profit_to_earn(product=self._harvest_earn_product or planned)
+            steps.extend(residual)
+            if _subscribed(residual) and not self.settings.dry_run:
+                time.sleep(max(int(self.settings.settle_seconds or 0), 2))
+            steps.extend(self._fund_after_earn(residual, check_idle_ldusdt=False))
+
         if restored.missing_side is None:
             steps.append(StepResult("收利完成", True, "对冲已齐。要放大仓位请点「加仓」"))
         elif restored.long_qty <= 0 and restored.short_qty <= 0:
@@ -571,6 +599,110 @@ class HedgeCycle:
                 )
             )
         return steps
+
+    def _spot_settle_left(self) -> bool:
+        try:
+            from .pipeline import SPOT_MIN
+
+            return self.pipeline.spot_cash(self.settle_asset) >= SPOT_MIN
+        except Exception:
+            return False
+
+    def _confirm_harvest_margin(
+        self,
+        product: FlexibleProduct | None,
+        *,
+        before_pm: dict[str, Decimal],
+        realized: Decimal,
+    ) -> list[StepResult]:
+        """申购并划转后，确认理财代币已进统一账户、可当保证金，再允许补仓。"""
+        if self.settings.dry_run:
+            return [StepResult("保证金确认", True, "dry-run 跳过", dry_run=True)]
+        if product is None:
+            return [StepResult("保证金确认", True, "未预选理财，按当前统一账户余额继续补仓")]
+        primary = self.pipeline.margin_token_of(product)
+        # 预选失败改申购时，也认 LDUSDT / BFUSD / RWUSD 任一增加
+        watch = [primary]
+        for tok in ("LDUSDT", "BFUSD", "RWUSD", "USDT", "USDC"):
+            if tok not in watch:
+                watch.append(tok)
+        need = max(Decimal("1"), (realized * Decimal("0.5")).quantize(Decimal("0.01")))
+        out: list[StepResult] = []
+
+        def snapshot() -> tuple[str, Decimal, Decimal, Decimal]:
+            try:
+                pm = self.futures.papi_balances()
+            except Exception:
+                pm = {}
+            best_tok = primary
+            best_bal = pm.get(primary, Decimal("0"))
+            best_gain = best_bal - before_pm.get(primary, Decimal("0"))
+            for tok in watch:
+                bal = pm.get(tok, Decimal("0"))
+                gain = bal - before_pm.get(tok, Decimal("0"))
+                if gain > best_gain:
+                    best_tok, best_bal, best_gain = tok, bal, gain
+            idle = Decimal("0")
+            for asset in ("USDT", "USDC", "BFUSD", "RWUSD"):
+                try:
+                    idle += self.pipeline.spot_cash(asset)
+                except Exception:
+                    continue
+            return best_tok, best_bal, best_gain, idle
+
+        deadline = time.monotonic() + 12.0
+        retried_fund = False
+        while True:
+            tok, bal, gained, idle = snapshot()
+            if gained >= need or gained >= Decimal("1"):
+                out.append(
+                    StepResult(
+                        "保证金确认",
+                        True,
+                        f"{tok} 统一账户 {fmt_amount(bal)}（较平仓前 +{fmt_amount(gained)}），已计入保证金",
+                    )
+                )
+                return out
+            if idle < 1 and gained > 0:
+                out.append(
+                    StepResult(
+                        "保证金确认",
+                        True,
+                        f"{tok} 统一账户 {fmt_amount(bal)}，现货已清空，可补仓",
+                    )
+                )
+                return out
+            if time.monotonic() >= deadline:
+                break
+            if (not retried_fund) and idle >= 1:
+                retried_fund = True
+                extra = self.pipeline.fund_unified(check_ldusdt=True)
+                if extra and not (len(extra) == 1 and extra[0].name == "无需划转"):
+                    out.extend(extra)
+                time.sleep(0.8)
+                continue
+            time.sleep(0.45)
+
+        tok, bal, gained, idle = snapshot()
+        if gained >= Decimal("0.5") or (idle < 1 and bal > 0 and gained > 0):
+            out.append(
+                StepResult(
+                    "保证金确认",
+                    True,
+                    f"{tok} 统一账户 {fmt_amount(bal)}（+{fmt_amount(gained)}），现货剩 {fmt_amount(idle)}，继续补仓",
+                )
+            )
+            return out
+        before = before_pm.get(primary, Decimal("0"))
+        out.append(
+            StepResult(
+                "保证金确认",
+                False,
+                f"{primary} 未明显增加（现 {fmt_amount(bal)}，平仓前 {fmt_amount(before)}，现货 {fmt_amount(idle)}）。"
+                f"仍尝试补仓；若 -2019 会立刻停手",
+            )
+        )
+        return out
 
     def _close_winner_for_harvest(
         self, side: str, qty: Decimal, *, wait_stable: bool = True
@@ -670,7 +802,11 @@ class HedgeCycle:
                             f"缺 {miss}，按 {fmt_amount(target)} 补仓（第 {round_i + 1} 轮）",
                         )
                     )
+                    before_n = len(steps)
                     steps.extend(self._quote_side(order, miss, target, reduce_only=False))
+                    if any(_no_margin(item) for item in steps[before_n:]):
+                        steps.append(StepResult("保证金不够", False, f"补 {miss} 持续 -2019，停止重试"))
+                        break
                 continue
             if miss == "IMBALANCE":
                 if wait_stable:
@@ -708,7 +844,7 @@ class HedgeCycle:
     def _profit_to_spot(self, realized: Decimal) -> list[StepResult]:
         steps: list[StepResult] = []
         asset = self.settle_asset
-        # 顺序保持：先转出再补仓。用短轮询等可转出，尽快进入补仓。
+        # 转出后由外层先申购理财并确认保证金，再补仓。
         collect = self._mutate(f"归集统一账户 {asset}", lambda: self.futures.collect_to_margin(asset))
         steps.append(collect)
         transferable = Decimal("0")
@@ -737,7 +873,7 @@ class HedgeCycle:
                 StepResult(
                     "转出现货",
                     True,
-                    f"最大可转出 {fmt_amount(transferable)} {asset}，不足 1，先补仓",
+                    f"最大可转出 {fmt_amount(transferable)} {asset}，不足 1，跳过转出直接补仓",
                 )
             )
             return steps
@@ -751,8 +887,8 @@ class HedgeCycle:
         steps.append(moved)
         return steps
 
-    def _spot_profit_to_earn(self) -> list[StepResult]:
-        return self.pipeline.sweep_spot_to_earn()
+    def _spot_profit_to_earn(self, product: FlexibleProduct | None = None) -> list[StepResult]:
+        return self.pipeline.sweep_spot_to_earn(product=product)
 
     def _quote_until_balanced(self, qty: Decimal, reduce_only: bool) -> list[StepResult]:
         """双边挂单直到对冲齐。
@@ -1502,6 +1638,15 @@ class HedgeCycle:
                 touch=True,
             )
             steps.extend(extra)
+            if (not reduce_only) and any(_no_margin(item) for item in extra):
+                steps.append(
+                    StepResult(
+                        "保证金不够",
+                        False,
+                        f"{position_side} 开仓 -2019，停止重试（需理财先入统一账户）",
+                    )
+                )
+                return steps
             if any(_order_filled_hint(item) for item in extra) or any(
                 _reduce_only_reject(item) for item in extra
             ):
@@ -1542,7 +1687,19 @@ class HedgeCycle:
 
         steps.append(StepResult("挂单未齐", True, f"{position_side} 已挂单未完成，改市价补仓（尽量少用）"))
         for _ in range(2):
-            steps.extend(self._side_pass(order_side, position_side, qty, reduce_only, market=True, aggressive=True))
+            market_steps = self._side_pass(
+                order_side, position_side, qty, reduce_only, market=True, aggressive=True
+            )
+            steps.extend(market_steps)
+            if (not reduce_only) and any(_no_margin(item) for item in market_steps):
+                steps.append(
+                    StepResult(
+                        "保证金不够",
+                        False,
+                        f"{position_side} 市价也 -2019，停止重试",
+                    )
+                )
+                return steps
             if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=0.8):
                 steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
                 return steps

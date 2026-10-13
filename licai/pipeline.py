@@ -285,7 +285,51 @@ class Pipeline:
         eligible.sort(key=lambda p: apr_ratio(p.apr), reverse=True)
         return eligible[0]
 
-    def sweep_spot_to_earn(self) -> list[StepResult]:
+    def margin_token_of(self, product: FlexibleProduct) -> str:
+        if product.kind in {"bfusd", "rwusd"}:
+            return product.asset.upper()
+        return (product.margin_token or f"LD{product.asset}").upper()
+
+    def plan_earn_target(self) -> tuple[FlexibleProduct | None, StepResult]:
+        """收利平仓前预选：查好要兑/申购哪个理财，避免平完再查。"""
+        try:
+            product = self.pick()
+        except Exception as exc:
+            return None, StepResult("预选理财", False, str(exc))
+        settle = settle_asset_of(self.settings.hedge_symbol).upper()
+        source = self.settings.source_asset.upper()
+        path: list[str] = []
+        if settle != source:
+            path.append(f"{settle}->{source}")
+        if product.kind in {"bfusd", "rwusd"}:
+            path.append(f"申购 {product.asset}")
+        else:
+            if source != product.asset.upper():
+                path.append(f"{source}->{product.asset}")
+            path.append(f"申购 {product.asset} 活期")
+        token = self.margin_token_of(product)
+        path.append(f"保证金 {token}")
+        return product, StepResult(
+            "预选理财",
+            True,
+            f"{' → '.join(path)}，年化 {apr_choice_text(product)}",
+        )
+
+    def _wait_spot_cash(self, asset: str | None = None, *, min_amt: Decimal = SPOT_MIN, timeout: float = 5.0) -> Decimal:
+        """兑换/划转后余额可能滞后，短轮询再读现货。"""
+        free = Decimal("0")
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            self.earn.invalidate()
+            try:
+                free = self.spot_cash(asset)
+            except BinanceAPIError:
+                free = Decimal("0")
+            if free >= min_amt or time.monotonic() >= deadline:
+                return free
+            time.sleep(0.35)
+
+    def sweep_spot_to_earn(self, product: FlexibleProduct | None = None) -> list[StepResult]:
         steps: list[StepResult] = []
         # USDC 本位收利后现货是 USDC：先换成 USDT，再走原来的理财申购
         settle = settle_asset_of(self.settings.hedge_symbol)
@@ -303,17 +347,28 @@ class Pipeline:
                 if not converted.ok:
                     return steps
                 if not converted.dry_run:
-                    self.earn.invalidate()
-        try:
-            free = self.spot_cash()
-        except BinanceAPIError as exc:
-            return steps + [StepResult("归集理财", False, str(exc))]
+                    free = self._wait_spot_cash(timeout=6.0)
+                else:
+                    free = free_settle
+            else:
+                free = Decimal("0")
+        else:
+            free = Decimal("0")
+        if free < SPOT_MIN:
+            try:
+                free = self._wait_spot_cash(timeout=2.0) if steps else self.spot_cash()
+            except BinanceAPIError as exc:
+                return steps + [StepResult("归集理财", False, str(exc))]
         if free < SPOT_MIN:
             if steps:
                 steps.append(StepResult("归集理财", True, f"已换到 {self.settings.source_asset}，但可申购余额不足，跳过申购"))
                 return steps
             return [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
-        product = self.pick()
+        if product is None:
+            try:
+                product = self.pick()
+            except Exception as exc:
+                return steps + [StepResult("归集理财", False, str(exc))]
         amount = self.plan_amount(product, sweep_all=True)
         if amount < SPOT_MIN:
             return steps + [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
