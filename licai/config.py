@@ -105,11 +105,8 @@ class Settings:
     leverage_unlock_at: str | None = None
     hedge_qty: Decimal = Decimal("0")
     hedge_margin_use_pct: Decimal = Decimal("0.85")
-    # 高杠杆时占用 = min(hedge_margin_use_pct, hedge_margin_lev_cap/杠杆)。
-    # 28 → 100x 约用 28% 保证金（原硬编码 40 偏满，收利转出后容易 -2019）。
-    hedge_margin_lev_cap: Decimal = Decimal("28")
-    # 收利转出现货时，至少预留「单边名义/杠杆 × 该倍数」在统一账户，供补回对冲。
-    harvest_transfer_reserve_im: Decimal = Decimal("1.3")
+    # 高杠杆时占用 = min(hedge_margin_use_pct, hedge_margin_lev_cap/杠杆)。40 → 100x 约 40%。
+    hedge_margin_lev_cap: Decimal = Decimal("40")
     take_profit_usdt: Decimal = Decimal("0")
     take_profit_custom: bool = False
     maker_only: bool = False
@@ -228,8 +225,7 @@ def load_settings(config_path: str | Path | None = None, dry_run_override: bool 
         hedge_leverage_target=int(raw.get("hedge_leverage", 100)),
         hedge_qty=d(raw.get("hedge_qty", "0")),
         hedge_margin_use_pct=d(raw.get("hedge_margin_use_pct", "0.85")),
-        hedge_margin_lev_cap=d(raw.get("hedge_margin_lev_cap", "28")),
-        harvest_transfer_reserve_im=d(raw.get("harvest_transfer_reserve_im", "1.3")),
+        hedge_margin_lev_cap=d(raw.get("hedge_margin_lev_cap", "40")),
         take_profit_usdt=d(raw.get("take_profit_usdt", "0")),
         take_profit_custom=d(raw.get("take_profit_usdt", "0")) > 0,
         maker_only=bool(raw.get("maker_only", False)),

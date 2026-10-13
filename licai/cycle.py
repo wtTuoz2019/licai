@@ -56,22 +56,14 @@ def _order_filled_hint(step: StepResult) -> bool:
 def margin_use_pct(settings) -> Decimal:
     """入场/加仓占用比例：低杠杆吃满 hedge_margin_use_pct；高杠杆按 lev_cap/杠杆。
 
-    100x + lev_cap=28 → 28%。要比「平一边+转出浮盈后仍能开回对侧」更保守。
+    100x + lev_cap=40 → 40%。在 uniMMR 安全线内尽量开满；收利靠「全额转出→理财入保证金→再补仓」保对冲。
     """
     cap = settings.hedge_margin_use_pct
     lev = max(int(settings.hedge_leverage), 1)
-    lev_cap = d(getattr(settings, "hedge_margin_lev_cap", None) or "28")
+    lev_cap = d(getattr(settings, "hedge_margin_lev_cap", None) or "40")
     if lev_cap <= 0:
-        lev_cap = Decimal("28")
+        lev_cap = Decimal("40")
     return min(cap, lev_cap / Decimal(lev))
-
-
-def one_leg_im(qty: Decimal, mid: Decimal, leverage: int) -> Decimal:
-    """单边初始保证金近似：名义 / 杠杆。"""
-    lev = max(int(leverage), 1)
-    if qty <= 0 or mid <= 0:
-        return Decimal("0")
-    return qty * mid / Decimal(lev)
 
 
 def mmr_qty_cap(current: Decimal, mmr: Decimal, min_uni_mmr: Decimal) -> Decimal | None:
@@ -97,7 +89,7 @@ def position_plan(
     use = margin_use_pct(settings)
     lev = Decimal(max(int(settings.hedge_leverage), 1))
     # 双向持仓：多空两边都要初始保证金。单边名义 = 本金×占用×杠杆 / 2
-    # 占用已按收利窗口压过（见 margin_use_pct），避免仓位顶满后转出浮盈开不出对侧。
+    # 在占用上限与 uniMMR 内尽量开满，多套出浮盈去理财。
     raw = collateral * use * lev / (Decimal("2") * mid) if mid > 0 and collateral > 0 else Decimal("0")
     target = round_qty(raw) if raw > 0 else Decimal("0")
     current = (
@@ -109,8 +101,7 @@ def position_plan(
     if cap is not None:
         target = min(target, round_qty(cap))
     if available is not None and available > 0 and mid > 0:
-        # 可用保证金再打九折，给收利单边窗口留余量（勿用满 available）
-        add_room = round_qty(available * Decimal("0.90") * lev / (Decimal("2") * mid))
+        add_room = round_qty(available * Decimal("0.95") * lev / (Decimal("2") * mid))
         if current > 0:
             target = min(target, current + add_room)
         else:
@@ -568,9 +559,9 @@ class HedgeCycle:
             steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
             return steps
 
-        # 转出（预留补仓保证金）→ 申购理财 → 确认计入保证金 → 再补仓
+        # 全额转出 → 申购理财 → 确认计入保证金 → 再补仓（不预留现金，利润尽量进理财）
         refill_qty = after.short_qty if side == "LONG" else after.long_qty
-        steps.extend(self._profit_to_spot(pnl, reserve_qty=refill_qty))
+        steps.extend(self._profit_to_spot(pnl))
         earn_steps = self._spot_profit_to_earn(product=planned)
         steps.extend(earn_steps)
         bought = _subscribed(earn_steps)
@@ -858,33 +849,10 @@ class HedgeCycle:
             )
         return steps
 
-    def _harvest_transfer_reserve(self, reserve_qty: Decimal) -> tuple[Decimal, str]:
-        """收利转出前预留的统一账户金额：约 N×单边初始保证金。"""
-        if reserve_qty <= 0:
-            return Decimal("0"), ""
-        mult = d(getattr(self.settings, "harvest_transfer_reserve_im", None) or "1.3")
-        if mult <= 0:
-            return Decimal("0"), ""
-        try:
-            bid, ask = self.futures.book(self.symbol, force=True)
-            mid = (bid + ask) / 2
-        except Exception:
-            return Decimal("0"), ""
-        lev = max(int(self.settings.hedge_leverage), 1)
-        im = one_leg_im(reserve_qty, mid, lev)
-        reserve = (im * mult).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        if reserve < 1:
-            return Decimal("0"), ""
-        note = (
-            f"预留 {fmt_amount(reserve)} {self.settle_asset} "
-            f"（{fmt_amount(mult, 2)}×单边保证金≈{fmt_amount(im)}，qty={fmt_amount(reserve_qty)}）供补仓"
-        )
-        return reserve, note
-
-    def _profit_to_spot(self, realized: Decimal, *, reserve_qty: Decimal = Decimal("0")) -> list[StepResult]:
+    def _profit_to_spot(self, realized: Decimal) -> list[StepResult]:
         steps: list[StepResult] = []
         asset = self.settle_asset
-        # 转出时预留补仓保证金；外层再申购理财确认后补仓。
+        # 可转尽转；外层立刻申购理财并划回保证金后再补仓。
         collect = self._mutate(f"归集统一账户 {asset}", lambda: self.futures.collect_to_margin(asset))
         steps.append(collect)
         transferable = Decimal("0")
@@ -917,31 +885,9 @@ class HedgeCycle:
                 )
             )
             return steps
-        reserve, reserve_note = self._harvest_transfer_reserve(reserve_qty)
-        if reserve > 0:
-            steps.append(StepResult("转出预留", True, reserve_note))
-        if reserve > 0 and transferable <= reserve:
-            steps.append(
-                StepResult(
-                    "转出现货",
-                    True,
-                    f"可转出 {fmt_amount(transferable)} ≤ 预留 {fmt_amount(reserve)}，本次不转出，先保证补仓",
-                )
-            )
-            return steps
-        amount = transferable - reserve if reserve > 0 else transferable
-        if amount < 1:
-            steps.append(
-                StepResult(
-                    "转出现货",
-                    True,
-                    f"扣除预留后可转 {fmt_amount(amount)} {asset}，不足 1，跳过转出",
-                )
-            )
-            return steps
+        amount = transferable
         moved = self._mutate(
-            f"转出 {fmt_amount(amount)} {asset} 到现货"
-            f"（可转 {fmt_amount(transferable)}，预留 {fmt_amount(reserve)}，浮盈约 {fmt_amount(realized)}）",
+            f"最大可转出 {fmt_amount(amount)} {asset} 转到现货（本次浮盈约 {fmt_amount(realized)}）",
             lambda: self.futures.unified_to_spot(asset, amount),
         )
         if moved.ok and not moved.dry_run:
