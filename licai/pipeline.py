@@ -861,23 +861,123 @@ class Pipeline:
             self.earn.invalidate()
         return step
 
-    def _return_pm_earn(self, asset: str, amount: Decimal) -> tuple[list[StepResult], Decimal]:
+    def _papi_wallet_balance(self, asset: str) -> Decimal:
+        """统一账户钱包余额（含负数）；papi_balances 会滤掉 ≤0。"""
+        asset = asset.upper()
+        try:
+            data = self.client.signed("GET", "/papi/v1/balance", papi=True)
+        except BinanceAPIError:
+            return Decimal("0")
+        rows = data if isinstance(data, list) else (data.get("balances") or data.get("data") or [])
+        for row in rows:
+            if str(row.get("asset") or "").upper() == asset:
+                total = d(row.get("totalWalletBalance"))
+                if total == 0 and "crossMarginFree" in row:
+                    total = d(row.get("crossMarginAsset")) + d(row.get("umWalletBalance")) + d(
+                        row.get("cmWalletBalance")
+                    )
+                return total
+        return Decimal("0")
+
+    def _repair_pm_negative_settle(self) -> list[StepResult]:
+        """无对冲仓时：用现货稳定币填上统一账户结算币负余额，否则 BFUSD 等 maxWithdraw 会被卡住。"""
+        settle = settle_asset_of(self.settings.hedge_symbol).upper()
+        bal = self._papi_wallet_balance(settle)
+        if bal >= -SPOT_MIN:
+            return []
+        need = (-bal).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if need < SPOT_MIN:
+            return []
+        steps = [
+            StepResult(
+                "填补负余额",
+                True,
+                f"统一账户 {settle}={fmt_amount(bal)}，无对冲仓，用现货填约 {fmt_amount(need)} 以便转出理财代币",
+            )
+        ]
+        # 1) 现货已有结算币
+        try:
+            spot_settle = self.spot_cash(settle)
+        except BinanceAPIError:
+            spot_settle = Decimal("0")
+        if spot_settle >= SPOT_MIN:
+            move = min(spot_settle, need)
+            fund = self._fund_spot_asset(settle, move)
+            steps.extend(fund)
+            if any(s.ok and not s.dry_run for s in fund):
+                need = (need - move).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        # 2) 现货 USDT 兑成结算币再划入
+        if need >= SPOT_MIN and settle != (self.settings.source_asset or "USDT").upper():
+            try:
+                spot_src = self.spot_cash(self.settings.source_asset)
+            except BinanceAPIError:
+                spot_src = Decimal("0")
+            if spot_src >= SPOT_MIN:
+                conv_amt = min(spot_src, need)
+                converted = self._mutate(
+                    f"兑换 {fmt_amount(conv_amt)} {self.settings.source_asset} -> {settle}（填负余额）",
+                    lambda amt=conv_amt: self.convert_api.convert(
+                        self.settings.source_asset, settle, amt
+                    ),
+                )
+                steps.append(converted)
+                if converted.ok and not converted.dry_run:
+                    self.earn.invalidate()
+                    to_amt = conv_amt
+                    if isinstance(converted.detail, dict):
+                        raw_to = (converted.detail.get("quote") or {}).get("toAmount")
+                        if raw_to:
+                            to_amt = d(raw_to)
+                    fund = self._fund_spot_asset(settle, to_amt)
+                    steps.extend(fund)
+        after = self._papi_wallet_balance(settle)
+        steps.append(
+            StepResult(
+                "负余额结果",
+                True,
+                f"{settle} 现为 {fmt_amount(after)}（填前 {fmt_amount(bal)}）",
+            )
+        )
+        return steps
+
+    def _return_pm_earn(
+        self, asset: str, amount: Decimal, *, has_hedge: bool = True
+    ) -> tuple[list[StepResult], Decimal]:
         """按币安 FUTURE_TO_EARN 可转上限转回。总余额大于这个上限时，多转会 -3020。"""
         try:
             cap = self.futures.earn_asset_transferable(asset, "FUTURE_TO_EARN")
         except BinanceAPIError as exc:
+            text = str(exc)
+            # BFUSD/RWUSD 等不走 earn-asset-transfer（会 -1100），交给现货划转路径
+            if "-1100" in text or "illegal characters" in text.lower():
+                return [
+                    StepResult(
+                        f"{asset} 不走理财划转",
+                        True,
+                        f"接口不支持 FUTURE_TO_EARN（{exc}），改从统一账户转现货再赎回",
+                    )
+                ], Decimal("0")
             return [StepResult(f"查询 {asset} 可转出", False, str(exc))], Decimal("0")
         move = amount if amount > 0 else cap
         if move > cap:
             move = cap
         move = move.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
         if move < SPOT_MIN:
+            if has_hedge:
+                return [
+                    StepResult(
+                        "暂停换产品",
+                        True,
+                        f"统一账户 {asset} 现在最多能转回理财 {fmt_amount(cap, 8)}。"
+                        "有对冲仓时其余要留作保证金，这次不转。",
+                    )
+                ], Decimal("0")
+            # 无仓：PM 侧可转=0 多半是代币已在理财钱包，继续赎回即可
             return [
                 StepResult(
-                    "暂停换产品",
+                    f"统一账户无 {asset} 可转回",
                     True,
-                    f"统一账户 {asset} 现在最多能转回理财 {fmt_amount(cap, 8)}。"
-                    "有对冲仓时其余要留作保证金，这次不转。",
+                    f"FUTURE_TO_EARN={fmt_amount(cap, 8)}，无对冲仓，按理财侧余额继续赎回",
                 )
             ], Decimal("0")
         step = self._mutate(
@@ -890,6 +990,36 @@ class Pipeline:
         if not step.ok:
             return [step], Decimal("0")
         return [step, StepResult("转回数量", True, move)], move
+
+    def _pull_pm_asset_to_spot(self, asset: str, want: Decimal) -> tuple[list[StepResult], Decimal]:
+        """BFUSD/RWUSD 在统一账户里时，earn-asset-transfer 不可用：走 maxWithdraw → 现货再赎回。"""
+        asset = asset.upper()
+        steps: list[StepResult] = []
+        try:
+            cap = self.futures.max_withdraw(asset)
+        except BinanceAPIError as exc:
+            return [StepResult(f"查询 {asset} 可转出现货", False, str(exc))], Decimal("0")
+        move = min(want if want > 0 else cap, cap)
+        move = move.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+        if move < SPOT_MIN:
+            return [
+                StepResult(
+                    f"统一账户 {asset} 暂不可转出现货",
+                    True,
+                    f"maxWithdraw={fmt_amount(cap, 8)}（若结算币有负余额会卡住，无仓时应先填补）",
+                )
+            ], Decimal("0")
+        step = self._mutate(
+            f"统一账户 {asset} {fmt_amount(move)} 转出现货，准备赎回",
+            lambda qty=move: self.futures.unified_to_spot(asset, qty),
+        )
+        steps.append(step)
+        if not step.ok:
+            return steps, Decimal("0")
+        if not step.dry_run:
+            self.earn.invalidate()
+            time.sleep(max(int(self.settings.settle_seconds or 0), 1))
+        return steps, move
 
     def _convert_usdc_proceeds(self) -> StepResult | None:
         """RWUSD 赎回有时回到 USDC。申购入口用的是 source_asset，先换过去。"""
@@ -1077,8 +1207,17 @@ class Pipeline:
                 f"最多 {max_batches} 批。比较 {compared}"
             )
         steps = [StepResult("开始分批换产品", True, start_detail)]
+        if full and not hedge_open and not self.settings.dry_run:
+            steps.extend(self._repair_pm_negative_settle())
         batches = 0
         dust_cut = Decimal("1")  # 入场：小于 1 的非目标活期直接 redeemAll，避免 0.01 取整漏尾
+        redeem_kw = {"has_hedge": hedge_open}
+
+        def _redeem(product: FlexibleProduct, amt: Decimal, *, redeem_all: bool = False) -> list[StepResult]:
+            return self._redeem_then_subscribe(
+                product, target, amt, redeem_all=redeem_all, **redeem_kw
+            )
+
         for product, amount in sources:
             remaining = amount
             # 山寨活期数量单位不是 U，不能按 USDT 批次估；一律整笔赎→兑 USDT→申购
@@ -1090,7 +1229,7 @@ class Pipeline:
                         f"{product.asset} {fmt_amount(remaining)} 整笔赎回并兑成 {self.settings.source_asset} 再申购 {target.asset}",
                     )
                 )
-                steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                steps.extend(_redeem(product, remaining, redeem_all=True))
                 self._soften_dust_failures(steps)
                 continue
             if full and remaining > 0 and remaining < dust_cut:
@@ -1101,7 +1240,7 @@ class Pipeline:
                         f"{product.asset} 仅剩 {fmt_amount(remaining)}，整笔赎回并入 {target.asset}",
                     )
                 )
-                steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                steps.extend(_redeem(product, remaining, redeem_all=True))
                 self._soften_dust_failures(steps)
                 continue
             while remaining > 0 and batches < max_batches:
@@ -1120,7 +1259,7 @@ class Pipeline:
                                 f"{product.asset} 还剩 {fmt_amount(remaining)}，整笔赎回清掉",
                             )
                         )
-                        steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                        steps.extend(_redeem(product, remaining, redeem_all=True))
                         self._soften_dust_failures(steps)
                         remaining = Decimal("0")
                         break
@@ -1143,12 +1282,12 @@ class Pipeline:
                     return steps
                 # 本批若本身已是尘埃，改整笔赎，避免按金额被拒
                 if full and batch < dust_cut:
-                    steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                    steps.extend(_redeem(product, remaining, redeem_all=True))
                     self._soften_dust_failures(steps)
                     remaining = Decimal("0")
                     break
                 before = len(steps)
-                steps.extend(self._redeem_then_subscribe(product, target, batch))
+                steps.extend(_redeem(product, batch))
                 fresh = steps[before:]
                 if any(not s.ok for s in fresh):
                     return steps
@@ -1187,13 +1326,13 @@ class Pipeline:
                 steps.append(
                     StepResult("清尾数", True, f"{product.asset} 循环后仍剩 {fmt_amount(remaining)}，整笔赎回")
                 )
-                steps.extend(self._redeem_then_subscribe(product, target, remaining, redeem_all=True))
+                steps.extend(_redeem(product, remaining, redeem_all=True))
                 self._soften_dust_failures(steps)
                 remaining = Decimal("0")
             elif 0 < remaining < self.settings.switch_min_batch:
                 mmr, equity = self._mmr_equity()
                 if self._next_switch_batch(remaining, mmr, equity, full=full, hedge_open=hedge_open) >= remaining:
-                    steps.extend(self._redeem_then_subscribe(product, target, remaining))
+                    steps.extend(_redeem(product, remaining))
                     remaining = Decimal("0")
         if full:
             # 再扫一遍持仓，清掉交易所账面尘埃（如 0.0065）
@@ -1207,7 +1346,7 @@ class Pipeline:
                         f"复查仍有 {product.asset} {fmt_amount(amount)}，整笔赎回",
                     )
                 )
-                steps.extend(self._redeem_then_subscribe(product, target, amount, redeem_all=True))
+                steps.extend(_redeem(product, amount, redeem_all=True))
                 self._soften_dust_failures(steps)
         if batches == 0 and all(s.ok for s in steps) and not any("清尾数" in s.name for s in steps):
             # 若已有清尾数步骤，不要盖成「没有达到最小批次」
@@ -1294,6 +1433,7 @@ class Pipeline:
         amount: Decimal,
         *,
         redeem_all: bool = False,
+        has_hedge: bool = True,
     ) -> list[StepResult]:
         steps: list[StepResult] = []
         if not source.can_redeem and source.kind not in {"bfusd", "rwusd"}:
@@ -1304,22 +1444,71 @@ class Pipeline:
                     f"交易所标记不可赎回 canRedeem=false，productId={source.product_id}",
                 )
             ]
+        moved_out = Decimal("0")
         if source.asset == "USDT" and source.kind == "flexible":
-            back, moved = self._return_pm_earn("LDUSDT", amount)
+            back, moved = self._return_pm_earn("LDUSDT", amount, has_hedge=has_hedge)
             steps.extend(back)
             if any(not s.ok for s in back) or any(s.name == "暂停换产品" for s in back):
                 return steps
             if source.raw.get("located") == "pm" and moved > 0:
                 amount = moved
+                moved_out = moved
+        if source.kind in {"bfusd", "rwusd"}:
+            # BFUSD/RWUSD 常在统一账户里；earn-asset-transfer 不支持，先转现货再赎
+            try:
+                pm_bal = self.futures.papi_balances().get(source.asset.upper(), Decimal("0"))
+            except BinanceAPIError:
+                pm_bal = Decimal("0")
+            if pm_bal >= SPOT_MIN:
+                pull_steps, pulled = self._pull_pm_asset_to_spot(source.asset, amount)
+                steps.extend(pull_steps)
+                if any(not s.ok for s in pull_steps):
+                    return steps
+                if pulled > 0:
+                    moved_out = pulled
+                    amount = pulled
+                elif has_hedge:
+                    steps.append(
+                        StepResult(
+                            "暂停换产品",
+                            True,
+                            f"统一账户有 {source.asset} 但转不出，有对冲仓先留作保证金",
+                        )
+                    )
+                    return steps
+                elif pulled <= 0:
+                    # 无仓仍转不出：别硬赎 PM 里的量（会 -6018）
+                    try:
+                        spot_only = self.earn.spot_free(source.asset)
+                    except BinanceAPIError:
+                        spot_only = Decimal("0")
+                    if spot_only < SPOT_MIN:
+                        steps.append(
+                            StepResult(
+                                f"赎回 {source.asset} 跳过",
+                                True,
+                                f"统一账户转不出且现货不足 1，先处理负余额/权限后再换",
+                            )
+                        )
+                        return steps
+                    amount = spot_only
+            if not self.settings.dry_run:
+                self.earn.invalidate()
+                try:
+                    spot_tok = self.earn.spot_free(source.asset)
+                except BinanceAPIError:
+                    spot_tok = Decimal("0")
+                if spot_tok >= SPOT_MIN:
+                    amount = min(amount, spot_tok)
         if source.kind == "bfusd":
             redeem = self._mutate(
                 f"赎回 BFUSD {fmt_amount(amount)}（FAST，回现货 USDT）",
-                lambda: self.earn.redeem_bfusd(amount, "FAST"),
+                lambda amt=amount: self.earn.redeem_bfusd(amt, "FAST"),
             )
         elif source.kind == "rwusd":
             redeem = self._mutate(
                 f"赎回 RWUSD {fmt_amount(amount)}（FAST，回到现货）",
-                lambda: self.earn.redeem_rwusd(amount, "FAST"),
+                lambda amt=amount: self.earn.redeem_rwusd(amt, "FAST"),
             )
         elif redeem_all:
             redeem = self._mutate(
@@ -1340,6 +1529,10 @@ class Pipeline:
         steps.append(redeem)
         if not redeem.ok:
             return steps
+        if moved_out <= 0:
+            moved_out = amount
+        if not any(s.name == "转回数量" for s in steps):
+            steps.append(StepResult("转回数量", True, moved_out))
         if not self.settings.dry_run and self.settings.settle_seconds > 0:
             time.sleep(self.settings.settle_seconds)
         # 赎回物可能是 USDC / 山寨币：先兑成申购资产再买目标理财
