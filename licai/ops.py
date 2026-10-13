@@ -283,13 +283,16 @@ def pipeline_for(
         take_profit_custom=account.take_profit_custom,
     )
     pipe = Pipeline(settings)
-    if ops is not None and account.proxy:
-        account_id = account.id
+    if ops is not None:
+        blocked = ops._earn_region_block.setdefault(account.id, set())
+        pipe._runtime_denylist = blocked
+        if account.proxy:
+            account_id = account.id
 
-        def _rotate(bad: str, exc: BaseException) -> str | None:
-            return ops.rotate_dead_proxy(account_id, bad, exc)
+            def _rotate(bad: str, exc: BaseException) -> str | None:
+                return ops.rotate_dead_proxy(account_id, bad, exc)
 
-        pipe.client.bind_proxy_rotator(_rotate)
+            pipe.client.bind_proxy_rotator(_rotate)
     return pipe
 
 
@@ -311,6 +314,8 @@ class OpsService:
         )
         self._bad_proxy_endpoints: set[str] = set()
         self._proxy_rotate_lock = threading.Lock()
+        # account_id -> 地区/合规不可用资产（进程内记住，避免每天把 BFUSD 赎成闲置 U）
+        self._earn_region_block: dict[int, set[str]] = {}
 
     def webshare_status(self) -> dict:
         ok = self._webshare.configured

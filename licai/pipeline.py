@@ -88,6 +88,8 @@ class Pipeline:
         self._product_list: list[FlexibleProduct] | None = None
         self._product_list_at = 0.0
         self._wallet_transfer_blocked = False
+        # 本进程内：地区/合规不可用的产品（如 RWUSD -9000），避免反复赎回后申购失败把 U 卡在现货
+        self._runtime_denylist: set[str] = set()
 
     def spot_cash(self, asset: str | None = None) -> Decimal:
         return self.earn.spot_free((asset or self.settings.source_asset).upper())
@@ -186,9 +188,10 @@ class Pipeline:
         del margin_assets
         if not product.purchasable:
             return False
-        if product.asset in self.settings.asset_denylist:
+        asset = (product.asset or "").upper()
+        if asset in self.settings.asset_denylist or asset in self._runtime_denylist:
             return False
-        if self.settings.asset_allowlist and product.asset not in self.settings.asset_allowlist:
+        if self.settings.asset_allowlist and asset not in self.settings.asset_allowlist:
             return False
         if not earns_as_um_margin(product, self._collateral_rate_map()):
             return False
@@ -198,6 +201,83 @@ class Pipeline:
         if self.settings.max_apr > 0 and percent > self.settings.max_apr:
             return False
         return True
+
+    @staticmethod
+    def _region_blocked_detail(detail: object) -> bool:
+        text = str(detail or "")
+        low = text.lower()
+        return (
+            "-9000" in text
+            or "not available in your region" in low
+            or "address verification" in low
+            or "local regulations" in low
+        )
+
+    def _mark_asset_unavailable(self, asset: str, detail: object) -> bool:
+        """地区/合规不可用时记入运行时黑名单，后续 pick/换年化跳过。"""
+        if not self._region_blocked_detail(detail):
+            return False
+        name = (asset or "").upper()
+        if not name:
+            return False
+        if name not in self._runtime_denylist:
+            self._runtime_denylist.add(name)
+            self._product_list = None
+        return True
+
+    def _fallback_subscribe(self, failed: FlexibleProduct, amount: Decimal, fail_detail: object) -> list[StepResult]:
+        """申购失败后改买次优可作保证金的产品（常见：RWUSD 地区限制 → BFUSD / USDT 活期）。"""
+        self._mark_asset_unavailable(failed.asset, fail_detail)
+        steps: list[StepResult] = []
+        try:
+            leftover = self.earn.spot_free(self.settings.source_asset)
+        except BinanceAPIError:
+            leftover = Decimal("0")
+        buy_amt = leftover if leftover >= SPOT_MIN else amount
+        if buy_amt < SPOT_MIN:
+            return steps
+        alt: FlexibleProduct | None = None
+        try:
+            alt = self.pick()
+        except Exception:
+            alt = None
+        if alt is None or self._same_product(alt, failed):
+            alt = self._best_usdt_flexible()
+        if alt is None or self._same_product(alt, failed):
+            return steps + [
+                StepResult(
+                    "改申购失败",
+                    False,
+                    f"{failed.asset} 不可用，也没有可替代的理财产品",
+                )
+            ]
+        steps.append(
+            StepResult(
+                "改申购",
+                True,
+                f"{failed.asset} 不可用（{fail_detail}），改买 {alt.asset} 年化 {apr_percent(alt.apr):.2f}%",
+            )
+        )
+        before = len(steps)
+        steps.extend(self.buy(alt, buy_amt))
+        if any(not s.ok for s in steps[before:]):
+            # 再试 USDT 活期
+            flex = self._best_usdt_flexible()
+            if flex is not None and not self._same_product(flex, alt):
+                try:
+                    leftover = self.earn.spot_free(self.settings.source_asset)
+                except BinanceAPIError:
+                    leftover = buy_amt
+                if leftover >= SPOT_MIN:
+                    steps.append(
+                        StepResult(
+                            "再改申购 USDT 活期",
+                            True,
+                            f"{alt.asset} 仍失败，改买 USDT 活期",
+                        )
+                    )
+                    steps.extend(self.buy(flex, leftover))
+        return steps
 
     @staticmethod
     def _is_margin_asset(asset: str, margin_assets: set[str]) -> bool:
@@ -245,6 +325,8 @@ class Pipeline:
                 f"申购 {product.asset}（用 {pay_asset}）数量={fmt_amount(subscribe_amount)}",
                 lambda fn=subscribe_fn: fn(subscribe_amount, pay_asset),
             )
+            if not subscribe.ok:
+                self._mark_asset_unavailable(product.asset, subscribe.detail)
             steps.append(subscribe)
             steps.append(StepResult("subscribe_amount", True, subscribe_amount))
             return steps
@@ -381,24 +463,14 @@ class Pipeline:
         )
         steps.extend(self.buy(product, amount))
         if any(not s.ok for s in steps) and product.kind in {"bfusd", "rwusd"}:
-            alt = self._best_usdt_flexible()
-            leftover = self.earn.spot_free(self.settings.source_asset)
-            if alt is not None and leftover > 0:
-                fail = next((s for s in reversed(steps) if not s.ok), None)
-                before = len(steps)
-                steps.append(
-                    StepResult(
-                        "改申购 USDT 活期",
-                        True,
-                        f"{product.asset} 申购失败（{fail.detail if fail else '未知'}），改买 USDT 活期",
-                    )
-                )
-                steps.extend(self.buy(alt, leftover))
-                if all(s.ok for s in steps[before:]):
-                    for s in steps[:before]:
-                        if not s.ok:
-                            s.ok = True
-                            s.detail = f"失败后已改申购 USDT 活期：{s.detail}"
+            fail = next((s for s in reversed(steps) if not s.ok), None)
+            before = len(steps)
+            steps.extend(self._fallback_subscribe(product, amount, fail.detail if fail else "未知"))
+            if before < len(steps) and all(s.ok for s in steps[before:]):
+                for s in steps[:before]:
+                    if not s.ok:
+                        s.ok = True
+                        s.detail = f"失败后已改申购：{s.detail}"
         return steps
 
     def earn_holdings(self) -> list[tuple[FlexibleProduct, Decimal]]:
@@ -1289,6 +1361,15 @@ class Pipeline:
                 before = len(steps)
                 steps.extend(_redeem(product, batch))
                 fresh = steps[before:]
+                if (target.asset or "").upper() in self._runtime_denylist:
+                    steps.append(
+                        StepResult(
+                            "暂停换产品",
+                            True,
+                            f"{target.asset} 本地区不可用，已尽量改买其它产品，停止继续换年化",
+                        )
+                    )
+                    return steps
                 if any(not s.ok for s in fresh):
                     return steps
                 if any(s.name == "暂停换产品" for s in fresh):
@@ -1571,6 +1652,15 @@ class Pipeline:
                 if not s.ok:
                     s.ok = True
                     s.detail = f"尾数过小未申购：{s.detail}"
+        elif any(not s.ok for s in steps[before:]):
+            fail = next((s for s in reversed(steps[before:]) if not s.ok), None)
+            fb_at = len(steps)
+            steps.extend(self._fallback_subscribe(target, buy_amount, fail.detail if fail else "未知"))
+            if fb_at < len(steps) and all(s.ok for s in steps[fb_at:]):
+                for s in steps[before:fb_at]:
+                    if not s.ok:
+                        s.ok = True
+                        s.detail = f"失败后已改申购：{s.detail}"
         return steps
 
     @staticmethod
