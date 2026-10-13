@@ -535,12 +535,16 @@ class FuturesAPI:
         return rows
 
     def round_trip_fee(self, symbol: str, qty: Decimal, mid: Decimal) -> dict[str, Decimal | str]:
-        """收利一轮手续费：优先用近期同仓位成交的实付，否则按账户真实费率×名义。"""
+        """收利一轮手续费：优先用近期同仓位成交的实付，否则按账户真实费率×名义。
+
+        同一订单可能拆成多笔成交（如平多 0.172 → 0.136+0.036），必须按 orderId 合并后再比数量，
+        否则会漏掉拆单手续费。
+        """
         qty = abs(qty)
         notional = qty * mid if qty > 0 and mid > 0 else Decimal("0")
         qty_bucket = str(qty.quantize(Decimal("0.001"))) if qty > 0 else "0"
         mid_bucket = str(mid.quantize(Decimal("0.01"))) if mid > 0 else "0"
-        fee_key = (self.client.api_key[:12], symbol, qty_bucket, mid_bucket)
+        fee_key = (self.client.api_key[:12], symbol, qty_bucket, mid_bucket, "v2")
         now = time.monotonic()
         hit = _ROUND_TRIP_FEE_CACHE.get(fee_key)
         if hit and now - hit[0] < _ROUND_TRIP_FEE_TTL:
@@ -555,22 +559,21 @@ class FuturesAPI:
         fee = notional * (maker + taker) if notional > 0 else Decimal("0")
         source = "rate"
         try:
-            trades = self.um_user_trades(symbol, limit=20)
+            trades = self.um_user_trades(symbol, limit=50)
         except BinanceAPIError:
             trades = []
-        matched: list[Decimal] = []
+
         bnb_mid = Decimal("0")
-        for row in trades:
+
+        def _commission_usdt(row: dict) -> Decimal:
+            nonlocal bnb_mid
             asset = str(row.get("commissionAsset") or "").upper()
             if asset and asset not in {"USDT", "USDC", "BFUSD", "BUSD", "FDUSD", "BNB"}:
-                continue
-            trade_qty = abs(d(row.get("qty")))
-            if qty > 0 and trade_qty > 0:
-                ratio = trade_qty / qty if qty >= trade_qty else qty / trade_qty
-                if ratio < Decimal("0.7"):
-                    continue
+                return Decimal("0")
             commission = abs(d(row.get("commission")))
-            if asset == "BNB" and commission > 0:
+            if commission <= 0:
+                return Decimal("0")
+            if asset == "BNB":
                 if bnb_mid <= 0:
                     try:
                         bb, ba = market.book("BNBUSDT")
@@ -578,14 +581,57 @@ class FuturesAPI:
                     except Exception:
                         bnb_mid = Decimal("0")
                 if bnb_mid <= 0:
+                    return Decimal("0")
+                return commission * bnb_mid
+            return commission
+
+        # 按订单合并拆单成交
+        by_order: dict[str, dict[str, Decimal | int]] = {}
+        for row in trades:
+            if not isinstance(row, dict):
+                continue
+            oid = str(row.get("orderId") or "")
+            if not oid:
+                oid = f"t:{row.get('id') or row.get('tradeId') or id(row)}"
+            slot = by_order.get(oid)
+            if slot is None:
+                slot = {"qty": Decimal("0"), "fee": Decimal("0"), "time": 0}
+                by_order[oid] = slot
+            slot["qty"] = d(slot["qty"]) + abs(d(row.get("qty")))
+            slot["fee"] = d(slot["fee"]) + _commission_usdt(row)
+            ts = int(row.get("time") or row.get("T") or 0)
+            if ts > int(slot["time"] or 0):
+                slot["time"] = ts
+
+        orders = sorted(by_order.values(), key=lambda o: int(o["time"] or 0), reverse=True)
+        if qty > 0:
+            matched: list[Decimal] = []
+            for order in orders:
+                oq = d(order["qty"])
+                if oq <= 0:
                     continue
-                commission = commission * bnb_mid
-            matched.append(commission)
+                ratio = (oq / qty) if qty >= oq else (qty / oq)
+                if ratio < Decimal("0.7"):
+                    continue
+                matched.append(d(order["fee"]))
+                if len(matched) >= 2:
+                    break
             if len(matched) >= 2:
-                break
-        if len(matched) >= 2:
-            fee = matched[0] + matched[1]
-            source = "trades"
+                fee = matched[0] + matched[1]
+                source = "trades"
+        elif orders:
+            # 无仓：上一轮收利通常是几分钟内平掉两边；把该时间窗内订单手续费加总
+            newest = int(orders[0]["time"] or 0)
+            window_ms = 20 * 60 * 1000
+            cluster_fee = Decimal("0")
+            for order in orders:
+                if newest - int(order["time"] or 0) > window_ms:
+                    break
+                cluster_fee += d(order["fee"])
+            if cluster_fee > 0:
+                fee = cluster_fee
+                source = "trades"
+
         out = {
             "fee": fee,
             "maker_rate": maker,
