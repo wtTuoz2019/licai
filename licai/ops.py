@@ -973,6 +973,10 @@ class OpsService:
             if fails:
                 print(f"动作失败 account={account.id} action={action} " + " | ".join(fails)[:800])
         self.invalidate_snapshot(account.id)
+        # 申购/划转落账有延迟，稍等再拉快照，避免页面仍显示操作前余额
+        settle = max(int(getattr(self.base, "settle_seconds", 0) or 0), 2)
+        if settle > 0 and not bool(getattr(self.base, "dry_run", False)):
+            time.sleep(settle)
         return {
             "ok": ok,
             "blocked": False,

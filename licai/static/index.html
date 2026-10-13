@@ -1445,10 +1445,15 @@
         const prev = seenEventId(selected);
         if (eid > prev) {
           setSeenEventId(selected, eid);
-          // 后台自动收利完成后，主动刷资金/日志（首次加载只记 id，不刷）
-          if (prev > 0 && top.action === "harvest" && top.ok && !busy) {
-            setActionMsg(String(top.detail || "自动收利已完成").slice(0, 220));
+          // 后台自动开仓/收利/换年化/归集完成后，主动刷资金（首次加载只记 id，不刷）
+          const fundActs = new Set(["harvest", "enter", "switch", "scale", "sweep", "fund", "recycle"]);
+          if (prev > 0 && top.ok && fundActs.has(top.action) && !busy) {
+            setActionMsg(String(top.detail || "自动操作已完成").slice(0, 220));
             refresh({ force: true, silent: true });
+            const accId = selected;
+            setTimeout(() => {
+              if (selected === accId && !busy) refresh({ force: true, silent: true });
+            }, 3500);
           }
         }
       }
@@ -1748,9 +1753,13 @@
           render(data.snapshot);
         }
         setActionMsg(formatActionResult(data));
-        // 收利后申购/划转刚落账，再强制刷一次资金与操作日志
-        if (action === "harvest" && !data.blocked) {
+        // 入场/收利/换年化/加仓等资金变动后强制刷账户；到账有延迟再补刷一次
+        if (!data.blocked) {
           await refresh({ force: true, silent: true });
+          const accId = selected;
+          setTimeout(() => {
+            if (selected === accId && !busy) refresh({ force: true, silent: true });
+          }, 3500);
         }
       } catch (err) {
         hideModal();
