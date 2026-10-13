@@ -672,8 +672,31 @@
     const FUNDS_STORE = "licai_funds_cache_v1";
     let pollMs = 120000;
     let liveAt = 0;
+    let fundsRefreshTimer = null;
     const lastSeenByAccount = Object.create(null);
     const $ = (id) => document.getElementById(id);
+
+    function scheduleFundsRefresh(accId, msg) {
+      // 等后台一整串操作结束（busy 解除）后再刷，避免中途余额半更新
+      if (msg) setActionMsg(msg);
+      if (fundsRefreshTimer) clearTimeout(fundsRefreshTimer);
+      const tryRefresh = () => {
+        fundsRefreshTimer = null;
+        if (!sameAccount(accId) || busy) return;
+        refresh({ force: true, silent: true });
+      };
+      fundsRefreshTimer = setTimeout(async () => {
+        // 账号仍在执行串联动作时再等一轮
+        try {
+          const s = await api(`/api/accounts/${accId}/monitor`);
+          if (s && s.action_busy) {
+            fundsRefreshTimer = setTimeout(tryRefresh, 4000);
+            return;
+          }
+        } catch (_) {}
+        tryRefresh();
+      }, 4000);
+    }
 
     function seenEventId(id) {
       return Number(lastSeenByAccount[cacheId(id)]) || 0;
@@ -1445,15 +1468,10 @@
         const prev = seenEventId(selected);
         if (eid > prev) {
           setSeenEventId(selected, eid);
-          // 后台自动开仓/收利/换年化/归集完成后，主动刷资金（首次加载只记 id，不刷）
+          // 后台资金类动作：等串联全部结束后再刷（防抖 + 避开 action_busy）
           const fundActs = new Set(["harvest", "enter", "switch", "scale", "sweep", "fund", "recycle"]);
           if (prev > 0 && top.ok && fundActs.has(top.action) && !busy) {
-            setActionMsg(String(top.detail || "自动操作已完成").slice(0, 220));
-            refresh({ force: true, silent: true });
-            const accId = selected;
-            setTimeout(() => {
-              if (selected === accId && !busy) refresh({ force: true, silent: true });
-            }, 3500);
+            scheduleFundsRefresh(selected, String(top.detail || "自动操作已完成").slice(0, 220));
           }
         }
       }
@@ -1741,26 +1759,23 @@
         });
         if (!ok) return;
       }
-      showLoading(meta.title, "请稍候");
+      showLoading(meta.title, "全部步骤完成后刷新账户…");
       try {
         const data = await api(`/api/accounts/${selected}/actions`, {
           method: "POST",
           body: JSON.stringify(payload),
         });
-        hideModal();
-        if (data.snapshot && !data.blocked) {
-          rememberSnap(selected, data.snapshot);
-          render(data.snapshot);
-        }
-        setActionMsg(formatActionResult(data));
-        // 入场/收利/换年化/加仓等资金变动后强制刷账户；到账有延迟再补刷一次
+        // 等接口整串步骤 + 服务端落账快照都返回后，再刷一次页面并关弹窗
         if (!data.blocked) {
-          await refresh({ force: true, silent: true });
-          const accId = selected;
-          setTimeout(() => {
-            if (selected === accId && !busy) refresh({ force: true, silent: true });
-          }, 3500);
+          if (data.snapshot) {
+            rememberSnap(selected, data.snapshot);
+            render(data.snapshot);
+          } else {
+            await refresh({ force: true, silent: true });
+          }
         }
+        hideModal();
+        setActionMsg(formatActionResult(data));
       } catch (err) {
         hideModal();
         setActionMsg(err.message);

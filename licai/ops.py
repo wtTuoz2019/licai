@@ -657,6 +657,7 @@ class OpsService:
             "auto_harvest_seconds": int(getattr(settings, "auto_harvest_seconds", 60) or 60),
             "price": stability.as_dict().get("mid") or "0",
             "spot_usdt": fmt_amount(spot_usdt, 4),
+            "action_busy": account.id in self._busy,
             "legs": self._legs_payload(legs),
             "other_positions": self._other_positions(futures, settings.hedge_symbol, legs),
             "stability": stability.as_dict(),
@@ -810,6 +811,7 @@ class OpsService:
         _locked: bool = False,
         auto: bool = False,
         harvest_side: str | None = None,
+        with_snapshot: bool = True,
     ) -> dict:
         own_lock = False
         if not _locked:
@@ -830,10 +832,19 @@ class OpsService:
                 mode=mode,
                 auto=auto,
                 harvest_side=harvest_side,
+                with_snapshot=with_snapshot,
             )
         finally:
             if own_lock:
                 self.end_action(account.id)
+
+    def refresh_account_snapshot(self, account: Account) -> dict:
+        """一整串操作都结束后再等落账并拉快照。"""
+        self.invalidate_snapshot(account.id)
+        settle = max(int(getattr(self.base, "settle_seconds", 0) or 0), 2)
+        if settle > 0 and not bool(getattr(self.base, "dry_run", False)):
+            time.sleep(settle)
+        return self.snapshot(account, force=True)
 
     @staticmethod
     def _auto_side_harvest_ok(live: dict, harvest: dict, side: str) -> bool:
@@ -859,6 +870,7 @@ class OpsService:
         *,
         auto: bool = False,
         harvest_side: str | None = None,
+        with_snapshot: bool = True,
     ) -> dict:
         if action not in {"enter", "harvest", "switch", "sweep", "hedge", "recycle", "fund", "leverage", "scale"}:
             raise ValueError(f"未知动作: {action}")
@@ -972,17 +984,18 @@ class OpsService:
                 fails = [f"{s.name}: {_detail(s.detail)}" for s in steps if not s.ok]
             if fails:
                 print(f"动作失败 account={account.id} action={action} " + " | ".join(fails)[:800])
-        self.invalidate_snapshot(account.id)
-        # 申购/划转落账有延迟，稍等再拉快照，避免页面仍显示操作前余额
-        settle = max(int(getattr(self.base, "settle_seconds", 0) or 0), 2)
-        if settle > 0 and not bool(getattr(self.base, "dry_run", False)):
-            time.sleep(settle)
+        # 默认在本动作全部步骤完成后再等落账拉快照；串联子动作可 with_snapshot=False，由外层统一刷
+        if with_snapshot:
+            snap = self.refresh_account_snapshot(account)
+        else:
+            self.invalidate_snapshot(account.id)
+            snap = None
         return {
             "ok": ok,
             "blocked": False,
             "live": True,
             "steps": steps_payload(steps),
-            "snapshot": self.snapshot(account, force=True),
+            "snapshot": snap,
         }
 
     def _persist_action_log(

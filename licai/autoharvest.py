@@ -177,12 +177,14 @@ class AutoHarvestWorker:
     def _maybe_act(self, account) -> None:
         if not self.ops.try_begin_action(account.id):
             return
+        did_trade = False
         try:
             live = self.ops.monitor(account)
             if not live.get("ok"):
                 return
             # 现货加了 U：先申购理财入保证金（不等交叉）
             if self._maybe_sweep_spot(account, live):
+                did_trade = True
                 # 申购后权益变了，重拉再决定开仓/加仓
                 live = self.ops.monitor(account)
                 if not live.get("ok"):
@@ -190,12 +192,21 @@ class AutoHarvestWorker:
             legs = live.get("legs") or {}
             flat = _qty(legs, "long_qty") <= 0 and _qty(legs, "short_qty") <= 0
             if flat:
-                self._maybe_enter(account, live)
+                if self._maybe_enter(account, live):
+                    did_trade = True
             else:
                 # 有仓：优先收利；否则在好时机自动加仓
-                if not self._maybe_harvest(account, live):
-                    self._maybe_scale(account, live)
+                if self._maybe_harvest(account, live):
+                    did_trade = True
+                elif self._maybe_scale(account, live):
+                    did_trade = True
         finally:
+            # 一整串（归集→开仓/收利/加仓）都结束后再等落账刷快照
+            if did_trade:
+                try:
+                    self.ops.refresh_account_snapshot(account)
+                except Exception:
+                    log.exception("账号 %s 操作后刷新快照失败", account.id)
             self.ops.end_action(account.id)
 
     def _maybe_sweep_spot(self, account, live: dict) -> bool:
@@ -217,6 +228,7 @@ class AutoHarvestWorker:
             mode="earn_only",
             _locked=True,
             auto=True,
+            with_snapshot=False,
         )
         ok = bool(result.get("ok"))
         detail = result.get("reason") or ""
@@ -254,6 +266,7 @@ class AutoHarvestWorker:
             mode=None,
             _locked=True,
             auto=True,
+            with_snapshot=False,
         )
         ok = bool(result.get("ok"))
         detail = result.get("reason") or ""
@@ -269,21 +282,21 @@ class AutoHarvestWorker:
         _print(f"自动加仓结束 account={account.id} ok={ok} {detail[:500]}")
         return True
 
-    def _maybe_enter(self, account, live: dict) -> None:
+    def _maybe_enter(self, account, live: dict) -> bool:
         """无仓：金叉/死叉那一根 + 严平稳，才自动双边开仓。"""
         stability = live.get("stability") or {}
         enter = live.get("enter") or {}
         if not stability.get("stable"):
-            return
+            return False
         if enter.get("can_click") is False and not enter.get("stable_ok"):
-            return
+            return False
         if not enter.get("stable_ok", stability.get("stable")):
-            return
+            return False
         macd_note = "未启用 MACD 过滤"
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
             side, macd_note = self._macd_side()
             if not side:
-                return
+                return False
         _print(f"自动开仓触发 account={account.id} 严平稳 · {macd_note}，双边挂单入场")
         result = self.ops.run_action(
             account,
@@ -292,6 +305,7 @@ class AutoHarvestWorker:
             mode=None,
             _locked=True,
             auto=True,
+            with_snapshot=False,
         )
         ok = bool(result.get("ok"))
         detail = result.get("reason") or ""
@@ -305,6 +319,7 @@ class AutoHarvestWorker:
             if cross:
                 self._last_cross_key = f"{cross.kind}:{cross.time}"
         _print(f"自动开仓结束 account={account.id} ok={ok} {detail[:500]}")
+        return True
 
     def _maybe_harvest(self, account, live: dict) -> bool:
         harvest = live.get("harvest") or {}
@@ -341,6 +356,7 @@ class AutoHarvestWorker:
             _locked=True,
             auto=True,
             harvest_side=side,
+            with_snapshot=False,
         )
         ok = bool(result.get("ok"))
         detail = result.get("reason") or ""
