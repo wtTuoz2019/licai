@@ -203,6 +203,9 @@ class AutoHarvestWorker:
         if not bool(getattr(self.ops.base, "auto_sweep_spot", True)):
             return False
         spot = d(live.get("spot_usdt") or "0")
+        if spot < 1:
+            # monitor 旧版可能没带 spot_usdt；再读快照缓存
+            spot = self.ops._idle_spot(account)
         # 其它稳定币闲置也从 wallet_status / holdings 难直接读；现货 USDT 是主路径
         if spot < 1:
             return False

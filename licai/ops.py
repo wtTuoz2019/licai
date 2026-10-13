@@ -635,6 +635,12 @@ class OpsService:
         )
         mmr_text = format_uni_mmr(mmr, legs.long_qty > 0 or legs.short_qty > 0)
         lev, lev_tgt = _display_leverage(legs, settings)
+        # 自动归集现货读的是 monitor.spot_usdt；不能只靠快照缓存（常为空）
+        spot_usdt = self._idle_spot(account)
+        try:
+            spot_usdt = pipe.spot_cash("USDT")
+        except Exception:
+            pass
         return {
             "ok": True,
             "account": account.public_dict(),
@@ -645,10 +651,11 @@ class OpsService:
             "live_poll_seconds": int(settings.live_poll_seconds),
             "auto_harvest_seconds": int(getattr(settings, "auto_harvest_seconds", 60) or 60),
             "price": stability.as_dict().get("mid") or "0",
+            "spot_usdt": fmt_amount(spot_usdt, 4),
             "legs": self._legs_payload(legs),
             "other_positions": self._other_positions(futures, settings.hedge_symbol, legs),
             "stability": stability.as_dict(),
-            "enter": enter_advice(legs, stability, self._idle_spot(account), plan),
+            "enter": enter_advice(legs, stability, spot_usdt, plan),
             "harvest": advice.as_dict(),
             "events": _events_payload(account.id, self.store.recent_events(account.id, 30)),
         }

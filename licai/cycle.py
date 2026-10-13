@@ -259,8 +259,7 @@ class HedgeCycle:
         legs = self.futures.legs(self.symbol)
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
         steps = list(self.pipeline.switch_to_best(full=not has_pos, has_hedge=has_pos))
-        if any(not s.ok for s in steps):
-            return steps
+        # 换年化失败不拦住扫现货，否则闲置 U 会一直卡着（例如 RWUSD 地址验证 -9000）
         sweep = self.pipeline.sweep_spot_to_earn()
         steps.extend(sweep)
         if any(not s.ok for s in sweep):
