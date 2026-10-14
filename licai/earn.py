@@ -330,10 +330,10 @@ class EarnAPI:
         return rank
 
     def bfusd_rate_pair(self) -> tuple[Decimal, Decimal]:
-        """返回 (800U以上的页面年化, 800U以内的更高一日)。
+        """返回 (超过 800 BFUSD 的年化, 800 以内的更高一日)。
 
-        理财页预估与近 7 日均值一致，给余额超过 800U 的账户用。
-        最近一日更高时，那是 800U 以内的高档。用哪一档由账户资金决定。
+        理财页预估与近 7 日均值一致，给持仓超过 800 的部分用。
+        最近一日更高时，那是前 800 BFUSD 的高档。按 BFUSD 持仓切档，不看账户总资金。
         """
         latest, average = self._daily_and_average("/sapi/v1/bfusd/history/rateHistory", days=7)
         card = self._homepage_apr("BFUSD")

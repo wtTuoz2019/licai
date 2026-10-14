@@ -28,7 +28,7 @@ def _qty(legs: dict, key: str):
 class AutoHarvestWorker:
     """后台轮询：
 
-    - 每日：拉全部理财奖励记录；若开启 auto_switch_earn，把可赎回的低收益稳定币理财换成当前最高
+    - 每日：拉全部理财奖励记录；仅开启自动收利、且 auto_switch_earn 时，按各产品额度自动换到更高年化
     - 账号开启「自动收利」时：无仓等金叉/死叉+严平稳开仓；有仓等交叉+浮盈达标收利
     手动一键入场/收利不受影响。
     """
@@ -117,6 +117,11 @@ class AutoHarvestWorker:
             yday = live.get("earn_yesterday") or "0"
             src = live.get("earn_yesterday_source") or ""
             _print(f"每日理财收益 account={account.id} 昨日={yday} source={src}")
+
+            if not account.auto_harvest:
+                _print(f"每日换年化跳过 account={account.id}：未开自动收利，只在手动点「换年化」时换")
+                self._earn_day_done[account.id] = day
+                return
 
             if not bool(getattr(self.ops.base, "auto_switch_earn", True)):
                 self._earn_day_done[account.id] = day

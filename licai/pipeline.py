@@ -21,20 +21,18 @@ _BFUSD_TIER_USDT = Decimal("800")
 
 
 def apr_choice_text(product: FlexibleProduct) -> str:
-    """BFUSD：账户资金不超过 800U 用高档，超过则用理财页年化。"""
+    """BFUSD：前 800 用高档，超出部分用低档。不看账户总资金。"""
     text = f"{apr_percent(product.apr):.2f}%"
     raw = product.raw or {}
-    tier = raw.get("apr_tier")
-    funds = d(raw.get("account_funds") or 0)
-    fund_text = f"资金 {fmt_amount(funds, 2)}U" if funds > 0 else "资金未知"
     base = raw.get("base_apr")
     small = raw.get("small_balance_apr")
-    if tier == "under_800":
-        return text + f"（{fund_text}，800U以内）"
-    if tier == "over_800" and small not in (None, "", "0"):
-        return text + f"（{fund_text}，800U以上；800U以内 {apr_percent(d(small)):.2f}%）"
-    if small not in (None, "", "0") and base not in (None, "", "0"):
-        return text + f"（800U以上 {apr_percent(d(base)):.2f}%，800U以内 {apr_percent(d(small)):.2f}%）"
+    if product.kind == "bfusd" and small not in (None, "", "0") and base not in (None, "", "0"):
+        held = d(raw.get("bfusd_held") or 0)
+        held_text = f"持仓 {fmt_amount(held, 2)}" if held > 0 else "尚无持仓"
+        return (
+            text
+            + f"（{held_text}；800以内 {apr_percent(d(small)):.2f}%，以上 {apr_percent(d(base)):.2f}%）"
+        )
     return text
 
 
@@ -123,17 +121,197 @@ class Pipeline:
                 continue
         return equity + spot
 
+    def _bfusd_held(self) -> Decimal:
+        """BFUSD 持仓（理财、现货、统一账户取最大），用来判断还在不在 800 高档里。"""
+        try:
+            earn_amt = self.earn.bfusd_balance()
+        except BinanceAPIError:
+            earn_amt = Decimal("0")
+        try:
+            spot = self.earn.spot_free("BFUSD")
+        except BinanceAPIError:
+            spot = Decimal("0")
+        pm = self._pm_balances().get("BFUSD", Decimal("0"))
+        return max(earn_amt, spot, pm)
+
     def _bfusd_product(self) -> FlexibleProduct:
         product = self.earn.bfusd_product()
         raw = dict(product.raw or {})
         base = d(raw.get("base_apr") or product.apr)
         small = d(raw.get("small_balance_apr") or 0)
-        funds = self._account_funds()
-        raw["account_funds"] = str(funds)
+        held = self._bfusd_held()
         raw["base_apr"] = str(base)
-        use_small = small > base and funds > 0 and funds <= _BFUSD_TIER_USDT
+        raw["bfusd_held"] = str(held)
+        # 还没满 800 时，下一笔按高档参与比较；满了之后新增的按低档
+        use_small = small > base and held < _BFUSD_TIER_USDT
         raw["apr_tier"] = "under_800" if use_small else "over_800"
         return replace(product, apr=small if use_small else base, raw=raw)
+
+    def _bfusd_subscribe_room(self, product: FlexibleProduct) -> Decimal | None:
+        """高档值得买、低档不值得时，申购最多补到 800。两档都值得则不封顶。"""
+        raw = product.raw or {}
+        base = d(raw.get("base_apr") or product.apr)
+        small = d(raw.get("small_balance_apr") or 0)
+        if small <= base:
+            return None
+        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.1")
+        if gap < 0:
+            gap = Decimal("0")
+        best_other = Decimal("0")
+        for item in self.list_products():
+            if item.kind == "bfusd" or not self._eligible(item, self.margin_assets()):
+                continue
+            best_other = max(best_other, apr_percent(item.apr))
+        base_pct = apr_percent(base)
+        small_pct = apr_percent(small)
+        if base_pct > 0 and base_pct + gap >= best_other:
+            return None
+        if small_pct <= 0 or small_pct + gap < best_other:
+            return Decimal("0")
+        held = d(raw.get("bfusd_held") or 0)
+        return max(_BFUSD_TIER_USDT - held, Decimal("0"))
+
+    def _bfusd_keep_amount(self, product: FlexibleProduct, amount: Decimal, target: FlexibleProduct) -> Decimal:
+        """800 以内高档不低于目标时，留下不超过 800 的 BFUSD，只换超出的低档。"""
+        if product.kind != "bfusd" or amount <= 0:
+            return Decimal("0")
+        raw = product.raw or {}
+        base = d(raw.get("base_apr") or product.apr)
+        small = d(raw.get("small_balance_apr") or 0)
+        if small <= base:
+            return Decimal("0")
+        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.1")
+        if gap < 0:
+            gap = Decimal("0")
+        target_pct = apr_percent(target.apr)
+        base_pct = apr_percent(base)
+        small_pct = apr_percent(small)
+        if base_pct > 0 and base_pct + gap >= target_pct:
+            return amount
+        if small_pct <= 0 or small_pct + gap < target_pct:
+            return Decimal("0")
+        return min(amount, _BFUSD_TIER_USDT)
+
+    def _apr_gap(self) -> Decimal:
+        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.1")
+        return gap if gap > 0 else Decimal("0")
+
+    @staticmethod
+    def _alloc_key(product: FlexibleProduct) -> str:
+        if product.kind in {"bfusd", "rwusd"}:
+            return product.kind
+        return f"flex:{product.product_id or product.asset}"
+
+    def _yield_slices(self) -> list[tuple[FlexibleProduct, Decimal, Decimal | None]]:
+        """每个产品按自己的额度切档：(产品, 年化百分比, 该档额度)。额度 None 表示剩余资金。"""
+        slices: list[tuple[FlexibleProduct, Decimal, Decimal | None]] = []
+        for product in self.list_products():
+            if not self._eligible(product, self.margin_assets()):
+                continue
+            if product.kind == "bfusd":
+                raw = product.raw or {}
+                base = apr_percent(d(raw.get("base_apr") or product.apr))
+                small = apr_percent(d(raw.get("small_balance_apr") or 0))
+                if small > base:
+                    slices.append((product, small, _BFUSD_TIER_USDT))
+                    slices.append((product, base, None))
+                else:
+                    slices.append((product, base if base > 0 else apr_percent(product.apr), None))
+            else:
+                slices.append((product, apr_percent(product.apr), None))
+        slices.sort(key=lambda item: item[1], reverse=True)
+        return slices
+
+    def _allocation_moves(
+        self,
+        holdings: list[tuple[FlexibleProduct, Decimal]] | None = None,
+        *,
+        stable_only: bool = False,
+    ) -> list[tuple[FlexibleProduct, Decimal, FlexibleProduct, str]]:
+        """按各产品额度从高年化往低填，只挪超出额度、且年化差得过最小差距的部分。"""
+        holdings = holdings if holdings is not None else self.earn_holdings()
+        slices = self._yield_slices()
+        if not slices:
+            return []
+        gap = self._apr_gap()
+        stable_rows: list[tuple[FlexibleProduct, Decimal]] = []
+        alt_rows: list[tuple[FlexibleProduct, Decimal]] = []
+        for product, amount in holdings:
+            if amount <= 0:
+                continue
+            if self._is_stable_earn_asset(product):
+                stable_rows.append((product, amount))
+            elif not stable_only:
+                alt_rows.append((product, amount))
+        total = sum((amt for _, amt in stable_rows), Decimal("0"))
+        remaining = total
+        slice_want: list[Decimal] = []
+        for _product, _apr, cap in slices:
+            if remaining <= 0:
+                slice_want.append(Decimal("0"))
+                continue
+            take = remaining if cap is None else min(remaining, cap)
+            slice_want.append(take)
+            remaining -= take
+        left: dict[str, Decimal] = {}
+        by_key: dict[str, FlexibleProduct] = {}
+        for product, amount in stable_rows:
+            key = self._alloc_key(product)
+            left[key] = left.get(key, Decimal("0")) + amount
+            by_key[key] = product
+        slice_have: list[Decimal] = []
+        for product, _apr, cap in slices:
+            key = self._alloc_key(product)
+            avail = left.get(key, Decimal("0"))
+            take = avail if cap is None else min(avail, cap)
+            slice_have.append(take)
+            left[key] = avail - take
+        overs: list[tuple[Decimal, FlexibleProduct, Decimal]] = []
+        shorts: list[tuple[Decimal, FlexibleProduct, Decimal]] = []
+        for (product, apr, _cap), have, want in zip(slices, slice_have, slice_want):
+            if have > want:
+                overs.append((apr, product, have - want))
+            elif want > have:
+                shorts.append((apr, product, want - have))
+        for key, amt in left.items():
+            if amt > 0:
+                overs.append((Decimal("0"), by_key[key], amt))
+        overs.sort(key=lambda item: item[0])
+        shorts.sort(key=lambda item: item[0], reverse=True)
+        moves: list[tuple[FlexibleProduct, Decimal, FlexibleProduct, str]] = []
+        for src_apr, src, extra in overs:
+            for idx, (dst_apr, dst, need) in enumerate(shorts):
+                if extra <= 0 or need <= 0:
+                    continue
+                if self._alloc_key(src) == self._alloc_key(dst):
+                    continue
+                if dst_apr < src_apr + gap:
+                    continue
+                amt = min(extra, need)
+                moves.append(
+                    (
+                        src,
+                        amt,
+                        dst,
+                        f"{src.asset} {fmt_amount(amt, 2)}（{src_apr:.2f}%）→ {dst.asset}（{dst_apr:.2f}%）",
+                    )
+                )
+                extra -= amt
+                shorts[idx] = (dst_apr, dst, need - amt)
+        dest, dest_apr = slices[0][0], slices[0][1]
+        open_short = next((item for item in shorts if item[2] > 0), None)
+        if open_short is not None:
+            dest_apr, dest, _need = open_short
+        for product, amount in alt_rows:
+            moves.append(
+                (
+                    product,
+                    amount,
+                    dest,
+                    f"{product.asset} {fmt_amount(amount, 2)} → {dest.asset}（{dest_apr:.2f}%）",
+                )
+            )
+        return moves
 
     def list_products(self) -> list[FlexibleProduct]:
         now = time.monotonic()
@@ -313,6 +491,10 @@ class Pipeline:
             raise RuntimeError(f"{product.asset} 活期剩余额度不足")
         if self.settings.source_asset == product.asset:
             amount = min(amount, quota)
+        if product.kind == "bfusd":
+            room = self._bfusd_subscribe_room(product)
+            if room is not None:
+                amount = min(amount, room)
         return amount
 
     def buy(self, product: FlexibleProduct, amount: Decimal) -> list[StepResult]:
@@ -446,31 +628,55 @@ class Pipeline:
                 steps.append(StepResult("归集理财", True, f"已换到 {self.settings.source_asset}，但可申购余额不足，跳过申购"))
                 return steps
             return [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
-        if product is None:
-            try:
-                product = self.pick()
-            except Exception as exc:
-                return steps + [StepResult("归集理财", False, str(exc))]
-        amount = self.plan_amount(product, sweep_all=True)
-        if amount < SPOT_MIN:
-            return steps + [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
-        steps.append(
-            StepResult(
-                "归集理财",
-                True,
-                f"把现货 {fmt_amount(amount)} {self.settings.source_asset} 申购 {product.asset} 年化 {apr_percent(product.apr)}%",
+        fixed_product = product
+        bought_any = False
+        for _round in range(4):
+            if free < SPOT_MIN:
+                break
+            if product is None or _round > 0:
+                self._product_list = None
+                try:
+                    product = self.pick()
+                except Exception as exc:
+                    return steps + [StepResult("归集理财", False, str(exc))]
+            amount = self.plan_amount(product, sweep_all=True)
+            if amount < SPOT_MIN:
+                if steps:
+                    break
+                return steps + [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
+            steps.append(
+                StepResult(
+                    "归集理财",
+                    True,
+                    f"把现货 {fmt_amount(amount)} {self.settings.source_asset} 申购 {product.asset} 年化 {apr_percent(product.apr)}%",
+                )
             )
-        )
-        steps.extend(self.buy(product, amount))
-        if any(not s.ok for s in steps) and product.kind in {"bfusd", "rwusd"}:
-            fail = next((s for s in reversed(steps) if not s.ok), None)
             before = len(steps)
-            steps.extend(self._fallback_subscribe(product, amount, fail.detail if fail else "未知"))
-            if before < len(steps) and all(s.ok for s in steps[before:]):
-                for s in steps[:before]:
-                    if not s.ok:
-                        s.ok = True
-                        s.detail = f"失败后已改申购：{s.detail}"
+            steps.extend(self.buy(product, amount))
+            if any(not s.ok for s in steps[before:]) and product.kind in {"bfusd", "rwusd"}:
+                fail = next((s for s in reversed(steps) if not s.ok), None)
+                fb = len(steps)
+                steps.extend(self._fallback_subscribe(product, amount, fail.detail if fail else "未知"))
+                if fb < len(steps) and all(s.ok for s in steps[fb:]):
+                    for s in steps[before:fb]:
+                        if not s.ok:
+                            s.ok = True
+                            s.detail = f"失败后已改申购：{s.detail}"
+            if any(not s.ok for s in steps[before:]):
+                return steps
+            bought_any = True
+            # 调用方指定了产品时只买这一笔；自动归集则额度用满后继续填下一档
+            if fixed_product is not None or amount + SPOT_MIN >= free:
+                break
+            self.earn.invalidate()
+            self._product_list = None
+            try:
+                free = self.spot_cash()
+            except BinanceAPIError as exc:
+                return steps + [StepResult("归集理财", False, str(exc))]
+            product = None
+        if not bought_any and free >= SPOT_MIN:
+            return steps + [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
         return steps
 
     def earn_holdings(self) -> list[tuple[FlexibleProduct, Decimal]]:
@@ -1161,18 +1367,23 @@ class Pipeline:
                 continue
             src_pct = apr_percent(product.apr)
             # 源年化未知/为 0 也视为可换；要比目标低出 gap 个百分点才动
-            if src_pct > 0 and src_pct + gap >= target_pct:
+            if product.kind == "bfusd":
+                keep = self._bfusd_keep_amount(product, amount, target)
+                amount = amount - keep
+                if amount <= 0:
+                    continue
+            elif src_pct > 0 and src_pct + gap >= target_pct:
                 continue
             out.append((product, amount))
         return out
 
     def switch_advice(self, *, mmr: Decimal | None = None, equity: Decimal | None = None) -> dict:
+        holdings = self.earn_holdings()
         try:
-            target = self.pick()
+            moves = self._allocation_moves(holdings)
+            target = moves[0][2] if moves else self.pick()
         except Exception as exc:
             return {"needed": False, "can_click": False, "reason": str(exc)}
-        holdings = self.earn_holdings()
-        sources = self._switch_sources(target, holdings, stable_only=False)
         if mmr is None or equity is None:
             try:
                 got_mmr, got_equity = self._mmr_equity() if self.settings.unified_account else (Decimal("0"), Decimal("0"))
@@ -1183,7 +1394,7 @@ class Pipeline:
             if equity is None:
                 equity = got_equity
         safe = self.settings.switch_safe_uni_mmr
-        leftover = sum((amt for _, amt in sources), Decimal("0"))
+        leftover = sum((amt for _src, amt, _dst, _note in moves), Decimal("0"))
         if leftover <= 0:
             if not holdings:
                 return {
@@ -1197,7 +1408,7 @@ class Pipeline:
                     "remaining": "0",
                     "reason": (
                         f"还没有理财仓位，钱还在现货。"
-                        f"点「换年化」会申购 {target.asset}，当前年化 {apr_choice_text(target)}"
+                        f"点「换年化」会按各产品额度申购，当前优先 {target.asset}，年化 {apr_choice_text(target)}"
                     ),
                 }
             return {
@@ -1209,7 +1420,7 @@ class Pipeline:
                 "safe_mmr": fmt_amount(safe, 4),
                 "next_batch": "0",
                 "remaining": "0",
-                "reason": f"理财仓已经在最高年化 {target.asset} {apr_choice_text(target)}，不用换",
+                "reason": "已经按各产品自己的额度配在更高年化上，不用换",
             }
         next_batch = self._next_switch_batch(leftover, mmr, equity)
         can = next_batch > 0
@@ -1218,9 +1429,9 @@ class Pipeline:
         elif next_batch <= 0:
             reason = "这批按 uniMMR 估出来能赎的数量太小，先不要动"
         else:
-            from_text = "、".join(f"{p.asset} {fmt_amount(amt, 2)}" for p, amt in sources)
+            plan = "；".join(note for _src, _amt, _dst, note in moves[:4])
             reason = (
-                f"分批把 {from_text} 换成 {target.asset}（年化 {apr_choice_text(target)}）。"
+                f"按各产品额度凑更高收益：{plan}。"
                 f"本批最多 {fmt_amount(next_batch, 2)} USDT，按赎回瞬间保证金暂时少一块来估，"
                 f"目标 uniMMR ≥ {fmt_amount(safe, 4)}。点一次最多 {self.settings.switch_max_batches} 批。"
             )
@@ -1250,12 +1461,13 @@ class Pipeline:
         has_hedge：是否已有对冲仓。无仓时不按 uniMMR 估赎回量（文案与批次都跳过）。
         """
         try:
-            target = self.pick()
-        except RuntimeError as exc:
+            moves = self._allocation_moves()
+        except Exception as exc:
             return [StepResult("换产品", False, str(exc))]
-        sources = self._switch_sources(target, stable_only=False)
-        if not sources:
-            return [StepResult("换产品", True, f"已经在 {target.asset}，不用换")]
+        if not moves:
+            return [StepResult("换产品", True, "已经按各产品自己的额度配在更高年化上，不用换")]
+        target = moves[0][2]
+        plan_text = "；".join(note for _src, _amt, _dst, note in moves[:6])
         if has_hedge is None:
             try:
                 legs = self.futures.legs(self.settings.hedge_symbol)
@@ -1267,13 +1479,13 @@ class Pipeline:
         compared = self._apr_comparison()
         if full and not hedge_open:
             start_detail = (
-                f"目标 {target.asset} 年化 {apr_choice_text(target)}；"
-                f"无对冲仓，其它活期整笔归集（不按 uniMMR 估批），最多 {max_batches} 批。"
+                f"按各产品额度凑更高收益：{plan_text}。"
+                f"无对冲仓，整笔归集（不按 uniMMR 估批），最多 {max_batches} 批。"
                 f"比较 {compared}"
             )
         else:
             start_detail = (
-                f"目标 {target.asset} 年化 {apr_choice_text(target)}；"
+                f"按各产品额度凑更高收益：{plan_text}。"
                 f"{'入场归集其它活期，' if full else ''}"
                 f"每批按 uniMMR≥{fmt_amount(self.settings.switch_safe_uni_mmr, 4)} 估赎回量，"
                 f"最多 {max_batches} 批。比较 {compared}"
@@ -1290,7 +1502,7 @@ class Pipeline:
                 product, target, amt, redeem_all=redeem_all, **redeem_kw
             )
 
-        for product, amount in sources:
+        for product, amount, target, _note in moves:
             remaining = amount
             # 山寨活期数量单位不是 U，不能按 USDT 批次估；一律整笔赎→兑 USDT→申购
             if remaining > 0 and not self._is_stable_earn_asset(product):
@@ -1416,10 +1628,12 @@ class Pipeline:
                     steps.extend(_redeem(product, remaining))
                     remaining = Decimal("0")
         if full:
-            # 再扫一遍持仓，清掉交易所账面尘埃（如 0.0065）
+            # 只清分配方案里还剩的尘埃，不要把仍该留在高档额度里的仓位赎掉
             self.earn.invalidate()
-            leftovers = [(p, amt) for p, amt in self.earn_holdings() if not self._same_product(p, target) and amt > 0]
-            for product, amount in leftovers:
+            self._product_list = None
+            for product, amount, target, _note in self._allocation_moves():
+                if amount <= 0 or amount >= dust_cut:
+                    continue
                 steps.append(
                     StepResult(
                         "清尾数",
