@@ -1591,7 +1591,7 @@
       const others = s.other_positions || [];
       if (others.length) {
         const tip = others.map((r) => `${r.symbol} ${r.side} ${r.qty}`).join("，");
-        setActionMsg(`已换套保，旧仓仍在：${tip}。平稳时可点「一键收利」：等金叉/死叉 + 收利级平稳后挂单全平旧仓，再开新对冲。`);
+        setActionMsg(`已换套保，旧仓仍在：${tip}。点「一键收利」将等到金叉/死叉与收利级平稳同时满足，再挂单全平旧仓并开新对冲。`);
       }
       const sw = s.switch || {};
       $("btn-switch").disabled = !sw.can_click;
@@ -1745,7 +1745,7 @@
         const tip = others.map((r) => `${r.symbol} ${r.side} ${r.qty}`).join("，") || "旧仓";
         const body = unstable
           ? `将跳过等金叉/死叉，挂单尽量平净旧仓（${tip}），再在 ${(live.symbol || "").toUpperCase() || "新套保"} 开对冲。当前不稳，不成交时可能市价扫尾。`
-          : `将一直等到 MACD 金叉/死叉，再用与收利相同的平稳条件等到价格稳，挂单全平旧仓（${tip}），然后在 ${(live.symbol || "").toUpperCase() || "新套保"} 自动开对冲。`;
+          : `将一直等到 MACD 金叉/死叉与收利级平稳同时满足，再挂单全平旧仓（${tip}），然后在 ${(live.symbol || "").toUpperCase() || "新套保"} 自动开对冲。交叉时不稳会错过，等下一次同时满足。`;
         const ok = await confirmAction({
           title: "换币迁仓",
           body,

@@ -339,13 +339,13 @@ class HedgeCycle:
     def migrate_symbol_and_enter(
         self, others: list[str] | None = None, *, wait_stable: bool = True
     ) -> list[StepResult]:
-        """换套保后迁仓：等 MACD 金叉/死叉 + 平稳 → 挂单全平旧仓 → 开新对冲。"""
+        """换套保后迁仓：金叉/死叉与平稳同时满足 → 挂单全平旧仓 → 开新对冲。"""
         others = list(others or self._other_open_symbols())
         steps: list[StepResult] = [
             StepResult(
                 "换币迁仓",
                 True,
-                f"当前套保 {self.symbol}，将等金叉/死叉后挂单全平旧仓 "
+                f"当前套保 {self.symbol}，将等金叉/死叉与收利级平稳同时满足后挂单全平旧仓 "
                 f"{'、'.join(others) or '（无）'}，再自动开新对冲",
             )
         ]
@@ -368,68 +368,96 @@ class HedgeCycle:
         steps.extend(self.setup_once(force_hedge=True))
         return steps
 
-    def _wait_until_macd_cross(self, purpose: str, *, timeout: float | None = None) -> list[StepResult]:
-        """一直等到金叉/死叉那一根再动手；无超时。timeout 仅测试用。"""
+    def _wait_until_macd_and_stable(
+        self, purpose: str, *, timeout: float | None = None
+    ) -> tuple[list[StepResult], str]:
+        """金叉/死叉与收利级平稳必须同一时刻同时满足；返回 (步骤, 优先平哪边)。"""
+        prefer = "LONG"
         if self.settings.dry_run:
-            return [StepResult("等 MACD", True, f"dry-run 跳过（{purpose}）", dry_run=True)]
-        if not bool(getattr(self.settings, "macd_auto_harvest", True)):
-            return [StepResult("等 MACD", True, f"MACD 过滤关闭，跳过（{purpose}）")]
+            return (
+                [StepResult("等时机", True, f"dry-run 跳过（{purpose}）", dry_run=True)],
+                prefer,
+            )
+        need_macd = bool(getattr(self.settings, "macd_auto_harvest", True))
         url = getattr(self.settings, "macd_indicator_url", None) or ""
-        # 已在交叉上：立刻用
-        try:
-            hit = fetch_macd_cross(url, force=True)
-        except Exception:
-            hit = None
-        if hit is not None:
-            return [
-                StepResult(
-                    "MACD 交叉",
-                    True,
-                    f"{purpose}：已是 {hit.label}@{hit.time}，先挂单平仓",
-                )
-            ]
         started = time.monotonic()
         deadline = None if timeout is None else started + max(0.0, float(timeout))
         steps = [
             StepResult(
-                "等 MACD",
+                "等时机",
                 True,
-                f"{purpose}：等待金叉/死叉，不设时限，有交叉再挂单平仓",
+                (
+                    f"{purpose}：须金叉/死叉与收利级平稳同时满足，不设时限"
+                    if need_macd
+                    else f"{purpose}：MACD 关闭，只等收利级平稳"
+                ),
             )
         ]
         last_log = started
+        last_macd_pull = 0.0
+        hit = None
         while True:
             if deadline is not None and time.monotonic() >= deadline:
-                steps.append(
-                    StepResult(
-                        "等 MACD 超时",
-                        False,
-                        f"{purpose}：测试超时仍无交叉",
-                    )
-                )
-                return steps
-            time.sleep(15.0)
-            try:
-                hit = fetch_macd_cross(url, force=True)
-            except Exception:
-                hit = None
-            if hit is not None:
-                waited = int(time.monotonic() - started)
-                steps.append(
-                    StepResult(
-                        "MACD 交叉",
-                        True,
-                        f"{purpose}：等了 {waited}s 等到 {hit.label}@{hit.time}，开始挂单平旧仓",
-                    )
-                )
-                return steps
+                steps.append(StepResult("等时机超时", False, f"{purpose}：测试超时仍未同时满足"))
+                return steps, prefer
+
             now = time.monotonic()
+            # MACD 约 15s 拉一次（只认当前那一根交叉）；平稳 2s 看一次
+            if need_macd and (last_macd_pull <= 0 or now - last_macd_pull >= 15.0):
+                try:
+                    hit = fetch_macd_cross(url, force=True)
+                except Exception:
+                    hit = None
+                last_macd_pull = now
+            elif not need_macd:
+                hit = None
+
+            try:
+                st = price_stability(self.futures, self.settings, purpose="harvest")
+                stable = bool(st.stable)
+                hint = st.hint
+            except Exception as exc:
+                stable = False
+                hint = f"平稳检测失败（{exc}）"
+
+            macd_ok = (not need_macd) or (hit is not None)
+            if macd_ok and stable:
+                # 平稳刚到位时再确认一次交叉，避免拿着过期交叉当真
+                if need_macd:
+                    try:
+                        hit = fetch_macd_cross(url, force=True)
+                    except Exception:
+                        hit = None
+                    last_macd_pull = time.monotonic()
+                    if hit is None:
+                        time.sleep(2.0)
+                        continue
+                waited = int(time.monotonic() - started)
+                if hit is not None:
+                    prefer = hit.harvest_side
+                    detail = (
+                        f"{purpose}：等了 {waited}s，{hit.label}@{hit.time} 与平稳同时满足"
+                        f"（{hint}），优先挂单平 {prefer}"
+                    )
+                else:
+                    detail = f"{purpose}：等了 {waited}s，已平稳（{hint}）"
+                steps.append(StepResult("时机已到", True, detail))
+                return steps, prefer
+
             if now - last_log >= 120:
                 waited = int(now - started)
-                steps.append(
-                    StepResult("等 MACD", True, f"{purpose}：仍无交叉，已等 {waited}s…")
-                )
+                if need_macd and hit is None and not stable:
+                    miss = "无交叉且不稳"
+                elif need_macd and hit is None:
+                    miss = "已平稳但无金叉/死叉"
+                elif not stable:
+                    miss = f"有{hit.label}但不稳"
+                else:
+                    miss = "条件未齐"
+                steps.append(StepResult("等时机", True, f"{purpose}：{miss}，已等 {waited}s…"))
                 last_log = now
+
+            time.sleep(2.0)
 
     def _close_symbol_fully(self, symbol: str, *, wait_stable: bool) -> list[StepResult]:
         """挂单清空指定币对双边（尽量 GTX；扫尾才市价）。临时切换 self.symbol。"""
@@ -445,31 +473,10 @@ class HedgeCycle:
             prefer = "LONG"
             if wait_stable:
                 try:
-                    steps.extend(self._wait_until_macd_cross(f"全平 {symbol} 前"))
+                    wait_steps, prefer = self._wait_until_macd_and_stable(f"全平 {symbol} 前")
+                    steps.extend(wait_steps)
                 except Exception as exc:
-                    steps.append(StepResult("等 MACD 跳过", True, str(exc)))
-                try:
-                    cross = fetch_macd_cross(
-                        getattr(self.settings, "macd_indicator_url", None) or "", force=False
-                    )
-                    if cross is not None:
-                        prefer = cross.harvest_side
-                        steps.append(
-                            StepResult(
-                                "平仓顺序",
-                                True,
-                                f"{cross.label} 优先挂单平 {prefer}，再平另一边",
-                            )
-                        )
-                except Exception:
-                    pass
-                try:
-                    # 与收利相同：收利宽阈值，一直等到平稳才挂单（不超时放弃）
-                    steps.extend(
-                        self._wait_until_stable(f"全平 {symbol} 前", forever=True)
-                    )
-                except Exception as exc:
-                    steps.append(StepResult("全平前平稳跳过", True, str(exc)))
+                    steps.append(StepResult("等时机跳过", True, str(exc)))
 
             legs = self.futures.legs(symbol)
             if legs.long_qty <= 0 and legs.short_qty <= 0:
