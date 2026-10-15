@@ -989,7 +989,7 @@ class HedgeCycle:
                 steps.append(StepResult("归集理财异常", False, str(exc)))
             bought = _subscribed(earn_steps)
             if bought and not self.settings.dry_run:
-                time.sleep(max(int(self.settings.settle_seconds or 0), 2))
+                self._wait_earn_visible(planned, timeout=2.0)
             try:
                 steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
                 steps.extend(self._confirm_harvest_margin(planned, before_pm=before_pm, realized=pnl))
@@ -1142,6 +1142,34 @@ class HedgeCycle:
         except Exception:
             return False
 
+    def _wait_earn_visible(self, product: FlexibleProduct | None, *, timeout: float = 2.0) -> None:
+        """申购后轮询理财代币是否可划回保证金，出现即停，不再固定睡满 settle。"""
+        if self.settings.dry_run:
+            return
+        token = ""
+        if product is not None:
+            try:
+                token = self.pipeline.margin_token_of(product)
+            except Exception:
+                token = ""
+        token = (token or "USDT").upper()
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            spot = earn_bal = Decimal("0")
+            try:
+                if token in {"USDT", "USDC"}:
+                    spot = self.pipeline.spot_cash(token)
+                else:
+                    spot = self.pipeline.spot_cash(token)
+                    earn_bal = self.futures.earn_to_pm_balance(token)
+            except Exception:
+                spot = earn_bal = Decimal("0")
+            if spot >= Decimal("1") or earn_bal >= Decimal("1"):
+                return
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.25)
+
     def _confirm_harvest_margin(
         self,
         product: FlexibleProduct | None,
@@ -1177,14 +1205,17 @@ class HedgeCycle:
                 if gain > best_gain:
                     best_tok, best_bal, best_gain = tok, bal, gain
             idle = Decimal("0")
-            for asset in ("USDT", "USDC", "BFUSD", "RWUSD"):
+            # 只看本次代币和 USDT，避免每轮打四次现货把补仓拖久
+            for asset in dict.fromkeys((primary, "USDT")):
+                if asset in {"LDUSDT"}:
+                    continue
                 try:
                     idle += self.pipeline.spot_cash(asset)
                 except Exception:
                     continue
             return best_tok, best_bal, best_gain, idle
 
-        deadline = time.monotonic() + 12.0
+        deadline = time.monotonic() + 6.0
         retried_fund = False
         while True:
             tok, bal, gained, idle = snapshot()
@@ -1213,9 +1244,9 @@ class HedgeCycle:
                 extra = self.pipeline.fund_unified(check_ldusdt=True)
                 if extra and not (len(extra) == 1 and extra[0].name == "无需划转"):
                     out.extend(extra)
-                time.sleep(0.8)
+                time.sleep(0.3)
                 continue
-            time.sleep(0.45)
+            time.sleep(0.25)
 
         tok, bal, gained, idle = snapshot()
         if gained >= Decimal("0.5") or (idle < 1 and bal > 0 and gained > 0):
@@ -1472,18 +1503,20 @@ class HedgeCycle:
                 return False
 
         if not self.settings.dry_run:
-            # 先等到至少 1U，再多盯几秒看可转出是否继续变大（结算滞后）
+            # 先等到至少 1U。额度已盖住本次浮盈就立刻转，不再空等结算。
             if not ready():
-                self._wait_until(ready, timeout=5.0, interval=0.4)
-            if transferable >= 1:
-                deadline = time.monotonic() + 4.0
+                self._wait_until(ready, timeout=3.0, interval=0.25)
+            covered = realized > 0 and transferable + Decimal("0.5") >= realized
+            if transferable >= 1 and not covered:
+                deadline = time.monotonic() + 1.5
                 while time.monotonic() < deadline:
                     prev = transferable
-                    time.sleep(0.5)
+                    time.sleep(0.25)
                     ready()
                     if transferable <= prev:
                         break
-            # 下单前再读一次，避免用过期额度
+                    if realized > 0 and transferable + Decimal("0.5") >= realized:
+                        break
             ready()
         else:
             ready()

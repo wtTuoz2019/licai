@@ -630,7 +630,7 @@ class Pipeline:
                 free = Decimal("0")
             if free >= min_amt or time.monotonic() >= deadline:
                 return free
-            time.sleep(0.35)
+            time.sleep(0.2)
 
     def sweep_spot_to_earn(self, product: FlexibleProduct | None = None) -> list[StepResult]:
         steps: list[StepResult] = []
@@ -650,7 +650,7 @@ class Pipeline:
                 if not converted.ok:
                     return steps
                 if not converted.dry_run:
-                    free = self._wait_spot_cash(timeout=6.0)
+                    free = self._wait_spot_cash(timeout=3.0)
                 else:
                     free = free_settle
             else:
@@ -659,7 +659,8 @@ class Pipeline:
             free = Decimal("0")
         if free < SPOT_MIN:
             try:
-                free = self._wait_spot_cash(timeout=2.0) if steps else self.spot_cash()
+                # 划转刚到现货可能滞后；够了立刻返回，最多等 2 秒
+                free = self._wait_spot_cash(timeout=2.0)
             except BinanceAPIError as exc:
                 return steps + [StepResult("归集理财", False, str(exc))]
         if free < SPOT_MIN:
