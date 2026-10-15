@@ -851,44 +851,65 @@ class HedgeCycle:
     def _profit_to_spot(self, realized: Decimal) -> list[StepResult]:
         steps: list[StepResult] = []
         asset = self.settle_asset
-        # 可转尽转；外层立刻申购理财并划回保证金后再补仓。
+        # 顺序不变：先尽量转出现货申购理财，再补仓。可转尽转。
         collect = self._mutate(f"归集统一账户 {asset}", lambda: self.futures.collect_to_margin(asset))
         steps.append(collect)
         transferable = Decimal("0")
         last_err: BinanceAPIError | None = None
+        peak = Decimal("0")
 
         def ready() -> bool:
-            nonlocal transferable, last_err
+            nonlocal transferable, last_err, peak
             try:
                 transferable = self.futures.max_withdraw(asset)
                 last_err = None
+                if transferable > peak:
+                    peak = transferable
+                # 平仓后保证金占用会暂时压住可转出；多等一会看额度是否回升
                 return transferable >= 1
             except BinanceAPIError as exc:
                 last_err = exc
                 return False
 
         if not self.settings.dry_run:
+            # 先等到至少 1U，再多盯几秒看可转出是否继续变大（结算滞后）
             if not ready():
-                self._wait_until(ready, timeout=2.0, interval=0.3)
+                self._wait_until(ready, timeout=5.0, interval=0.4)
+            if transferable >= 1:
+                deadline = time.monotonic() + 4.0
+                while time.monotonic() < deadline:
+                    prev = transferable
+                    time.sleep(0.5)
+                    ready()
+                    if transferable <= prev:
+                        break
+            # 下单前再读一次，避免用过期额度
+            ready()
         else:
             ready()
         if last_err is not None and transferable < 1:
             steps.append(StepResult("查询可转出", False, str(last_err)))
             return steps
         if transferable < 1:
+            note = ""
+            if realized >= 1:
+                note = f"；浮盈约 {fmt_amount(realized)} 仍占用在剩余仓位保证金里，可转出不足 1"
             steps.append(
                 StepResult(
                     "转出现货",
                     True,
-                    f"最大可转出 {fmt_amount(transferable)} {asset}，不足 1，跳过转出直接补仓",
+                    f"最大可转出 {fmt_amount(transferable)} {asset}，不足 1，跳过转出直接补仓{note}",
                 )
             )
             return steps
         amount = transferable
-        moved = self._mutate(
-            f"最大可转出 {fmt_amount(amount)} {asset} 转到现货（本次浮盈约 {fmt_amount(realized)}）",
-            lambda: self.futures.unified_to_spot(asset, amount),
-        )
+        detail = f"最大可转出 {fmt_amount(amount)} {asset} 转到现货（本次浮盈约 {fmt_amount(realized)}）"
+        if realized >= 1 and amount + 1 < realized * Decimal("0.3"):
+            detail += (
+                f"；可转出远小于浮盈，多半是剩余腿仍占用保证金"
+                f"（峰值可转出 {fmt_amount(peak)}）"
+            )
+        moved = self._mutate(detail, lambda: self.futures.unified_to_spot(asset, amount))
         if moved.ok and not moved.dry_run:
             self.pipeline.earn.invalidate()
         steps.append(moved)

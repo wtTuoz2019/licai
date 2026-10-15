@@ -456,14 +456,33 @@ class FuturesAPI:
 
     def unified_to_spot(self, asset: str, amount: Decimal) -> dict:
         params = {"asset": asset.upper(), "amount": fmt_amount(amount)}
-        return self._post_first(
-            [
-                ("/sapi/v1/margin/transfer", {**params, "type": 2}),
-                ("/sapi/v1/asset/transfer", {**params, "type": "PORTFOLIO_MARGIN_MAIN"}),
-                ("/sapi/v1/asset/transfer", {**params, "type": "MARGIN_MAIN"}),
-            ],
-            fail="统一账户全仓转出现货失败。",
-        )
+        # 子账户常见：/sapi/v1/margin/transfer 直接 -1002；万向划转 PORTFOLIO_MARGIN_MAIN 才通。
+        # 平仓刚完时偶发 -21003 fail to retrieve margin assets，对可恢复错误做短重试。
+        attempts = [
+            ("/sapi/v1/asset/transfer", {**params, "type": "PORTFOLIO_MARGIN_MAIN"}),
+            ("/sapi/v1/asset/transfer", {**params, "type": "MARGIN_MAIN"}),
+            ("/sapi/v1/margin/transfer", {**params, "type": 2}),
+        ]
+        errors: list[str] = []
+        for path, body in attempts:
+            last_exc: BinanceAPIError | None = None
+            for _try in range(3):
+                try:
+                    data = self.client.signed("POST", path, body)
+                    self._clear_risk()
+                    return data if isinstance(data, dict) else {"result": data}
+                except BinanceAPIError as exc:
+                    last_exc = exc
+                    text = str(exc)
+                    # -21003：平仓后保证金资产索引未就绪；稍等再试同一路径
+                    if "-21003" in text or "fail to retrieve margin assets" in text.lower():
+                        time.sleep(0.8 * (_try + 1))
+                        continue
+                    break
+            if last_exc is not None:
+                label = body.get("type", path)
+                errors.append(f"{label}: {last_exc}")
+        raise BinanceAPIError("统一账户全仓转出现货失败。" + "；".join(errors))
 
     def refresh_account_risk(self) -> dict:
         self._clear_risk()
