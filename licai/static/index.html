@@ -1745,7 +1745,7 @@
         const tip = others.map((r) => `${r.symbol} ${r.side} ${r.qty}`).join("，") || "旧仓";
         const body = unstable
           ? `将跳过等金叉/死叉，挂单尽量平净旧仓（${tip}），再在 ${(live.symbol || "").toUpperCase() || "新套保"} 开对冲。当前不稳，不成交时可能市价扫尾。`
-          : `将等 MACD 金叉/死叉 + 平稳后，挂单全平旧仓（${tip}），再在 ${(live.symbol || "").toUpperCase() || "新套保"} 自动开对冲（最长约等 45 分钟）。`;
+          : `将一直等到 MACD 金叉/死叉，再平稳挂单全平旧仓（${tip}），然后在 ${(live.symbol || "").toUpperCase() || "新套保"} 自动开对冲（不等到交叉不会动手）。`;
         const ok = await confirmAction({
           title: "换币迁仓",
           body,

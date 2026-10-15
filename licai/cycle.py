@@ -369,17 +369,11 @@ class HedgeCycle:
         return steps
 
     def _wait_until_macd_cross(self, purpose: str, *, timeout: float | None = None) -> list[StepResult]:
-        """等到金叉/死叉那一根再动手；超时不阻断，继续挂单平仓。"""
+        """一直等到金叉/死叉那一根再动手；无超时。timeout 仅测试用。"""
         if self.settings.dry_run:
             return [StepResult("等 MACD", True, f"dry-run 跳过（{purpose}）", dry_run=True)]
         if not bool(getattr(self.settings, "macd_auto_harvest", True)):
             return [StepResult("等 MACD", True, f"MACD 过滤关闭，跳过（{purpose}）")]
-        limit = timeout
-        if limit is None:
-            limit = float(getattr(self.settings, "migrate_macd_wait_seconds", 2700) or 2700)
-        limit = max(0.0, float(limit))
-        if limit <= 0:
-            return []
         url = getattr(self.settings, "macd_indicator_url", None) or ""
         # 已在交叉上：立刻用
         try:
@@ -394,43 +388,48 @@ class HedgeCycle:
                     f"{purpose}：已是 {hit.label}@{hit.time}，先挂单平仓",
                 )
             ]
-        deadline = time.monotonic() + limit
+        started = time.monotonic()
+        deadline = None if timeout is None else started + max(0.0, float(timeout))
         steps = [
             StepResult(
                 "等 MACD",
                 True,
-                f"{purpose}：等待金叉/死叉，最多 {int(limit)}s",
+                f"{purpose}：等待金叉/死叉，不设时限，有交叉再挂单平仓",
             )
         ]
-        last_log = time.monotonic()
-        while time.monotonic() < deadline:
+        last_log = started
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                steps.append(
+                    StepResult(
+                        "等 MACD 超时",
+                        False,
+                        f"{purpose}：测试超时仍无交叉",
+                    )
+                )
+                return steps
             time.sleep(15.0)
             try:
                 hit = fetch_macd_cross(url, force=True)
             except Exception:
                 hit = None
             if hit is not None:
+                waited = int(time.monotonic() - started)
                 steps.append(
                     StepResult(
                         "MACD 交叉",
                         True,
-                        f"{purpose}：{hit.label}@{hit.time}，开始挂单平旧仓",
+                        f"{purpose}：等了 {waited}s 等到 {hit.label}@{hit.time}，开始挂单平旧仓",
                     )
                 )
                 return steps
             now = time.monotonic()
             if now - last_log >= 120:
-                left = max(0, int(deadline - now))
-                steps.append(StepResult("等 MACD", True, f"{purpose}：仍无交叉，约剩 {left}s"))
+                waited = int(now - started)
+                steps.append(
+                    StepResult("等 MACD", True, f"{purpose}：仍无交叉，已等 {waited}s…")
+                )
                 last_log = now
-        steps.append(
-            StepResult(
-                "等 MACD 超时",
-                True,
-                f"{purpose}：已等 {int(limit)}s 未等到金叉/死叉，改平稳后挂单平仓",
-            )
-        )
-        return steps
 
     def _close_symbol_fully(self, symbol: str, *, wait_stable: bool) -> list[StepResult]:
         """挂单清空指定币对双边（尽量 GTX；扫尾才市价）。临时切换 self.symbol。"""
