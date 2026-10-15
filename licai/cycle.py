@@ -394,16 +394,54 @@ class HedgeCycle:
                 found.append(sym)
         return found
 
+    def migrate_timing_ready(self, symbol: str) -> tuple[bool, str, str]:
+        """非阻塞：旧币对上金叉/死叉与收利级平稳是否同时满足。返回 (ok, detail, prefer_side)。"""
+        prefer = "LONG"
+        symbol = (symbol or "").upper()
+        need_macd = bool(getattr(self.settings, "macd_auto_harvest", True))
+        try:
+            st = price_stability(
+                self.futures, self.settings, purpose="harvest", symbol=symbol
+            )
+            stable = bool(st.stable)
+            hint = st.hint
+        except Exception as exc:
+            return False, f"平稳检测失败：{exc}", prefer
+        if not need_macd:
+            if not stable:
+                return False, f"须收利级平稳（{hint}）", prefer
+            return True, f"已平稳（{hint}）", prefer
+        url = getattr(self.settings, "macd_indicator_url", None) or ""
+        try:
+            hit = fetch_macd_cross(url, force=True)
+        except Exception as exc:
+            return False, f"MACD 拉取失败：{exc}", prefer
+        if hit is None:
+            miss = "已平稳但无金叉/死叉" if stable else "无交叉且不稳"
+            return False, f"须交叉与平稳同时满足（{miss}）", prefer
+        prefer = hit.harvest_side
+        if not stable:
+            return False, f"有{hit.label}@{hit.time} 但不稳（{hint}）", prefer
+        return True, f"{hit.label}@{hit.time} 与平稳同时满足，优先平 {prefer}", prefer
+
     def migrate_symbol_and_enter(
-        self, others: list[str] | None = None, *, wait_stable: bool = True
+        self,
+        others: list[str] | None = None,
+        *,
+        wait_stable: bool = True,
+        prefer: str | None = None,
     ) -> list[StepResult]:
-        """换套保后迁仓：金叉/死叉与平稳同时满足 → 挂单全平旧仓 → 开新对冲。"""
+        """换套保后迁仓：金叉/死叉与平稳同时满足 → 挂单全平旧仓 → 开新对冲。
+
+        wait_stable=True 时会阻塞等到时机（仅测试/兼容）；后台挂起路径应先
+        migrate_timing_ready 再以 wait_stable=False 调用。
+        """
         others = list(others or self._other_open_symbols())
         steps: list[StepResult] = [
             StepResult(
                 "换币迁仓",
                 True,
-                f"当前套保 {self.symbol}，将等金叉/死叉与收利级平稳同时满足后挂单全平旧仓 "
+                f"当前套保 {self.symbol}，挂单全平旧仓 "
                 f"{'、'.join(others) or '（无）'}，再自动开新对冲",
             )
         ]
@@ -411,7 +449,9 @@ class HedgeCycle:
             steps.extend(self.setup_once(force_hedge=True))
             return steps
         for sym in others:
-            steps.extend(self._close_symbol_fully(sym, wait_stable=wait_stable))
+            steps.extend(
+                self._close_symbol_fully(sym, wait_stable=wait_stable, prefer=prefer)
+            )
             left = self.futures.legs(sym)
             if left.long_qty > 0 or left.short_qty > 0:
                 steps.append(
@@ -519,7 +559,9 @@ class HedgeCycle:
 
             time.sleep(2.0)
 
-    def _close_symbol_fully(self, symbol: str, *, wait_stable: bool) -> list[StepResult]:
+    def _close_symbol_fully(
+        self, symbol: str, *, wait_stable: bool, prefer: str | None = None
+    ) -> list[StepResult]:
         """挂单清空指定币对双边（尽量 GTX；扫尾才市价）。临时切换 self.symbol。"""
         steps: list[StepResult] = []
         symbol = (symbol or "").upper()
@@ -530,10 +572,14 @@ class HedgeCycle:
             self.symbol = symbol
             self.settle_asset = settle_asset_of(symbol)
             steps.append(StepResult("全平旧仓", True, f"开始挂单全平 {symbol}"))
-            prefer = "LONG"
+            prefer_side = (prefer or "LONG").upper()
+            if prefer_side not in {"LONG", "SHORT"}:
+                prefer_side = "LONG"
             if wait_stable:
                 try:
-                    wait_steps, prefer = self._wait_until_macd_and_stable(f"全平 {symbol} 前")
+                    wait_steps, prefer_side = self._wait_until_macd_and_stable(
+                        f"全平 {symbol} 前"
+                    )
                     steps.extend(wait_steps)
                 except Exception as exc:
                     steps.append(StepResult("等时机跳过", True, str(exc)))
@@ -544,7 +590,7 @@ class HedgeCycle:
                 return steps
 
             # 金叉收空 / 死叉收多：先平时机腿，再平另一边；都尽量挂单
-            order = [prefer, "SHORT" if prefer == "LONG" else "LONG"]
+            order = [prefer_side, "SHORT" if prefer_side == "LONG" else "LONG"]
             for side in order:
                 legs = self.futures.legs(symbol)
                 qty = legs.long_qty if side == "LONG" else legs.short_qty

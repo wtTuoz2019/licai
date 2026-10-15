@@ -317,6 +317,9 @@ class OpsService:
         self._action_locks: dict[int, threading.Lock] = {}
         self._action_guard = threading.Lock()
         self._busy: set[int] = set()
+        # 换币迁仓挂起：点「一键收利」后后台等到交叉+平稳再执行，不堵 HTTP
+        # account_id -> {"force": bool, "armed_at": float, "last_event_at": float}
+        self._migrate_armed: dict[int, dict] = {}
         self._webshare = WebshareClient(
             self.base.webshare_api_token,
             mode=self.base.webshare_mode,
@@ -482,6 +485,33 @@ class OpsService:
         with self._action_guard:
             self._busy.discard(account_id)
 
+    def arm_migrate(self, account_id: int, *, force: bool = False) -> dict:
+        """挂起换币迁仓；已挂起则更新 force。"""
+        now = time.monotonic()
+        with self._action_guard:
+            prev = self._migrate_armed.get(account_id)
+            if prev:
+                prev["force"] = bool(force) or bool(prev.get("force"))
+                return dict(prev)
+            row = {"force": bool(force), "armed_at": now, "last_event_at": 0.0}
+            self._migrate_armed[account_id] = row
+            return dict(row)
+
+    def clear_migrate_arm(self, account_id: int) -> None:
+        with self._action_guard:
+            self._migrate_armed.pop(account_id, None)
+
+    def migrate_arm(self, account_id: int) -> dict | None:
+        with self._action_guard:
+            hit = self._migrate_armed.get(account_id)
+            return dict(hit) if hit else None
+
+    def touch_migrate_event(self, account_id: int) -> None:
+        with self._action_guard:
+            hit = self._migrate_armed.get(account_id)
+            if hit:
+                hit["last_event_at"] = time.monotonic()
+
     def _idle_spot(self, account: Account) -> Decimal:
         hit = self._snap_cache.get(account.id)
         if not hit:
@@ -535,44 +565,88 @@ class OpsService:
             "missing": legs.missing_side,
         }
 
-    def _other_positions(self, futures, symbol: str, legs) -> list[dict]:
-        if legs.long_qty > 0 or legs.short_qty > 0:
-            return []
+    def _other_positions(self, futures, symbol: str, legs=None) -> list[dict]:
+        """当前套保以外仍有仓的币对（换币后旧仓）；带双边数量与浮盈便于页面展示。"""
         try:
             rows = futures.open_um_symbols()
         except Exception:
             return []
-        sym = (symbol or "").upper()
-        return [r for r in rows if r.get("symbol") != sym]
+        cur = (symbol or "").upper()
+        out: list[dict] = []
+        seen: set[str] = set()
+        for row in rows or []:
+            sym = str(row.get("symbol") or "").upper()
+            if not sym or sym == cur or sym in seen:
+                continue
+            seen.add(sym)
+            try:
+                ol = futures.legs(sym)
+            except Exception:
+                out.append(
+                    {
+                        "symbol": sym,
+                        "side": row.get("side") or "",
+                        "qty": row.get("qty") or "0",
+                        "long_qty": row.get("qty") if (row.get("side") or "").upper() == "LONG" else "0",
+                        "short_qty": row.get("qty") if (row.get("side") or "").upper() == "SHORT" else "0",
+                        "long_pnl": "0",
+                        "short_pnl": "0",
+                        "long_entry": "",
+                        "short_entry": "",
+                    }
+                )
+                continue
+            if ol.long_qty <= 0 and ol.short_qty <= 0:
+                continue
+            if ol.long_qty > 0 and ol.short_qty > 0:
+                side = "BOTH"
+            elif ol.long_qty > 0:
+                side = "LONG"
+            else:
+                side = "SHORT"
+            out.append(
+                {
+                    "symbol": sym,
+                    "side": side,
+                    "qty": fmt_amount(max(ol.long_qty, ol.short_qty)),
+                    "long_qty": fmt_amount(ol.long_qty),
+                    "short_qty": fmt_amount(ol.short_qty),
+                    "long_pnl": fmt_amount(ol.long_pnl, 4),
+                    "short_pnl": fmt_amount(ol.short_pnl, 4),
+                    "long_entry": fmt_amount(ol.long_entry) if ol.long_entry > 0 else "",
+                    "short_entry": fmt_amount(ol.short_entry) if ol.short_entry > 0 else "",
+                }
+            )
+        return out
 
     @staticmethod
     def _apply_migrate_harvest_advice(
-        advice: dict, others: list[dict], current_symbol: str
+        advice: dict, others: list[dict], current_symbol: str, *, armed: bool = False
     ) -> dict:
         """当前套保无仓但旧币种有仓：一键收利改为「全平旧仓 + 开新对冲」。"""
         if not others:
             return advice
         tip = "、".join(
-            f"{r.get('symbol')} {r.get('side')} {r.get('qty')}" for r in others[:6]
+            f"{r.get('symbol')} 多{r.get('long_qty') or 0}/空{r.get('short_qty') or 0}"
+            for r in others[:6]
         )
         out = dict(advice)
-        stable_ok = bool(advice.get("stable_ok"))
+        # 迁仓挂起后由后台等时机；点按钮不要求当前已平稳
         out["migrate"] = True
-        out["force_ok"] = True
-        # 与收利一样：平稳才能点；不稳可强行
-        out["can_click"] = stable_ok
-        out["stable_ok"] = stable_ok
-        if stable_ok:
+        out["migrate_armed"] = bool(armed)
+        out["force_ok"] = not armed
+        out["can_click"] = not armed
+        out["stable_ok"] = bool(advice.get("stable_ok"))
+        if armed:
             out["reason"] = (
-                f"已换套保到 {current_symbol}，旧仓仍在：{tip}。"
-                "点「一键收利」将等到金叉/死叉与收利级平稳同时满足，"
-                "再挂单全平旧仓并自动开新对冲。"
+                f"迁仓已挂起：旧仓 {tip}。后台等到金叉/死叉与收利级平稳同时满足后，"
+                f"会挂单全平再开 {current_symbol}。可在事件里看进度。"
             )
         else:
             out["reason"] = (
                 f"已换套保到 {current_symbol}，旧仓仍在：{tip}。"
-                "价格还不够稳（与收利同一套宽阈值）；迁仓须交叉与平稳同时满足，"
-                "也可强行迁仓。"
+                "点「迁仓开新」会挂起任务（不堵页面），后台等到交叉与平稳同时满足后执行；"
+                "不稳时可强行挂起并尽快平仓。"
             )
         return out
 
@@ -638,7 +712,10 @@ class OpsService:
             data["stability"] = stability.as_dict()
             data["enter"] = enter_advice(legs, stability, d(data.get("spot_usdt") or "0"), plan)
             data["harvest"] = self._apply_migrate_harvest_advice(
-                advice.as_dict(), others, settings.hedge_symbol
+                advice.as_dict(),
+                others,
+                settings.hedge_symbol,
+                armed=bool(self.migrate_arm(account.id)),
             )
             data["account"] = account.public_dict()
             data["events"] = _events_payload(account.id, self.store.recent_events(account.id, 30))
@@ -725,6 +802,7 @@ class OpsService:
         except Exception:
             pass
         others = self._other_positions(futures, settings.hedge_symbol, legs)
+        armed = self.migrate_arm(account.id)
         return {
             "ok": True,
             "account": account.public_dict(),
@@ -737,12 +815,16 @@ class OpsService:
             "price": stability.as_dict().get("mid") or "0",
             "spot_usdt": fmt_amount(spot_usdt, 4),
             "action_busy": account.id in self._busy,
+            "migrate_armed": bool(armed),
             "legs": self._legs_payload(legs),
             "other_positions": others,
             "stability": stability.as_dict(),
             "enter": enter_advice(legs, stability, spot_usdt, plan),
             "harvest": self._apply_migrate_harvest_advice(
-                advice.as_dict(), others, settings.hedge_symbol
+                advice.as_dict(),
+                others,
+                settings.hedge_symbol,
+                armed=bool(armed),
             ),
             "events": _events_payload(account.id, self.store.recent_events(account.id, 30)),
         }
@@ -833,6 +915,7 @@ class OpsService:
         mmr_text = format_uni_mmr(mmr, has_pos)
         lev, lev_tgt = _display_leverage(legs, settings)
         others = self._other_positions(futures, settings.hedge_symbol, legs)
+        armed = self.migrate_arm(account.id)
         return {
             **base,
             "ok": True,
@@ -860,10 +943,14 @@ class OpsService:
             "margin": margin,
             "legs": self._legs_payload(legs),
             "other_positions": others,
+            "migrate_armed": bool(armed),
             "stability": stability.as_dict(),
             "enter": enter,
             "harvest": self._apply_migrate_harvest_advice(
-                advice.as_dict(), others, settings.hedge_symbol
+                advice.as_dict(),
+                others,
+                settings.hedge_symbol,
+                armed=bool(armed),
             ),
             "switch": switch,
             "holdings": wallet.get("holdings") or [],
@@ -976,7 +1063,7 @@ class OpsService:
             side = (harvest_side or "").upper() or None
             if side not in {"LONG", "SHORT"}:
                 side = None
-            # 自动收利：可按 MACD 指定腿；手动仍可强行。换币迁仓仅手动。
+            # 自动收利：可按 MACD 指定腿；手动仍可强行。换币迁仓仅手动挂起。
             if auto and harvest.get("migrate"):
                 allowed = False
             elif auto:
@@ -1000,6 +1087,35 @@ class OpsService:
                     "live": True,
                     "reason": reason,
                     "steps": [],
+                }
+            # 手动迁仓：挂起给后台等时机，立刻返回（不堵 HTTP）
+            if (not auto) and harvest.get("migrate"):
+                others = (live or {}).get("other_positions") or []
+                tip = "、".join(
+                    f"{r.get('symbol')} 多{r.get('long_qty') or 0}/空{r.get('short_qty') or 0}"
+                    for r in others[:6]
+                ) or "旧仓"
+                try:
+                    sym = pipe.settings.hedge_symbol
+                except Exception:
+                    sym = (live or {}).get("symbol") or ""
+                self.arm_migrate(account.id, force=force)
+                detail = (
+                    f"已挂起迁仓（{'强行尽快平' if force else '等金叉/死叉与平稳同时满足'}）："
+                    f"{tip}，完成后开 {sym or '新套保'}。后台执行，可看事件进度。"
+                )
+                self.store.add_event(account.id, "harvest", True, detail[:500])
+                self.touch_migrate_event(account.id)
+                snap = self.snapshot(account, force=True) if with_snapshot else None
+                return {
+                    "ok": True,
+                    "blocked": False,
+                    "queued": True,
+                    "migrate_armed": True,
+                    "live": True,
+                    "reason": detail,
+                    "steps": [{"name": "迁仓挂起", "ok": True, "detail": detail}],
+                    "snapshot": snap,
                 }
         if action == "scale":
             live = self.monitor(account)

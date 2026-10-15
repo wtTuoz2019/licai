@@ -186,6 +186,32 @@
     .pos .qty { font-size: 15px; margin-top: 4px; font-variant-numeric: tabular-nums; }
     .pos .entry { color: var(--muted); font-size: 12px; margin-top: 2px; font-variant-numeric: tabular-nums; }
     .pos .pnl { font-size: 22px; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+    .other-pos {
+      margin-top: 10px;
+      background: var(--panel2);
+      border-radius: 10px;
+      padding: 10px 12px;
+      border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+    }
+    .other-pos-h {
+      font-size: 12px;
+      color: var(--warn);
+      margin-bottom: 8px;
+    }
+    .other-pos-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 6px;
+    }
+    .other-pos-row:first-of-type { margin-top: 0; }
+    .other-pos .sym-tag {
+      grid-column: 1 / -1;
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+    .other-pos .sym-tag:first-child { margin-top: 0; }
     .up { color: var(--good); }
     .down { color: var(--bad); }
     .wait { color: var(--warn); }
@@ -502,17 +528,21 @@
         <div class="chips" id="collateral" hidden></div>
         <div class="pos-row">
           <div class="pos long">
-            <div class="pos-h">多仓</div>
+            <div class="pos-h">多仓 <span class="muted" id="pos-sym-label"></span></div>
             <div class="qty" id="long-qty">-</div>
             <div class="entry" id="long-entry">仓位价 -</div>
             <div class="pnl" id="long-pnl">-</div>
           </div>
           <div class="pos short">
-            <div class="pos-h">空仓</div>
+            <div class="pos-h">空仓 <span class="muted" id="pos-sym-label2"></span></div>
             <div class="qty" id="short-qty">-</div>
             <div class="entry" id="short-entry">仓位价 -</div>
             <div class="pnl" id="short-pnl">-</div>
           </div>
+        </div>
+        <div id="other-pos" class="other-pos" hidden>
+          <div class="other-pos-h" id="other-pos-h">旧套保仓位（已换币，尚未迁仓）</div>
+          <div id="other-pos-list"></div>
         </div>
         <div class="harvest">
           <div class="harvest-top">
@@ -1366,6 +1396,10 @@
       const price = s.price || (s.stability && s.stability.mid) || "";
       if (price) $("mid-price").textContent = price;
       const legs = s.legs || {};
+      const curSym = (s.symbol || (s.account && s.account.hedge_symbol) || "").toUpperCase();
+      const symLbl = curSym ? `(${curSym})` : "";
+      if ($("pos-sym-label")) $("pos-sym-label").textContent = symLbl;
+      if ($("pos-sym-label2")) $("pos-sym-label2").textContent = symLbl;
       $("long-qty").textContent = legs.long_qty || "-";
       $("short-qty").textContent = legs.short_qty || "-";
       const longEntry = legs.long_entry || "";
@@ -1374,6 +1408,7 @@
       $("short-entry").textContent = "仓位价 " + (toNum(shortEntry) > 0 ? shortEntry : "-");
       setPnl($("long-pnl"), legs.long_pnl);
       setPnl($("short-pnl"), legs.short_pnl);
+      renderOtherPositions(s);
       const h = s.harvest || {};
       $("fee").textContent = h.round_trip_fee || "-";
       $("min-profit").textContent = h.min_profit || "-";
@@ -1419,7 +1454,9 @@
       }
       $("harvest-why").textContent = why;
       $("btn-harvest").title = h.reason || "";
-      $("btn-harvest").textContent = h.migrate ? "迁仓开新" : "一键收利";
+      $("btn-harvest").textContent = h.migrate_armed
+        ? "迁仓待命中"
+        : (h.migrate ? "迁仓开新" : "一键收利");
       const en = s.enter || {};
       const scaleBox = $("scale-box");
       const scaleEl = $("scale-why");
@@ -1590,8 +1627,12 @@
       liveAt = Date.now();
       const others = s.other_positions || [];
       if (others.length) {
-        const tip = others.map((r) => `${r.symbol} ${r.side} ${r.qty}`).join("，");
-        setActionMsg(`已换套保，旧仓仍在：${tip}。点「一键收利」将等到金叉/死叉与收利级平稳同时满足，再挂单全平旧仓并开新对冲。`);
+        const armed = !!(s.migrate_armed || (s.harvest || {}).migrate_armed);
+        setActionMsg(
+          armed
+            ? `旧仓仍在，迁仓已挂起：后台等到金叉/死叉与平稳同时满足后会自动全平再开 ${s.symbol || "新套保"}。`
+            : `已换套保，旧仓见下方黄色区。点「迁仓开新」会挂起任务（不堵页面），后台等时机后执行。`
+        );
       }
       const sw = s.switch || {};
       $("btn-switch").disabled = !sw.can_click;
@@ -1665,9 +1706,57 @@
       el.textContent = text;
     }
 
+    function renderOtherPositions(s) {
+      const box = $("other-pos");
+      const list = $("other-pos-list");
+      const head = $("other-pos-h");
+      if (!box || !list) return;
+      const others = s.other_positions || [];
+      if (!others.length) {
+        box.hidden = true;
+        list.innerHTML = "";
+        return;
+      }
+      box.hidden = false;
+      const armed = !!(s.migrate_armed || (s.harvest || {}).migrate_armed);
+      if (head) {
+        head.textContent = armed
+          ? `旧套保仓位 · 迁仓待命中（等交叉与平稳）→ 将开 ${(s.symbol || "").toUpperCase() || "新套保"}`
+          : `旧套保仓位（已换到 ${(s.symbol || "").toUpperCase() || "新套保"}，尚未迁仓）`;
+      }
+      list.innerHTML = "";
+      others.forEach((r) => {
+        const tag = document.createElement("div");
+        tag.className = "sym-tag";
+        tag.textContent = `${r.symbol || "-"} · ${r.side === "BOTH" ? "多空对冲" : (r.side || "")}`;
+        list.appendChild(tag);
+        const row = document.createElement("div");
+        row.className = "other-pos-row";
+        const longPnl = toNum(r.long_pnl);
+        const shortPnl = toNum(r.short_pnl);
+        row.innerHTML =
+          `<div class="pos long">` +
+          `<div class="pos-h">多仓</div>` +
+          `<div class="qty">${esc(r.long_qty || "0")}</div>` +
+          `<div class="entry">仓位价 ${esc(r.long_entry || "-")}</div>` +
+          `<div class="pnl ${longPnl > 0 ? "up" : longPnl < 0 ? "down" : ""}">${esc(r.long_pnl || "0")}</div>` +
+          `</div>` +
+          `<div class="pos short">` +
+          `<div class="pos-h">空仓</div>` +
+          `<div class="qty">${esc(r.short_qty || "0")}</div>` +
+          `<div class="entry">仓位价 ${esc(r.short_entry || "-")}</div>` +
+          `<div class="pnl ${shortPnl > 0 ? "up" : shortPnl < 0 ? "down" : ""}">${esc(r.short_pnl || "0")}</div>` +
+          `</div>`;
+        list.appendChild(row);
+      });
+    }
+
     function formatActionResult(data) {
       if (data.blocked) return "已拦截：" + (data.reason || "");
       if (data.error) return data.error;
+      if (data.queued || data.migrate_armed) {
+        return "已挂起：" + (data.reason || "后台等时机迁仓");
+      }
       const rows = (data.steps || []).map((s) => {
         const t = s.at ? `${s.at} ` : "";
         return `${s.ok ? "✓" : "✗"} ${t}${s.name}：${s.detail || ""}`;
@@ -1742,14 +1831,16 @@
         payload.force = choice === "force";
       } else if (action === "harvest" && (live.harvest || {}).migrate) {
         const others = live.other_positions || [];
-        const tip = others.map((r) => `${r.symbol} ${r.side} ${r.qty}`).join("，") || "旧仓";
+        const tip = others.map((r) =>
+          `${r.symbol} 多${r.long_qty || 0}/空${r.short_qty || 0}`
+        ).join("，") || "旧仓";
         const body = unstable
-          ? `将跳过等金叉/死叉，挂单尽量平净旧仓（${tip}），再在 ${(live.symbol || "").toUpperCase() || "新套保"} 开对冲。当前不稳，不成交时可能市价扫尾。`
-          : `将一直等到 MACD 金叉/死叉与收利级平稳同时满足，再挂单全平旧仓（${tip}），然后在 ${(live.symbol || "").toUpperCase() || "新套保"} 自动开对冲。交叉时不稳会错过，等下一次同时满足。`;
+          ? `将挂起强行迁仓：尽快挂单平旧仓（${tip}），再开 ${(live.symbol || "").toUpperCase() || "新套保"}。不堵页面，进度看事件。`
+          : `将挂起迁仓：后台等到金叉/死叉与收利级平稳同时满足后，挂单全平（${tip}），再开 ${(live.symbol || "").toUpperCase() || "新套保"}。不堵页面。`;
         const ok = await confirmAction({
           title: "换币迁仓",
           body,
-          okText: unstable ? "强行迁仓" : "确认迁仓",
+          okText: unstable ? "强行挂起" : "挂起迁仓",
           danger: true,
         });
         if (!ok) return;

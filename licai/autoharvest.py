@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING
 
 from . import earn as earn_mod
 from .config import ROOT, d
+from .cycle import HedgeCycle
 from .macd import fetch_macd_cross
+from .ops import pipeline_for
 
 if TYPE_CHECKING:
     from .ops import OpsService
@@ -113,12 +115,110 @@ class AutoHarvestWorker:
                 self._maybe_daily_earn(account)
             except Exception:
                 log.exception("账号 %s 每日理财检查失败", account.id)
+            # 换币迁仓挂起：与是否开自动收利无关，后台等到时机再执行
+            try:
+                self._maybe_armed_migrate(account)
+            except Exception:
+                log.exception("账号 %s 挂起迁仓检查失败", account.id)
             if not account.auto_harvest:
                 continue
             try:
                 self._maybe_act(account)
             except Exception:
                 log.exception("账号 %s 自动开仓/收利失败", account.id)
+
+    def _maybe_armed_migrate(self, account) -> bool:
+        """手动挂起的换币迁仓：时机到了才动手，否则写进度事件。"""
+        arm = self.ops.migrate_arm(account.id)
+        if not arm:
+            return False
+        if not self.ops.try_begin_action(account.id):
+            return True
+        try:
+            force = bool(arm.get("force"))
+            live = self.ops.monitor(account)
+            others = (live or {}).get("other_positions") or []
+            if not others:
+                self.ops.clear_migrate_arm(account.id)
+                self.ops.store.add_event(
+                    account.id, "harvest", True, "迁仓挂起取消：旧仓已不在"
+                )
+                self.ops.invalidate_snapshot(account.id)
+                _print(f"迁仓挂起取消 account={account.id}：旧仓已清")
+                return True
+
+            tip = "、".join(
+                f"{r.get('symbol')} 多{r.get('long_qty')}/空{r.get('short_qty')}"
+                for r in others[:4]
+            )
+            now = time.monotonic()
+            last_ev = float(arm.get("last_event_at") or 0)
+            # 约每 2 分钟写一条待命进度
+            if now - last_ev >= 120:
+                waited = int(now - float(arm.get("armed_at") or now))
+                note = (
+                    f"迁仓待命：旧仓 {tip}，已挂起 {waited}s"
+                    + ("（强行，下一轮即平）" if force else "，等金叉/死叉与平稳同时满足")
+                )
+                self.ops.store.add_event(account.id, "harvest", True, note[:500])
+                self.ops.touch_migrate_event(account.id)
+
+            prefer = "LONG"
+            if not force:
+                try:
+                    pipe = pipeline_for(account, self.ops.base, dry_run=True, ops=self.ops)
+                    cycle = HedgeCycle(pipe)
+                    first_sym = str(others[0].get("symbol") or "")
+                    ready, detail, prefer = cycle.migrate_timing_ready(first_sym)
+                except Exception as exc:
+                    ready, detail = False, str(exc)
+                if not ready:
+                    _print(f"迁仓待命 account={account.id} {detail}")
+                    return True
+                timing_note = detail
+            else:
+                timing_note = "强行迁仓，跳过等交叉/平稳"
+
+            _print(f"迁仓执行 account={account.id} {timing_note} · {tip}")
+            try:
+                pipe = pipeline_for(account, self.ops.base, dry_run=False, ops=self.ops)
+                cycle = HedgeCycle(pipe)
+                steps = cycle.migrate_symbol_and_enter(
+                    [str(r.get("symbol") or "") for r in others if r.get("symbol")],
+                    wait_stable=False,
+                    prefer=prefer,
+                )
+            except Exception as exc:
+                log.exception("账号 %s 迁仓执行异常", account.id)
+                self.ops.store.add_event(
+                    account.id, "harvest", False, f"迁仓执行异常：{exc}"[:500]
+                )
+                self.ops.touch_migrate_event(account.id)
+                return True
+
+            ok = all(getattr(s, "ok", True) for s in steps) if steps else False
+            # 允许部分步骤名含提示但仍 ok
+            fails = [s for s in steps if not getattr(s, "ok", True)]
+            ok = not fails
+            detail = "；".join(
+                f"{getattr(s, 'name', '')}: {getattr(s, 'detail', '')}"
+                for s in (fails or steps[-4:])
+            )
+            self.ops.store.add_event(
+                account.id,
+                "harvest",
+                ok,
+                (("迁仓完成：" if ok else "迁仓未完成：") + detail)[:500],
+            )
+            if ok:
+                self.ops.clear_migrate_arm(account.id)
+            else:
+                self.ops.touch_migrate_event(account.id)
+            self.ops.refresh_account_snapshot(account)
+            _print(f"迁仓结束 account={account.id} ok={ok} {detail[:300]}")
+            return True
+        finally:
+            self.ops.end_action(account.id)
 
     def _maybe_daily_earn(self, account) -> None:
         """每日拉一次全部理财奖励；有低收益稳定币仓且安全时自动换到最高年化。"""
@@ -278,8 +378,10 @@ class AutoHarvestWorker:
         return True
 
     def _maybe_scale(self, account, live: dict) -> bool:
-        """有对冲且还能加：等金叉/死叉 + 入场级平稳，自动加仓。"""
+        """有对冲且还能加：金叉/死叉与入场级平稳同时满足才加仓。"""
         if not bool(getattr(self.ops.base, "auto_scale", True)):
+            return False
+        if self.ops.migrate_arm(account.id):
             return False
         enter = live.get("enter") or {}
         stability = live.get("stability") or {}
@@ -291,6 +393,12 @@ class AutoHarvestWorker:
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
             side, macd_note = self._macd_side()
             if not side:
+                return False
+            # 动手前再确认交叉与平稳仍同时成立
+            if not (live.get("stability") or {}).get("stable") and not enter.get("stable_ok"):
+                return False
+            cross = fetch_macd_cross(getattr(self.ops.base, "macd_indicator_url", None), force=True)
+            if cross is None:
                 return False
         _print(
             f"自动加仓触发 account={account.id} add={enter.get('add_qty')} "
@@ -320,7 +428,9 @@ class AutoHarvestWorker:
         return True
 
     def _maybe_enter(self, account, live: dict) -> bool:
-        """无仓：金叉/死叉那一根 + 严平稳，才自动双边开仓。"""
+        """无仓：金叉/死叉与严平稳同时满足，才自动双边开仓。"""
+        if self.ops.migrate_arm(account.id):
+            return False
         stability = live.get("stability") or {}
         enter = live.get("enter") or {}
         if not stability.get("stable"):
@@ -333,6 +443,9 @@ class AutoHarvestWorker:
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
             side, macd_note = self._macd_side()
             if not side:
+                return False
+            cross = fetch_macd_cross(getattr(self.ops.base, "macd_indicator_url", None), force=True)
+            if cross is None or not stability.get("stable"):
                 return False
         _print(f"自动开仓触发 account={account.id} 严平稳 · {macd_note}，双边挂单入场")
         result = self.ops.run_action(
@@ -361,6 +474,8 @@ class AutoHarvestWorker:
     def _maybe_harvest(self, account, live: dict) -> bool:
         harvest = live.get("harvest") or {}
         legs = live.get("legs") or {}
+        if self.ops.migrate_arm(account.id) or harvest.get("migrate"):
+            return False
 
         side, macd_note = self._macd_side()
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
