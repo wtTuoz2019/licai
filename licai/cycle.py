@@ -301,7 +301,12 @@ class HedgeCycle:
         return []
 
     def harvest_once(
-        self, *, wait_stable: bool = True, side: str | None = None, allow_migrate: bool = True
+        self,
+        *,
+        wait_stable: bool = True,
+        side: str | None = None,
+        allow_migrate: bool = True,
+        auto: bool = False,
     ) -> list[StepResult]:
         # 换币后手动收利：当前套保无仓但旧币种仍有仓 → 全平旧仓再开新对冲
         legs = self.futures.legs(self.symbol)
@@ -321,7 +326,58 @@ class HedgeCycle:
         pnl = legs.long_pnl if winner == "LONG" else legs.short_pnl
         if pnl <= 0:
             return [StepResult("平仓跳过", False, f"{note}：该腿没有浮盈（{fmt_amount(pnl, 4)}）")]
-        return self._harvest(winner, legs, wait_stable=wait_stable)
+        return self._harvest(winner, legs, wait_stable=wait_stable, auto=auto)
+
+    def _assert_macd_and_stable_now(self, side: str) -> tuple[list[StepResult], bool]:
+        """自动收利动手前：金叉/死叉与收利级平稳必须同一时刻同时满足。"""
+        need_macd = bool(getattr(self.settings, "macd_auto_harvest", True))
+        try:
+            st = price_stability(self.futures, self.settings, purpose="harvest")
+            stable = bool(st.stable)
+            hint = st.hint
+        except Exception as exc:
+            return [StepResult("时机未齐", False, f"平稳检测失败：{exc}")], False
+        if not need_macd:
+            if not stable:
+                return [StepResult("时机未齐", False, f"须收利级平稳（{hint}）")], False
+            return [StepResult("时机已到", True, f"已平稳（{hint}）")], True
+        url = getattr(self.settings, "macd_indicator_url", None) or ""
+        try:
+            hit = fetch_macd_cross(url, force=True)
+        except Exception as exc:
+            return [StepResult("时机未齐", False, f"MACD 拉取失败：{exc}")], False
+        if hit is None:
+            miss = "已平稳但无金叉/死叉" if stable else "无交叉且不稳"
+            return [
+                StepResult(
+                    "时机未齐",
+                    False,
+                    f"须金叉/死叉与收利级平稳同时满足（{miss}）",
+                )
+            ], False
+        if hit.harvest_side != (side or "").upper():
+            return [
+                StepResult(
+                    "时机未齐",
+                    False,
+                    f"当前 {hit.label} 应收 {hit.harvest_side}，与指定 {side} 不一致",
+                )
+            ], False
+        if not stable:
+            return [
+                StepResult(
+                    "时机未齐",
+                    False,
+                    f"有{hit.label}@{hit.time} 但不稳（{hint}），须同时满足",
+                )
+            ], False
+        return [
+            StepResult(
+                "时机已到",
+                True,
+                f"{hit.label}@{hit.time} 与收利级平稳同时满足，平 {side}",
+            )
+        ], True
 
     def _other_open_symbols(self) -> list[str]:
         try:
@@ -767,7 +823,9 @@ class HedgeCycle:
             steps.append(StepResult("停止", True, "已手动停止盯盘"))
         return steps
 
-    def _harvest(self, side: str, legs: HedgeLegs, *, wait_stable: bool = True) -> list[StepResult]:
+    def _harvest(
+        self, side: str, legs: HedgeLegs, *, wait_stable: bool = True, auto: bool = False
+    ) -> list[StepResult]:
         qty = legs.long_qty if side == "LONG" else legs.short_qty
         pnl = legs.long_pnl if side == "LONG" else legs.short_pnl
         steps = [
@@ -787,7 +845,13 @@ class HedgeCycle:
         except Exception:
             before_pm = {}
 
-        if wait_stable:
+        if auto and wait_stable:
+            # 自动收利：与迁仓一样，交叉与平稳须同时满足；不单独干等平稳后强平
+            gate, ok = self._assert_macd_and_stable_now(side)
+            steps.extend(gate)
+            if not ok:
+                return steps
+        elif wait_stable:
             try:
                 steps.extend(self._wait_until_stable("平仓前"))
             except Exception as exc:

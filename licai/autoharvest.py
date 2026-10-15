@@ -32,7 +32,8 @@ class AutoHarvestWorker:
     """后台轮询：
 
     - 每日：拉全部理财奖励记录；仅开启自动收利、且 auto_switch_earn 时，按各产品额度自动换到更高年化
-    - 账号开启「自动收利」时：无仓等金叉/死叉+严平稳开仓；有仓等交叉+浮盈达标收利
+    - 账号开启「自动收利」时：无仓须金叉/死叉与严平稳同时满足才开仓；
+      有仓须金叉/死叉与收利级平稳同时满足，且浮盈达标才收利
     手动一键入场/收利不受影响。
     """
 
@@ -68,7 +69,7 @@ class AutoHarvestWorker:
         self._thread = threading.Thread(target=self._loop, name="auto-harvest", daemon=True)
         self._thread.start()
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
-            note = "无仓/有仓都须金叉或死叉；有仓还要浮盈达到名义比例"
+            note = "无仓/有仓都须金叉或死叉与平稳同时满足；有仓还要浮盈达到名义比例"
         else:
             note = "MACD 过滤已关：无仓严平稳开仓；有仓按名义比例收"
         extras = []
@@ -202,7 +203,7 @@ class AutoHarvestWorker:
         if not bool(getattr(base, "macd_auto_harvest", True)):
             return None, "MACD 过滤已关闭"
         url = getattr(base, "macd_indicator_url", None) or ""
-        cross = fetch_macd_cross(url)
+        cross = fetch_macd_cross(url, force=True)
         if cross is None:
             return None, "当前不是金叉/死叉那一根"
         key = f"{cross.kind}:{cross.time}"
@@ -363,10 +364,12 @@ class AutoHarvestWorker:
 
         side, macd_note = self._macd_side()
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
+            # 金叉/死叉与收利级平稳必须同一轮同时满足（与迁仓一致）
             if not side:
                 return False
-            # 必须交叉那一根 + 收利平稳(更宽) + 浮盈 + 冷却
-            if not harvest.get("stable_ok") or not harvest.get("cooldown_ok"):
+            if not harvest.get("stable_ok"):
+                return False
+            if not harvest.get("cooldown_ok"):
                 return False
             if legs.get("missing"):
                 return False

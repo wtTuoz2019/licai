@@ -932,7 +932,7 @@ class OpsService:
 
     @staticmethod
     def _auto_side_harvest_ok(live: dict, harvest: dict, side: str) -> bool:
-        """自动收利指定腿：收利平稳(更宽)+冷却+该腿浮盈达标+对冲齐全。"""
+        """自动收利指定腿：收利平稳与交叉同时满足 + 冷却 + 该腿浮盈 + 对冲齐全。"""
         if not harvest.get("stable_ok"):
             return False
         if not harvest.get("cooldown_ok"):
@@ -1031,12 +1031,13 @@ class OpsService:
             side = (harvest_side or "").upper() or None
             if side not in {"LONG", "SHORT"}:
                 side = None
-            # 自动收利：按 MACD 指定腿；平稳用收利宽阈值，仍可等一会再平；迁仓仅手动
+            # 自动收利：交叉与收利级平稳须同时满足；迁仓仅手动
             wait_stable = not force
             run = lambda: cycle.harvest_once(
                 wait_stable=wait_stable,
                 side=side if auto else None,
                 allow_migrate=not auto,
+                auto=auto,
             )
         elif action == "scale":
             run = lambda: cycle.scale_once(force=force or mode == "force")
