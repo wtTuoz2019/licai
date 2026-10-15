@@ -556,13 +556,23 @@ class OpsService:
             f"{r.get('symbol')} {r.get('side')} {r.get('qty')}" for r in others[:6]
         )
         out = dict(advice)
-        out["can_click"] = True
-        out["force_ok"] = True
+        stable_ok = bool(advice.get("stable_ok"))
         out["migrate"] = True
-        out["reason"] = (
-            f"已换套保到 {current_symbol}，旧仓仍在：{tip}。"
-            "点「一键收利」将等 MACD 金叉/死叉 + 平稳后挂单全平旧仓，再自动开新对冲。"
-        )
+        out["force_ok"] = True
+        # 与收利一样：平稳才能点；不稳可强行
+        out["can_click"] = stable_ok
+        out["stable_ok"] = stable_ok
+        if stable_ok:
+            out["reason"] = (
+                f"已换套保到 {current_symbol}，旧仓仍在：{tip}。"
+                "价格已平稳，点「一键收利」将等 MACD 金叉/死叉，"
+                "再确认收利级平稳后挂单全平旧仓，自动开新对冲。"
+            )
+        else:
+            out["reason"] = (
+                f"已换套保到 {current_symbol}，旧仓仍在：{tip}。"
+                "价格还不够稳（与收利同一套宽阈值），等平稳后再迁仓；也可强行迁仓。"
+            )
         return out
 
     def _refresh_cached_legs(self, account: Account, data: dict) -> dict:

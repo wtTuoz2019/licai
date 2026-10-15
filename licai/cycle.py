@@ -464,7 +464,10 @@ class HedgeCycle:
                 except Exception:
                     pass
                 try:
-                    steps.extend(self._wait_until_stable(f"全平 {symbol} 前"))
+                    # 与收利相同：收利宽阈值，一直等到平稳才挂单（不超时放弃）
+                    steps.extend(
+                        self._wait_until_stable(f"全平 {symbol} 前", forever=True)
+                    )
                 except Exception as exc:
                     steps.append(StepResult("全平前平稳跳过", True, str(exc)))
 
@@ -505,16 +508,25 @@ class HedgeCycle:
             self.symbol = old_sym
             self.settle_asset = old_settle
 
-    def _wait_until_stable(self, purpose: str, *, timeout: float | None = None) -> list[StepResult]:
-        """尽可能等到价格平稳再下单；超时不阻断，继续用挂单路径。"""
+    def _wait_until_stable(
+        self, purpose: str, *, timeout: float | None = None, forever: bool = False
+    ) -> list[StepResult]:
+        """等到价格平稳（收利宽阈值）再下单。
+
+        forever=True：一直等到平稳（迁仓与收利门槛一致）。
+        否则超时后不阻断，继续挂单路径。
+        """
         if self.settings.dry_run:
             return [StepResult("等待平稳", True, f"dry-run 跳过（{purpose}）", dry_run=True)]
-        limit = timeout
-        if limit is None:
-            limit = float(getattr(self.settings, "harvest_stable_wait_seconds", 90) or 90)
-        limit = max(0.0, float(limit))
-        if limit <= 0:
-            return []
+        if forever:
+            limit = None
+        else:
+            limit = timeout
+            if limit is None:
+                limit = float(getattr(self.settings, "harvest_stable_wait_seconds", 90) or 90)
+            limit = max(0.0, float(limit))
+            if limit <= 0:
+                return []
         try:
             first = price_stability(self.futures, self.settings, purpose="harvest")
             if first.stable:
@@ -522,23 +534,43 @@ class HedgeCycle:
         except Exception as exc:
             return [StepResult("平稳检测", True, f"{purpose}：检测失败仍继续（{exc}）")]
 
-        deadline = time.monotonic() + limit
+        started = time.monotonic()
+        deadline = None if forever else started + float(limit)
         steps = [
             StepResult(
                 "等待平稳",
                 True,
-                f"{purpose}：当前不稳，最多等 {int(limit)}s 再操作",
+                (
+                    f"{purpose}：当前不稳，等到收利级平稳再挂单（不设时限）"
+                    if forever
+                    else f"{purpose}：当前不稳，最多等 {int(limit)}s 再操作"
+                ),
             )
         ]
-        while time.monotonic() < deadline:
+        last_log = started
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             time.sleep(2.0)
             try:
                 st = price_stability(self.futures, self.settings, purpose="harvest")
             except Exception:
                 continue
             if st.stable:
-                steps.append(StepResult("价格已平稳", True, f"{purpose}：{st.hint}"))
+                waited = int(time.monotonic() - started)
+                steps.append(
+                    StepResult(
+                        "价格已平稳",
+                        True,
+                        f"{purpose}：等了 {waited}s · {st.hint}",
+                    )
+                )
                 return steps
+            now = time.monotonic()
+            if forever and now - last_log >= 120:
+                waited = int(now - started)
+                steps.append(StepResult("等待平稳", True, f"{purpose}：仍不稳，已等 {waited}s…"))
+                last_log = now
         steps.append(
             StepResult(
                 "等待平稳超时",
