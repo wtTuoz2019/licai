@@ -332,7 +332,9 @@ class HedgeCycle:
         """自动收利动手前：金叉/死叉与收利级平稳必须同一时刻同时满足。"""
         need_macd = bool(getattr(self.settings, "macd_auto_harvest", True))
         try:
-            st = price_stability(self.futures, self.settings, purpose="harvest")
+            st = price_stability(
+                self.futures, self.settings, purpose="harvest", symbol=self.symbol
+            )
             stable = bool(st.stable)
             hint = st.hint
         except Exception as exc:
@@ -469,7 +471,9 @@ class HedgeCycle:
                 hit = None
 
             try:
-                st = price_stability(self.futures, self.settings, purpose="harvest")
+                st = price_stability(
+                    self.futures, self.settings, purpose="harvest", symbol=self.symbol
+                )
                 stable = bool(st.stable)
                 hint = st.hint
             except Exception as exc:
@@ -553,7 +557,8 @@ class HedgeCycle:
                         f"{symbol} {side} {fmt_amount(qty)}，GTX 优先",
                     )
                 )
-                steps.extend(self._close_winner_for_harvest(side, qty, wait_stable=wait_stable))
+                # 时机已在交叉+平稳同时满足时确认；平仓过程不再单独干等平稳，避免错过窗口
+                steps.extend(self._close_winner_for_harvest(side, qty, wait_stable=False))
 
             legs = self.futures.legs(symbol)
             if legs.long_qty <= 0 and legs.short_qty <= 0:
@@ -591,7 +596,9 @@ class HedgeCycle:
             if limit <= 0:
                 return []
         try:
-            first = price_stability(self.futures, self.settings, purpose="harvest")
+            first = price_stability(
+                self.futures, self.settings, purpose="harvest", symbol=self.symbol
+            )
             if first.stable:
                 return [StepResult("价格已平稳", True, f"{purpose}：{first.hint}")]
         except Exception as exc:
@@ -616,7 +623,9 @@ class HedgeCycle:
                 break
             time.sleep(2.0)
             try:
-                st = price_stability(self.futures, self.settings, purpose="harvest")
+                st = price_stability(
+                    self.futures, self.settings, purpose="harvest", symbol=self.symbol
+                )
             except Exception:
                 continue
             if st.stable:

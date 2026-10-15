@@ -104,12 +104,14 @@ def price_stability(
     range_pct: Decimal | None = None,
     spread_pct_limit: Decimal | None = None,
     purpose: str = "enter",
+    symbol: str | None = None,
 ) -> Stability:
     """平稳判定：15/5/2 分钟振幅 + 盘口价差。
 
     purpose=harvest 时用收利专用更宽阈值（harvest_stable_*），入场仍用更严的 stable_*。
+    symbol 默认当前套保；迁仓平旧仓时应传入旧币对，避免看错新套保的 K 线。
     """
-    symbol = settings.hedge_symbol
+    symbol = (symbol or settings.hedge_symbol or "").upper()
     bid, ask = futures.book(symbol)
     mid = (bid + ask) / 2 if bid + ask > 0 else Decimal("0")
     spread_pct = (ask - bid) / mid if mid > 0 else Decimal("1")
