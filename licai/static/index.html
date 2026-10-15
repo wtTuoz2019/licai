@@ -1419,6 +1419,7 @@
       }
       $("harvest-why").textContent = why;
       $("btn-harvest").title = h.reason || "";
+      $("btn-harvest").textContent = h.migrate ? "迁仓开新" : "一键收利";
       const en = s.enter || {};
       const scaleBox = $("scale-box");
       const scaleEl = $("scale-why");
@@ -1590,7 +1591,7 @@
       const others = s.other_positions || [];
       if (others.length) {
         const tip = others.map((r) => `${r.symbol} ${r.side} ${r.qty}`).join("，");
-        setActionMsg(`当前套保币对无仓，但账户还有持仓：${tip}。请在设置里把套保改成对应币对。`);
+        setActionMsg(`已换套保，旧仓仍在：${tip}。点「一键收利」将等平稳全平旧仓，再自动开新对冲。`);
       }
       const sw = s.switch || {};
       $("btn-switch").disabled = !sw.can_click;
@@ -1739,6 +1740,23 @@
         if (!choice) return;
         payload.mode = choice;
         payload.force = choice === "force";
+      } else if (action === "harvest" && (live.harvest || {}).migrate) {
+        const others = live.other_positions || [];
+        const tip = others.map((r) => `${r.symbol} ${r.side} ${r.qty}`).join("，") || "旧仓";
+        const body = unstable
+          ? `将市价全平旧仓（${tip}），再在 ${(live.symbol || "").toUpperCase() || "新套保"} 开对冲。当前价格不稳，滑点可能更大。`
+          : `将等平稳后全平旧仓（${tip}），再在 ${(live.symbol || "").toUpperCase() || "新套保"} 自动开对冲。`;
+        const ok = await confirmAction({
+          title: "换币迁仓",
+          body,
+          okText: unstable ? "强行迁仓" : "确认迁仓",
+          danger: true,
+        });
+        if (!ok) return;
+        if (unstable) {
+          payload.force = true;
+          payload.mode = "force";
+        }
       } else if (action === "harvest" && unstable) {
         const choice = await confirmChoices({
           title: "价格不稳",

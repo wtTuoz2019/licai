@@ -300,8 +300,15 @@ class HedgeCycle:
             )
         return []
 
-    def harvest_once(self, *, wait_stable: bool = True, side: str | None = None) -> list[StepResult]:
+    def harvest_once(
+        self, *, wait_stable: bool = True, side: str | None = None, allow_migrate: bool = True
+    ) -> list[StepResult]:
+        # 换币后手动收利：当前套保无仓但旧币种仍有仓 → 全平旧仓再开新对冲
         legs = self.futures.legs(self.symbol)
+        if allow_migrate and legs.long_qty <= 0 and legs.short_qty <= 0:
+            others = self._other_open_symbols()
+            if others:
+                return self.migrate_symbol_and_enter(others, wait_stable=wait_stable)
         if legs.missing_side is not None:
             return [StepResult("平仓跳过", False, f"对冲不平衡，先补仓：{self._legs_text(legs)}")]
         want = (side or "").upper()
@@ -315,6 +322,111 @@ class HedgeCycle:
         if pnl <= 0:
             return [StepResult("平仓跳过", False, f"{note}：该腿没有浮盈（{fmt_amount(pnl, 4)}）")]
         return self._harvest(winner, legs, wait_stable=wait_stable)
+
+    def _other_open_symbols(self) -> list[str]:
+        try:
+            rows = self.futures.open_um_symbols()
+        except Exception:
+            return []
+        cur = (self.symbol or "").upper()
+        found: list[str] = []
+        for row in rows:
+            sym = str(row.get("symbol") or "").upper()
+            if sym and sym != cur and sym not in found:
+                found.append(sym)
+        return found
+
+    def migrate_symbol_and_enter(
+        self, others: list[str] | None = None, *, wait_stable: bool = True
+    ) -> list[StepResult]:
+        """换套保后迁仓：等平稳 → 市价全平旧币种 → 在新套保币对开对冲。"""
+        others = list(others or self._other_open_symbols())
+        steps: list[StepResult] = [
+            StepResult(
+                "换币迁仓",
+                True,
+                f"当前套保 {self.symbol}，将全平旧仓 {'、'.join(others) or '（无）'}，再自动开新对冲",
+            )
+        ]
+        if not others:
+            steps.extend(self.setup_once(force_hedge=True))
+            return steps
+        for sym in others:
+            steps.extend(self._close_symbol_fully(sym, wait_stable=wait_stable))
+            left = self.futures.legs(sym)
+            if left.long_qty > 0 or left.short_qty > 0:
+                steps.append(
+                    StepResult(
+                        "换币迁仓中止",
+                        False,
+                        f"{sym} 未平干净：多 {fmt_amount(left.long_qty)} / 空 {fmt_amount(left.short_qty)}，不开新仓",
+                    )
+                )
+                return steps
+        steps.append(StepResult("旧仓已清", True, "开始在新套保币对开仓"))
+        steps.extend(self.setup_once(force_hedge=True))
+        return steps
+
+    def _close_symbol_fully(self, symbol: str, *, wait_stable: bool) -> list[StepResult]:
+        """市价减仓清空指定币对双边（临时切换 self.symbol）。"""
+        steps: list[StepResult] = []
+        symbol = (symbol or "").upper()
+        if not symbol:
+            return [StepResult("全平跳过", False, "币对为空")]
+        old_sym, old_settle = self.symbol, self.settle_asset
+        try:
+            self.symbol = symbol
+            self.settle_asset = settle_asset_of(symbol)
+            steps.append(StepResult("全平旧仓", True, f"开始全平 {symbol}"))
+            if wait_stable:
+                try:
+                    steps.extend(self._wait_until_stable(f"全平 {symbol} 前"))
+                except Exception as exc:
+                    steps.append(StepResult("全平前平稳跳过", True, str(exc)))
+            for _ in range(8):
+                try:
+                    self.futures.cancel_open(symbol)
+                except BinanceAPIError:
+                    pass
+                legs = self.futures.legs(symbol)
+                if legs.long_qty <= 0 and legs.short_qty <= 0:
+                    steps.append(StepResult("旧仓已空", True, f"{symbol} 已清零"))
+                    return steps
+                try:
+                    bid, ask = self.futures.book(symbol, force=True)
+                    tick, step = self.futures.filters(symbol)
+                except BinanceAPIError as exc:
+                    steps.append(StepResult("全平读盘失败", False, str(exc)))
+                    return steps
+                if legs.long_qty > 0:
+                    qty = self.futures.round_qty(legs.long_qty, step)
+                    px = self.futures.round_price(bid, tick)
+                    steps.append(self._place("SELL", "LONG", qty, px, True, market=True))
+                if legs.short_qty > 0:
+                    qty = self.futures.round_qty(legs.short_qty, step)
+                    px = self.futures.round_price(ask, tick)
+                    steps.append(self._place("BUY", "SHORT", qty, px, True, market=True))
+                self._wait_until(
+                    lambda: (
+                        (lambda cur: cur.long_qty <= 0 and cur.short_qty <= 0)(self.futures.legs(symbol))
+                    ),
+                    timeout=2.0,
+                )
+            legs = self.futures.legs(symbol)
+            if legs.long_qty <= 0 and legs.short_qty <= 0:
+                steps.append(StepResult("旧仓已空", True, f"{symbol} 已清零"))
+            else:
+                steps.append(
+                    StepResult(
+                        "旧仓未清净",
+                        False,
+                        f"{symbol} 仍剩 多 {fmt_amount(legs.long_qty)} / 空 {fmt_amount(legs.short_qty)}",
+                    )
+                )
+            return steps
+        finally:
+            self.symbol = old_sym
+            self.settle_asset = old_settle
 
     def _wait_until_stable(self, purpose: str, *, timeout: float | None = None) -> list[StepResult]:
         """尽可能等到价格平稳再下单；超时不阻断，继续用挂单路径。"""

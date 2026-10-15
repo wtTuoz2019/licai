@@ -545,6 +545,26 @@ class OpsService:
         sym = (symbol or "").upper()
         return [r for r in rows if r.get("symbol") != sym]
 
+    @staticmethod
+    def _apply_migrate_harvest_advice(
+        advice: dict, others: list[dict], current_symbol: str
+    ) -> dict:
+        """当前套保无仓但旧币种有仓：一键收利改为「全平旧仓 + 开新对冲」。"""
+        if not others:
+            return advice
+        tip = "、".join(
+            f"{r.get('symbol')} {r.get('side')} {r.get('qty')}" for r in others[:6]
+        )
+        out = dict(advice)
+        out["can_click"] = True
+        out["force_ok"] = True
+        out["migrate"] = True
+        out["reason"] = (
+            f"已换套保到 {current_symbol}，旧仓仍在：{tip}。"
+            "点「一键收利」将等平稳全平旧仓，再自动开新对冲。"
+        )
+        return out
+
     def _refresh_cached_legs(self, account: Account, data: dict) -> dict:
         """资金可沿用缓存，仓位/浮盈必须现拉，避免线上一直显示无仓。"""
         try:
@@ -602,10 +622,13 @@ class OpsService:
             data["uni_mmr"] = format_uni_mmr(mmr, has_pos)
             data["price"] = stability.as_dict().get("mid") or data.get("price") or "0"
             data["legs"] = self._legs_payload(legs)
-            data["other_positions"] = self._other_positions(futures, settings.hedge_symbol, legs)
+            others = self._other_positions(futures, settings.hedge_symbol, legs)
+            data["other_positions"] = others
             data["stability"] = stability.as_dict()
             data["enter"] = enter_advice(legs, stability, d(data.get("spot_usdt") or "0"), plan)
-            data["harvest"] = advice.as_dict()
+            data["harvest"] = self._apply_migrate_harvest_advice(
+                advice.as_dict(), others, settings.hedge_symbol
+            )
             data["account"] = account.public_dict()
             data["events"] = _events_payload(account.id, self.store.recent_events(account.id, 30))
         except Exception as exc:
@@ -690,6 +713,7 @@ class OpsService:
             spot_usdt = pipe.spot_cash("USDT")
         except Exception:
             pass
+        others = self._other_positions(futures, settings.hedge_symbol, legs)
         return {
             "ok": True,
             "account": account.public_dict(),
@@ -703,10 +727,12 @@ class OpsService:
             "spot_usdt": fmt_amount(spot_usdt, 4),
             "action_busy": account.id in self._busy,
             "legs": self._legs_payload(legs),
-            "other_positions": self._other_positions(futures, settings.hedge_symbol, legs),
+            "other_positions": others,
             "stability": stability.as_dict(),
             "enter": enter_advice(legs, stability, spot_usdt, plan),
-            "harvest": advice.as_dict(),
+            "harvest": self._apply_migrate_harvest_advice(
+                advice.as_dict(), others, settings.hedge_symbol
+            ),
             "events": _events_payload(account.id, self.store.recent_events(account.id, 30)),
         }
 
@@ -795,6 +821,7 @@ class OpsService:
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
         mmr_text = format_uni_mmr(mmr, has_pos)
         lev, lev_tgt = _display_leverage(legs, settings)
+        others = self._other_positions(futures, settings.hedge_symbol, legs)
         return {
             **base,
             "ok": True,
@@ -821,10 +848,12 @@ class OpsService:
             "account_total": margin.get("equity") or fmt_amount(collateral, 4),
             "margin": margin,
             "legs": self._legs_payload(legs),
-            "other_positions": self._other_positions(futures, settings.hedge_symbol, legs),
+            "other_positions": others,
             "stability": stability.as_dict(),
             "enter": enter,
-            "harvest": advice.as_dict(),
+            "harvest": self._apply_migrate_harvest_advice(
+                advice.as_dict(), others, settings.hedge_symbol
+            ),
             "switch": switch,
             "holdings": wallet.get("holdings") or [],
             "events": _events_payload(account.id, self.store.recent_events(account.id, 30)),
@@ -936,8 +965,10 @@ class OpsService:
             side = (harvest_side or "").upper() or None
             if side not in {"LONG", "SHORT"}:
                 side = None
-            # 自动收利：可按 MACD 指定腿；手动仍可强行
-            if auto:
+            # 自动收利：可按 MACD 指定腿；手动仍可强行。换币迁仓仅手动。
+            if auto and harvest.get("migrate"):
+                allowed = False
+            elif auto:
                 if side:
                     allowed = self._auto_side_harvest_ok(live, harvest, side)
                 else:
@@ -945,9 +976,12 @@ class OpsService:
             else:
                 allowed = harvest.get("can_click") or (force and harvest.get("force_ok"))
             if not allowed:
-                reason = harvest.get("reason") or live.get("error") or "现在不适合平仓"
-                if auto and side:
-                    reason = f"自动收利({side})未满足：{reason}"
+                if auto and harvest.get("migrate"):
+                    reason = "换币迁仓仅手动点「一键收利」，自动收利不迁仓"
+                else:
+                    reason = harvest.get("reason") or live.get("error") or "现在不适合平仓"
+                    if auto and side:
+                        reason = f"自动收利({side})未满足：{reason}"
                 self.store.add_event(account.id, action, False, ("自动收利已拦截：" if auto else "已拦截：") + reason[:500])
                 return {
                     "ok": False,
@@ -986,9 +1020,13 @@ class OpsService:
             side = (harvest_side or "").upper() or None
             if side not in {"LONG", "SHORT"}:
                 side = None
-            # 自动收利：按 MACD 指定腿；平稳用收利宽阈值，仍可等一会再平
+            # 自动收利：按 MACD 指定腿；平稳用收利宽阈值，仍可等一会再平；迁仓仅手动
             wait_stable = not force
-            run = lambda: cycle.harvest_once(wait_stable=wait_stable, side=side if auto else None)
+            run = lambda: cycle.harvest_once(
+                wait_stable=wait_stable,
+                side=side if auto else None,
+                allow_migrate=not auto,
+            )
         elif action == "scale":
             run = lambda: cycle.scale_once(force=force or mode == "force")
         elif action == "switch":

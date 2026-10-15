@@ -375,7 +375,7 @@ class AutoHarvestWorker:
             if pnl <= 0 or pnl < min_profit:
                 return False
         else:
-            if not harvest.get("can_click"):
+            if harvest.get("migrate") or not harvest.get("can_click"):
                 return False
             side = None
             macd_note = "未启用 MACD 过滤"
