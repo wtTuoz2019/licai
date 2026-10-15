@@ -222,6 +222,35 @@ class Pipeline:
         slices.sort(key=lambda item: item[1], reverse=True)
         return slices
 
+    def _movable_holding_amount(self, product: FlexibleProduct, amount: Decimal) -> Decimal:
+        """统一账户里当保证金的仓，只能按可转回额度算可换数量；转不出的不要反复列入换年化。"""
+        if amount <= 0:
+            return Decimal("0")
+        located = str((product.raw or {}).get("located") or "")
+        in_pm = located == "pm" or product.kind in {"bfusd", "rwusd"}
+        if not in_pm:
+            return amount
+        try:
+            legs = self.futures.legs(self.settings.hedge_symbol)
+            has_hedge = legs.long_qty > 0 or legs.short_qty > 0
+        except Exception:
+            has_hedge = True
+        try:
+            if product.kind == "flexible" and product.asset.upper() == "USDT":
+                cap = self.futures.earn_asset_transferable("LDUSDT", "FUTURE_TO_EARN")
+            elif product.kind in {"bfusd", "rwusd"}:
+                try:
+                    cap = self.futures.earn_asset_transferable(product.asset, "FUTURE_TO_EARN")
+                except BinanceAPIError:
+                    cap = self.futures.max_withdraw(product.asset)
+            else:
+                return amount
+        except BinanceAPIError:
+            return Decimal("0") if has_hedge else amount
+        if cap < SPOT_MIN:
+            return Decimal("0") if has_hedge else amount
+        return min(amount, cap)
+
     def _allocation_moves(
         self,
         holdings: list[tuple[FlexibleProduct, Decimal]] | None = None,
@@ -237,6 +266,7 @@ class Pipeline:
         stable_rows: list[tuple[FlexibleProduct, Decimal]] = []
         alt_rows: list[tuple[FlexibleProduct, Decimal]] = []
         for product, amount in holdings:
+            amount = self._movable_holding_amount(product, amount)
             if amount <= 0:
                 continue
             if self._is_stable_earn_asset(product):
@@ -1411,6 +1441,13 @@ class Pipeline:
                         f"点「换年化」会按各产品额度申购，当前优先 {target.asset}，年化 {apr_choice_text(target)}"
                     ),
                 }
+            locked = any(amt > 0 for _p, amt in holdings)
+            reason = "已经按各产品自己的额度配在更高年化上，不用换"
+            if locked:
+                reason = (
+                    "没有可转出的低收益仓可换（有对冲时统一账户里的 LDUSDT/BFUSD "
+                    "常被占作保证金，可转回为 0 就先不动）"
+                )
             return {
                 "needed": False,
                 "can_click": False,
@@ -1420,7 +1457,7 @@ class Pipeline:
                 "safe_mmr": fmt_amount(safe, 4),
                 "next_batch": "0",
                 "remaining": "0",
-                "reason": "已经按各产品自己的额度配在更高年化上，不用换",
+                "reason": reason,
             }
         next_batch = self._next_switch_batch(leftover, mmr, equity)
         can = next_batch > 0

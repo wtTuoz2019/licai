@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -7,13 +8,15 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from . import earn as earn_mod
-from .config import d
+from .config import ROOT, d
 from .macd import fetch_macd_cross
 
 if TYPE_CHECKING:
     from .ops import OpsService
 
 log = logging.getLogger("licai.autoharvest")
+
+_EARN_DAY_PATH = ROOT / "data" / "earn_day_done.json"
 
 
 def _print(msg: str) -> None:
@@ -38,8 +41,25 @@ class AutoHarvestWorker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_cross_key = ""
-        # account_id -> UTC 日期，每日理财检查只跑一次
-        self._earn_day_done: dict[int, str] = {}
+        # account_id -> UTC 日期，每日理财检查只跑一次（落盘，重启不重试）
+        self._earn_day_done: dict[int, str] = self._load_earn_day_done()
+
+    @staticmethod
+    def _load_earn_day_done() -> dict[int, str]:
+        try:
+            raw = json.loads(_EARN_DAY_PATH.read_text(encoding="utf-8"))
+            return {int(k): str(v) for k, v in (raw or {}).items()}
+        except Exception:
+            return {}
+
+    def _mark_earn_day_done(self, account_id: int, day: str) -> None:
+        self._earn_day_done[account_id] = day
+        try:
+            _EARN_DAY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            payload = {str(k): v for k, v in self._earn_day_done.items()}
+            _EARN_DAY_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            log.exception("写入每日理财检查标记失败")
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -120,17 +140,17 @@ class AutoHarvestWorker:
 
             if not account.auto_harvest:
                 _print(f"每日换年化跳过 account={account.id}：未开自动收利，只在手动点「换年化」时换")
-                self._earn_day_done[account.id] = day
+                self._mark_earn_day_done(account.id, day)
                 return
 
             if not bool(getattr(self.ops.base, "auto_switch_earn", True)):
-                self._earn_day_done[account.id] = day
+                self._mark_earn_day_done(account.id, day)
                 return
 
             switch = live.get("switch") or {}
             if not switch.get("needed"):
                 _print(f"每日换年化跳过 account={account.id}：已是最高或无需换")
-                self._earn_day_done[account.id] = day
+                self._mark_earn_day_done(account.id, day)
                 return
             if not switch.get("can_click"):
                 _print(
@@ -138,9 +158,11 @@ class AutoHarvestWorker:
                     f"{switch.get('reason') or 'uniMMR/批次不够'}"
                 )
                 # 今天仍算检查过，避免每分钟重试打爆；安全线恢复后次日再换
-                self._earn_day_done[account.id] = day
+                self._mark_earn_day_done(account.id, day)
                 return
 
+            # 先打上今日已处理，避免重启/异常后同一天反复空转
+            self._mark_earn_day_done(account.id, day)
             _print(
                 f"每日自动换年化 account={account.id} "
                 f"→ {switch.get('target')} {switch.get('target_apr')}% · {switch.get('reason')}"
@@ -160,8 +182,17 @@ class AutoHarvestWorker:
                 fails = [s for s in steps if not s.get("ok")]
                 pick = fails or steps[-4:]
                 detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
-            _print(f"每日自动换年化结束 account={account.id} ok={ok} {detail[:500]}")
-            self._earn_day_done[account.id] = day
+            paused = any(
+                (s.get("name") == "暂停换产品") or ("先不动" in str(s.get("detail") or ""))
+                for s in steps
+            )
+            if paused and ok:
+                _print(
+                    f"每日自动换年化结束 account={account.id} ok={ok} "
+                    f"未实际换出（保证金占用/批次不足），今日不再重试：{detail[:400]}"
+                )
+            else:
+                _print(f"每日自动换年化结束 account={account.id} ok={ok} {detail[:500]}")
         finally:
             self.ops.end_action(account.id)
 
