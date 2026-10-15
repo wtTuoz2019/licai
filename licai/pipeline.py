@@ -69,6 +69,8 @@ class StepResult:
 
 
 SPOT_MIN = Decimal("1")
+# 币安 Convert 常见下限；低于此数询价会 345233，不当整笔换年化失败
+CONVERT_MIN = Decimal("0.01")
 
 
 class Pipeline:
@@ -1399,9 +1401,15 @@ class Pipeline:
             free = self.earn.spot_free(asset)
         except BinanceAPIError:
             return None
-        # 灰尘也尽量兑；兑换所下限不够时由调用方软化失败
         if free <= 0:
             return None
+        # 低于 Convert 下限（常 0.01）直接跳过，避免 345233 打断换年化
+        if free < CONVERT_MIN:
+            return StepResult(
+                "兑换跳过",
+                True,
+                f"{asset} {fmt_amount(free)} < {fmt_amount(CONVERT_MIN)}，低于币安兑换下限，留着灰尘",
+            )
         step = self._mutate(
             f"兑换 {fmt_amount(free)} {asset} -> {target}",
             lambda amt=free, a=asset, t=target: self.convert_api.convert(a, t, amt),
@@ -1936,8 +1944,16 @@ class Pipeline:
                     continue
                 steps.append(converted)
                 if not converted.ok:
-                    # 灰尘兑换常因低于币安最小额失败，不当整笔换产品失败
-                    if redeem_all or amount < SPOT_MIN:
+                    # 灰尘/低于 Convert 下限：不当整笔换产品失败
+                    detail = str(converted.detail or "")
+                    soft = (
+                        redeem_all
+                        or amount < SPOT_MIN
+                        or "345233" in detail
+                        or "between 0.01" in detail.lower()
+                        or "兑换下限" in detail
+                    )
+                    if soft:
                         converted.ok = True
                         converted.detail = f"尾数过小未兑换：{converted.detail}"
                     else:
