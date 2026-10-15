@@ -242,6 +242,9 @@ class HedgeCycle:
         if any(not s.ok for s in steps):
             return steps
         paused = any(s.name == "暂停换产品" for s in steps)
+        region_stop = paused and any(
+            "本地区不可用" in str(s.detail or "") for s in steps if s.name == "暂停换产品"
+        )
         if not paused:
             sweep = self.pipeline.sweep_spot_to_earn()
             steps.extend(sweep)
@@ -250,8 +253,15 @@ class HedgeCycle:
         bought = _subscribed(steps)
         if bought and not self.settings.dry_run:
             time.sleep(max(int(self.settings.settle_seconds or 0), 3))
+        # 地区墙暂停后禁止 BFUSD 赎回空转；只尝试理财代币直接入统一账户
         if bought or self.pipeline.spot_needs_move():
-            steps.extend(self._fund_after_earn(steps, check_idle_ldusdt=not paused))
+            steps.extend(
+                self._fund_after_earn(
+                    steps,
+                    check_idle_ldusdt=not paused,
+                    allow_redeem_fallback=not region_stop,
+                )
+            )
         return steps
 
     def _bootstrap_funds(self) -> list[StepResult]:
@@ -267,15 +277,27 @@ class HedgeCycle:
         bought = _subscribed(steps)
         if bought and not self.settings.dry_run:
             time.sleep(max(int(self.settings.settle_seconds or 0), 3))
-        steps.extend(self._fund_after_earn(steps, check_idle_ldusdt=True))
+        # 入场需要保证金：允许 BFUSD/RWUSD 赎回走 LDUSDT；换年化则默认不赎回
+        steps.extend(
+            self._fund_after_earn(steps, check_idle_ldusdt=True, allow_redeem_fallback=True)
+        )
         return steps
 
-    def _fund_after_earn(self, earn_steps: list[StepResult], *, check_idle_ldusdt: bool) -> list[StepResult]:
+    def _fund_after_earn(
+        self,
+        earn_steps: list[StepResult],
+        *,
+        check_idle_ldusdt: bool,
+        allow_redeem_fallback: bool = False,
+    ) -> list[StepResult]:
         bought = _subscribed(earn_steps)
         bought_flex = any((not s.dry_run) and s.ok and "申购活期" in s.name for s in earn_steps)
         check_ld = bought_flex or (check_idle_ldusdt and not bought)
         if bought or self.pipeline.spot_needs_move() or check_ld:
-            return self.pipeline.fund_unified(check_ldusdt=check_ld)
+            return self.pipeline.fund_unified(
+                check_ldusdt=check_ld,
+                allow_redeem_fallback=allow_redeem_fallback,
+            )
         return []
 
     def harvest_once(self, *, wait_stable: bool = True, side: str | None = None) -> list[StepResult]:

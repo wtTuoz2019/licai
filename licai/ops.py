@@ -7,7 +7,16 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
 
-from .config import Settings, d, fmt_amount, is_mmr_sentinel, load_settings, settings_for_account, settle_asset_of
+from .config import (
+    ROOT,
+    Settings,
+    d,
+    fmt_amount,
+    is_mmr_sentinel,
+    load_settings,
+    settings_for_account,
+    settle_asset_of,
+)
 from .cycle import HedgeCycle, margin_use_pct, position_plan
 from .monitor import (
     enter_advice,
@@ -286,6 +295,7 @@ def pipeline_for(
     if ops is not None:
         blocked = ops._earn_region_block.setdefault(account.id, set())
         pipe._runtime_denylist = blocked
+        pipe._on_denylist_change = ops.save_earn_region_block
         if account.proxy:
             account_id = account.id
 
@@ -314,8 +324,42 @@ class OpsService:
         )
         self._bad_proxy_endpoints: set[str] = set()
         self._proxy_rotate_lock = threading.Lock()
-        # account_id -> 地区/合规不可用资产（进程内记住，避免每天把 BFUSD 赎成闲置 U）
+        # account_id -> 地区/合规不可用资产（落盘，避免重启后又申购 RWUSD 空转）
         self._earn_region_block: dict[int, set[str]] = {}
+        self._region_block_path = ROOT / "data" / "earn_region_block.json"
+        self._load_earn_region_block()
+
+    def _load_earn_region_block(self) -> None:
+        path = getattr(self, "_region_block_path", ROOT / "data" / "earn_region_block.json")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            raw = {}
+        out: dict[int, set[str]] = {}
+        if isinstance(raw, dict):
+            for key, assets in raw.items():
+                try:
+                    aid = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(assets, list):
+                    out[aid] = {str(a).upper() for a in assets if a}
+                elif isinstance(assets, str) and assets:
+                    out[aid] = {assets.upper()}
+        self._earn_region_block = out
+
+    def save_earn_region_block(self) -> None:
+        path = getattr(self, "_region_block_path", ROOT / "data" / "earn_region_block.json")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                str(aid): sorted(assets)
+                for aid, assets in sorted(self._earn_region_block.items())
+                if assets
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
 
     def webshare_status(self) -> dict:
         ok = self._webshare.configured

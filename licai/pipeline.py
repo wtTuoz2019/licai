@@ -88,6 +88,7 @@ class Pipeline:
         self._wallet_transfer_blocked = False
         # 本进程内：地区/合规不可用的产品（如 RWUSD -9000），避免反复赎回后申购失败把 U 卡在现货
         self._runtime_denylist: set[str] = set()
+        self._on_denylist_change: Callable[[], None] | None = None
 
     def spot_cash(self, asset: str | None = None) -> Decimal:
         return self.earn.spot_free((asset or self.settings.source_asset).upper())
@@ -265,11 +266,14 @@ class Pipeline:
         gap = self._apr_gap()
         stable_rows: list[tuple[FlexibleProduct, Decimal]] = []
         alt_rows: list[tuple[FlexibleProduct, Decimal]] = []
+        dust = SPOT_MIN  # <1 的稳定币灰尘不进换年化，避免 -6060/-6009
         for product, amount in holdings:
             amount = self._movable_holding_amount(product, amount)
             if amount <= 0:
                 continue
             if self._is_stable_earn_asset(product):
+                if amount < dust:
+                    continue
                 stable_rows.append((product, amount))
             elif not stable_only:
                 alt_rows.append((product, amount))
@@ -431,6 +435,11 @@ class Pipeline:
         if name not in self._runtime_denylist:
             self._runtime_denylist.add(name)
             self._product_list = None
+            if self._on_denylist_change is not None:
+                try:
+                    self._on_denylist_change()
+                except Exception:
+                    pass
         return True
 
     def _fallback_subscribe(self, failed: FlexibleProduct, amount: Decimal, fail_detail: object) -> list[StepResult]:
@@ -1010,7 +1019,9 @@ class Pipeline:
             "ld_transferable": fmt_amount(ld_free, 4),
         }
 
-    def fund_unified(self, *, check_ldusdt: bool = True) -> list[StepResult]:
+    def fund_unified(
+        self, *, check_ldusdt: bool = True, allow_redeem_fallback: bool = False
+    ) -> list[StepResult]:
         if not self.settings.unified_account:
             return [StepResult("保证金", False, "当前配置不是统一账户")]
         steps: list[StepResult] = []
@@ -1022,10 +1033,14 @@ class Pipeline:
             steps.extend(self._fund_spot_asset("USDC", usdc_spot))
         bfusd_spot = self.spot_cash("BFUSD")
         if bfusd_spot >= SPOT_MIN:
-            steps.extend(self._fund_spot_asset("BFUSD", bfusd_spot))
+            steps.extend(
+                self._fund_spot_asset("BFUSD", bfusd_spot, allow_redeem_fallback=allow_redeem_fallback)
+            )
         rwusd_spot = self.spot_cash("RWUSD")
         if rwusd_spot >= SPOT_MIN:
-            steps.extend(self._fund_spot_asset("RWUSD", rwusd_spot))
+            steps.extend(
+                self._fund_spot_asset("RWUSD", rwusd_spot, allow_redeem_fallback=allow_redeem_fallback)
+            )
         already_ld = any("LDUSDT" in s.name and s.ok for s in steps)
         if check_ldusdt and not already_ld:
             try:
@@ -1046,12 +1061,22 @@ class Pipeline:
             return [StepResult("无需划转", True, "现货没有可划入统一账户的余额")]
         return steps
 
-    def _fund_spot_asset(self, asset: str, amount: Decimal) -> list[StepResult]:
+    def _fund_spot_asset(
+        self, asset: str, amount: Decimal, *, allow_redeem_fallback: bool = False
+    ) -> list[StepResult]:
+        if amount < SPOT_MIN:
+            return [
+                StepResult(
+                    f"{asset} 灰尘跳过",
+                    True,
+                    f"{asset} {fmt_amount(amount)} < {fmt_amount(SPOT_MIN)}，忽略",
+                )
+            ]
         if self._wallet_transfer_blocked:
             return self._spot_via_ldusdt(asset, amount)
         # BFUSD / RWUSD 不能走 MAIN_PORTFOLIO_MARGIN（会 -3027），优先用理财代币转入
         if asset in {"BFUSD", "RWUSD"}:
-            return self._fund_earn_token(asset, amount)
+            return self._fund_earn_token(asset, amount, allow_redeem_fallback=allow_redeem_fallback)
         step = self._move_spot(asset, amount)
         if step.ok:
             return [step]
@@ -1065,15 +1090,26 @@ class Pipeline:
         )
         return [note, *self._spot_via_ldusdt(asset, amount)]
 
-    def _fund_earn_token(self, asset: str, amount: Decimal) -> list[StepResult]:
-        """BFUSD / RWUSD：先试 EARN_TO_FUTURE；现货划转会 -3027；再不行就赎回走 LDUSDT。"""
+    def _fund_earn_token(
+        self, asset: str, amount: Decimal, *, allow_redeem_fallback: bool = False
+    ) -> list[StepResult]:
+        """BFUSD / RWUSD：先试 EARN_TO_FUTURE；默认不赎回改低年化（避免 RWUSD 地区失败后 BFUSD↔USDT 空转）。"""
         steps: list[StepResult] = []
+        if amount < SPOT_MIN:
+            return [
+                StepResult(
+                    f"{asset} 灰尘跳过",
+                    True,
+                    f"{asset} {fmt_amount(amount)} < {fmt_amount(SPOT_MIN)}，不划转不赎回",
+                )
+            ]
         try:
             cap = self.futures.earn_to_pm_balance(asset)
         except BinanceAPIError as exc:
-            cap = Decimal("0")
+            # -1100 等查询异常时仍按持仓量尝试转入，避免误走赎回
+            cap = amount
             steps.append(StepResult(f"查询 {asset} 可转入", True, str(exc)))
-        move = min(amount, cap) if cap > 0 else Decimal("0")
+        move = min(amount, cap) if cap > 0 else amount
         move = move.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
         if move >= SPOT_MIN:
             step = self._mutate(
@@ -1088,7 +1124,27 @@ class Pipeline:
                 if leftover < SPOT_MIN:
                     return steps
                 amount = leftover
-        # 仍在现货、万向划转又不认这个币：赎回成稳定币再走 LDUSDT
+            else:
+                # 转入失败：默认留着继续吃利息，不赎回砸成 USDT 活期
+                if not allow_redeem_fallback:
+                    steps.append(
+                        StepResult(
+                            f"{asset} 暂留",
+                            True,
+                            f"{asset} 暂不能入统一账户，留在理财/现货继续计息（不赎回改低年化）",
+                        )
+                    )
+                    return steps
+        if not allow_redeem_fallback:
+            steps.append(
+                StepResult(
+                    f"{asset} 暂留",
+                    True,
+                    f"{asset} 未转入统一账户，留着计息（禁止赎回空转）",
+                )
+            )
+            return steps
+        # 仅入场急需保证金时：赎回成稳定币再走 LDUSDT
         note = StepResult(
             f"{asset} 改走赎回",
             True,
@@ -1096,7 +1152,6 @@ class Pipeline:
         )
         via = self._spot_via_ldusdt(asset, amount)
         if any(not s.ok for s in via):
-            # 仓位已齐时，理财代币入金失败不盖掉收利；留着下次换年化/入场再处理
             via = [
                 s
                 if s.ok
@@ -1541,6 +1596,20 @@ class Pipeline:
 
         for product, amount, target, _note in moves:
             remaining = amount
+            # 稳定币灰尘：不赎回，避免 -6060/-6009 刷屏
+            if (
+                remaining > 0
+                and remaining < dust_cut
+                and self._is_stable_earn_asset(product)
+            ):
+                steps.append(
+                    StepResult(
+                        "灰尘跳过",
+                        True,
+                        f"{product.asset} 仅 {fmt_amount(remaining)} < {fmt_amount(dust_cut)}，不赎回",
+                    )
+                )
+                continue
             # 山寨活期数量单位不是 U，不能按 USDT 批次估；一律整笔赎→兑 USDT→申购
             if remaining > 0 and not self._is_stable_earn_asset(product):
                 steps.append(
@@ -1665,21 +1734,9 @@ class Pipeline:
                     steps.extend(_redeem(product, remaining))
                     remaining = Decimal("0")
         if full:
-            # 只清分配方案里还剩的尘埃，不要把仍该留在高档额度里的仓位赎掉
+            # 入场时也不再强清 <1 稳定币灰尘（币安常拒，只会 -6060 限频）
             self.earn.invalidate()
             self._product_list = None
-            for product, amount, target, _note in self._allocation_moves():
-                if amount <= 0 or amount >= dust_cut:
-                    continue
-                steps.append(
-                    StepResult(
-                        "清尾数",
-                        True,
-                        f"复查仍有 {product.asset} {fmt_amount(amount)}，整笔赎回",
-                    )
-                )
-                steps.extend(_redeem(product, amount, redeem_all=True))
-                self._soften_dust_failures(steps)
         if batches == 0 and all(s.ok for s in steps) and not any("清尾数" in s.name for s in steps):
             # 若已有清尾数步骤，不要盖成「没有达到最小批次」
             if len(steps) <= 1:
