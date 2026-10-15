@@ -559,15 +559,23 @@ class HedgeCycle:
             return steps
 
         # 全额转出 → 申购理财 → 确认计入保证金 → 再补仓（不预留现金，利润尽量进理财）
+        # 理财/兑换失败也必须继续补仓，避免裸仓一直敞口
         refill_qty = after.short_qty if side == "LONG" else after.long_qty
         steps.extend(self._profit_to_spot(pnl))
-        earn_steps = self._spot_profit_to_earn(product=planned)
-        steps.extend(earn_steps)
+        earn_steps: list[StepResult] = []
+        try:
+            earn_steps = self._spot_profit_to_earn(product=planned)
+            steps.extend(earn_steps)
+        except Exception as exc:
+            steps.append(StepResult("归集理财异常", False, str(exc)))
         bought = _subscribed(earn_steps)
         if bought and not self.settings.dry_run:
             time.sleep(max(int(self.settings.settle_seconds or 0), 2))
-        steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
-        steps.extend(self._confirm_harvest_margin(planned, before_pm=before_pm, realized=pnl))
+        try:
+            steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
+            steps.extend(self._confirm_harvest_margin(planned, before_pm=before_pm, realized=pnl))
+        except Exception as exc:
+            steps.append(StepResult("保证金回注异常", False, str(exc)))
 
         refill_pos = "LONG" if side == "LONG" else "SHORT"
         refill_order = "BUY" if refill_pos == "LONG" else "SELL"

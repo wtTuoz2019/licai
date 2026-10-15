@@ -2068,3 +2068,6 @@ class Pipeline:
             return StepResult(name, True, fn(), dry_run=False)
         except BinanceAPIError as exc:
             return StepResult(name, False, str(exc), dry_run=False)
+        except Exception as exc:
+            # 兑换询价等非 BinanceAPIError 也不能冒泡中断收利补仓
+            return StepResult(name, False, str(exc), dry_run=False)
