@@ -576,7 +576,22 @@ class HedgeCycle:
                 steps.extend(self._wait_until_stable("补仓前"))
             refill_steps = self._quote_side(refill_order, refill_pos, refill_qty, reduce_only=False)
             steps.extend(refill_steps)
-            if any(_no_margin(item) for item in refill_steps):
+            after_refill = self.futures.legs(self.symbol)
+            if after_refill.missing_side is None or (
+                (refill_pos == "SHORT" and after_refill.short_qty > 0)
+                or (refill_pos == "LONG" and after_refill.long_qty > 0)
+            ):
+                # 追挂曾报 -2019，但补腿已到位：不算失败，勿误平
+                if any(_no_margin(item) for item in refill_steps):
+                    steps.append(
+                        StepResult(
+                            "补仓已齐",
+                            True,
+                            f"过程中曾 -2019，但 {refill_pos} 已到位，继续：{self._legs_text(after_refill)}",
+                        )
+                    )
+                steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
+            elif any(_no_margin(item) for item in refill_steps):
                 steps.append(StepResult("补仓未完成", False, "保证金不足（-2019），平掉单边避免裸仓"))
                 steps.extend(self._flatten_if_naked())
             else:
@@ -1667,14 +1682,24 @@ class HedgeCycle:
             )
             steps.extend(extra)
             if (not reduce_only) and any(_no_margin(item) for item in extra):
-                steps.append(
-                    StepResult(
-                        "保证金不够",
-                        False,
-                        f"{position_side} 开仓 -2019，停止重试（需理财先入统一账户）",
-                    )
+                # 追挂 -2019：旧单可能仍在/刚成交，先确认再决定是否真失败
+                recovered = self._recover_refill_margin_reject(
+                    order_side,
+                    position_side,
+                    qty,
+                    finished=finished,
+                    done_name=done_name,
+                    wait=max(wait, 1.2),
                 )
-                return steps
+                steps.extend(recovered)
+                if finished(self.futures.legs(self.symbol)):
+                    return steps
+                if any(_no_margin(item) for item in recovered):
+                    return steps
+                # 恢复挂单成功则继续盯成交，不立刻判死
+                quote_at = time.monotonic()
+                queue_since = time.monotonic()
+                continue
             if any(_order_filled_hint(item) for item in extra) or any(
                 _reduce_only_reject(item) for item in extra
             ):
@@ -1720,19 +1745,122 @@ class HedgeCycle:
             )
             steps.extend(market_steps)
             if (not reduce_only) and any(_no_margin(item) for item in market_steps):
-                steps.append(
-                    StepResult(
-                        "保证金不够",
-                        False,
-                        f"{position_side} 市价也 -2019，停止重试",
-                    )
+                recovered = self._recover_refill_margin_reject(
+                    order_side,
+                    position_side,
+                    qty,
+                    finished=finished,
+                    done_name=done_name,
+                    wait=1.0,
+                    allow_retry_place=True,
                 )
-                return steps
+                steps.extend(recovered)
+                if finished(self.futures.legs(self.symbol)):
+                    return steps
+                if any(_no_margin(item) for item in recovered):
+                    return steps
             if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=0.8):
                 steps.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
                 return steps
         steps.append(StepResult(f"{position_side} 未完成", False, self._legs_text(self.futures.legs(self.symbol))))
         return steps
+
+    def _recover_refill_margin_reject(
+        self,
+        order_side: str,
+        position_side: str,
+        qty: Decimal,
+        *,
+        finished,
+        done_name: str,
+        wait: float,
+        allow_retry_place: bool = True,
+    ) -> list[StepResult]:
+        """补仓追挂 -2019：先看是否已成交/旧单还在，再等保证金释放后重挂一次。"""
+        out: list[StepResult] = []
+        legs = self.futures.legs(self.symbol)
+        if finished(legs):
+            out.append(
+                StepResult(
+                    done_name,
+                    True,
+                    f"曾报 -2019，但仓位已到位：{self._legs_text(legs)}",
+                )
+            )
+            return out
+
+        resting = None
+        try:
+            bid, ask = self.futures.book(self.symbol, force=True)
+            resting = self._open_maker_px(order_side, position_side, bid, ask)
+        except BinanceAPIError:
+            resting = None
+        if resting is not None:
+            out.append(
+                StepResult(
+                    "挂单仍在",
+                    True,
+                    f"-2019 但 {position_side} 挂单仍在 @ {fmt_amount(resting)}，继续等成交",
+                )
+            )
+            if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=max(wait, 2.0)):
+                out.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
+            return out
+
+        if not allow_retry_place:
+            out.append(
+                StepResult(
+                    "保证金不够",
+                    False,
+                    f"{position_side} 开仓 -2019，无挂单可等（需理财先入统一账户）",
+                )
+            )
+            return out
+
+        # 撤挂后保证金释放常有短暂延迟，稍等再挂，避免误杀
+        out.append(StepResult("保证金释放等待", True, "撤挂后等保证金释放再补挂"))
+        time.sleep(0.7)
+        self._cancel_open_clean()
+        time.sleep(0.35)
+        if finished(self.futures.legs(self.symbol)):
+            out.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
+            return out
+        retry = self._side_pass(
+            order_side,
+            position_side,
+            qty,
+            reduce_only=False,
+            market=False,
+            aggressive=False,
+            pass_n=0,
+            touch=True,
+        )
+        out.extend(retry)
+        if finished(self.futures.legs(self.symbol)):
+            out.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
+            return out
+        if any(_no_margin(item) for item in retry):
+            # 最后再看一眼：可能旧单刚成交
+            if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=1.0):
+                out.append(
+                    StepResult(
+                        done_name,
+                        True,
+                        f"重挂仍 -2019，但仓位已到位：{self._legs_text(self.futures.legs(self.symbol))}",
+                    )
+                )
+                return out
+            out.append(
+                StepResult(
+                    "保证金不够",
+                    False,
+                    f"{position_side} 开仓 -2019，停止重试（需理财先入统一账户）",
+                )
+            )
+            return out
+        if self._wait_until(lambda: finished(self.futures.legs(self.symbol)), timeout=max(wait, 1.5)):
+            out.append(StepResult(done_name, True, self._legs_text(self.futures.legs(self.symbol))))
+        return out
 
     def _side_pass(
         self,
@@ -1771,6 +1899,9 @@ class HedgeCycle:
                 return [kept]
 
         self._cancel_open_clean()
+        # 开仓撤旧单后保证金释放有延迟；立刻重挂小账户易 -2019
+        if (not market) and (not reduce_only):
+            time.sleep(0.35)
 
         placed = self._place(
             order_side,
