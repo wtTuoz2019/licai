@@ -384,16 +384,22 @@ class AutoHarvestWorker:
             f"自动收利触发 account={account.id} side={side or harvest.get('winner')} "
             f"pnl={harvest.get('winner_pnl')} macd={macd_note}"
         )
-        result = self.ops.run_action(
-            account,
-            "harvest",
-            force=False,
-            mode=None,
-            _locked=True,
-            auto=True,
-            harvest_side=side,
-            with_snapshot=False,
-        )
+        result: dict = {}
+        try:
+            result = self.ops.run_action(
+                account,
+                "harvest",
+                force=False,
+                mode=None,
+                _locked=True,
+                auto=True,
+                harvest_side=side,
+                with_snapshot=False,
+            )
+        except Exception as exc:
+            log.exception("账号 %s 自动收利异常，尝试修复裸仓", account.id)
+            result = {"ok": False, "reason": str(exc), "steps": []}
+            self._repair_naked_hedge(account)
         ok = bool(result.get("ok"))
         detail = result.get("reason") or ""
         steps = result.get("steps") or []
@@ -401,9 +407,36 @@ class AutoHarvestWorker:
             fails = [s for s in steps if not s.get("ok")]
             pick = fails or steps[-4:]
             detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+        # 收利后无论成败，再确认一次没有单边敞口
+        self._repair_naked_hedge(account)
         if ok and side:
             cross = fetch_macd_cross(getattr(self.ops.base, "macd_indicator_url", None))
             if cross and cross.harvest_side == side:
                 self._last_cross_key = f"{cross.kind}:{cross.time}"
         _print(f"自动收利结束 account={account.id} ok={ok} {detail[:500]}")
         return True
+
+    def _repair_naked_hedge(self, account) -> None:
+        """收利后若仍单边，强行一键补仓/平裸仓，避免爆仓。"""
+        try:
+            live = self.ops.monitor(account)
+        except Exception:
+            log.exception("账号 %s 裸仓检查读仓失败", account.id)
+            return
+        legs = live.get("legs") or {}
+        missing = legs.get("missing")
+        if not missing:
+            return
+        _print(f"裸仓修复 account={account.id} missing={missing} → 强制入场补齐")
+        try:
+            self.ops.run_action(
+                account,
+                "enter",
+                force=True,
+                mode="force",
+                _locked=True,
+                auto=True,
+                with_snapshot=False,
+            )
+        except Exception:
+            log.exception("账号 %s 裸仓强制补仓失败", account.id)

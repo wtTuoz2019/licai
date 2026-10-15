@@ -538,83 +538,89 @@ class HedgeCycle:
             before_pm = {}
 
         if wait_stable:
-            steps.extend(self._wait_until_stable("平仓前"))
-        steps.extend(self._close_winner_for_harvest(side, qty, wait_stable=wait_stable))
-        after = self.futures.legs(self.symbol)
-        still = after.long_qty if side == "LONG" else after.short_qty
-        # 盈利腿必须归零才转出；否则先把仓位拉回平衡再停
-        if still > 0:
-            steps.append(
-                StepResult(
-                    "平仓未净",
-                    False,
-                    f"{side} 仍剩 {fmt_amount(still)}，无法安全转出，先恢复对冲平衡",
-                )
-            )
-            steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
-            return steps
-        if after.missing_side is None:
-            steps.append(StepResult("平仓异常", False, "平仓后两侧仍在，没有实现盈利可转出"))
-            steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
-            return steps
+            try:
+                steps.extend(self._wait_until_stable("平仓前"))
+            except Exception as exc:
+                steps.append(StepResult("平仓前平稳跳过", True, str(exc)))
 
-        # 全额转出 → 申购理财 → 确认计入保证金 → 再补仓（不预留现金，利润尽量进理财）
-        # 理财/兑换失败也必须继续补仓，避免裸仓一直敞口
-        refill_qty = after.short_qty if side == "LONG" else after.long_qty
-        steps.extend(self._profit_to_spot(pnl))
-        earn_steps: list[StepResult] = []
+        # 一经平掉盈利腿进入裸仓，后面任何报错都不能阻断补仓（finally 保底）
+        refill_qty = Decimal("0")
+        must_refill = False
         try:
-            earn_steps = self._spot_profit_to_earn(product=planned)
-            steps.extend(earn_steps)
-        except Exception as exc:
-            steps.append(StepResult("归集理财异常", False, str(exc)))
-        bought = _subscribed(earn_steps)
-        if bought and not self.settings.dry_run:
-            time.sleep(max(int(self.settings.settle_seconds or 0), 2))
-        try:
-            steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
-            steps.extend(self._confirm_harvest_margin(planned, before_pm=before_pm, realized=pnl))
-        except Exception as exc:
-            steps.append(StepResult("保证金回注异常", False, str(exc)))
-
-        refill_pos = "LONG" if side == "LONG" else "SHORT"
-        refill_order = "BUY" if refill_pos == "LONG" else "SELL"
-        if refill_qty > 0:
-            if wait_stable:
-                steps.extend(self._wait_until_stable("补仓前"))
-            refill_steps = self._quote_side(refill_order, refill_pos, refill_qty, reduce_only=False)
-            steps.extend(refill_steps)
-            after_refill = self.futures.legs(self.symbol)
-            if after_refill.missing_side is None or (
-                (refill_pos == "SHORT" and after_refill.short_qty > 0)
-                or (refill_pos == "LONG" and after_refill.long_qty > 0)
-            ):
-                # 追挂曾报 -2019，但补腿已到位：不算失败，勿误平
-                if any(_no_margin(item) for item in refill_steps):
-                    steps.append(
-                        StepResult(
-                            "补仓已齐",
-                            True,
-                            f"过程中曾 -2019，但 {refill_pos} 已到位，继续：{self._legs_text(after_refill)}",
-                        )
+            steps.extend(self._close_winner_for_harvest(side, qty, wait_stable=wait_stable))
+            after = self.futures.legs(self.symbol)
+            still = after.long_qty if side == "LONG" else after.short_qty
+            # 盈利腿必须归零才转出；否则先把仓位拉回平衡再停
+            if still > 0:
+                steps.append(
+                    StepResult(
+                        "平仓未净",
+                        False,
+                        f"{side} 仍剩 {fmt_amount(still)}，无法安全转出，先恢复对冲平衡",
                     )
+                )
                 steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
-            elif any(_no_margin(item) for item in refill_steps):
-                steps.append(StepResult("补仓未完成", False, "保证金不足（-2019），平掉单边避免裸仓"))
-                steps.extend(self._flatten_if_naked())
-            else:
+                return steps
+            if after.missing_side is None:
+                steps.append(StepResult("平仓异常", False, "平仓后两侧仍在，没有实现盈利可转出"))
                 steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
-        else:
-            steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
+                return steps
+
+            must_refill = True
+            refill_qty = after.short_qty if side == "LONG" else after.long_qty
+
+            # 全额转出 → 申购理财 → 回注保证金（失败只记步骤，绝不中断补仓）
+            try:
+                steps.extend(self._profit_to_spot(pnl))
+            except Exception as exc:
+                steps.append(StepResult("转出现货异常", False, str(exc)))
+            earn_steps: list[StepResult] = []
+            try:
+                earn_steps = self._spot_profit_to_earn(product=planned)
+                steps.extend(earn_steps)
+            except Exception as exc:
+                steps.append(StepResult("归集理财异常", False, str(exc)))
+            bought = _subscribed(earn_steps)
+            if bought and not self.settings.dry_run:
+                time.sleep(max(int(self.settings.settle_seconds or 0), 2))
+            try:
+                steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
+                steps.extend(self._confirm_harvest_margin(planned, before_pm=before_pm, realized=pnl))
+            except Exception as exc:
+                steps.append(StepResult("保证金回注异常", False, str(exc)))
+        except Exception as exc:
+            steps.append(StepResult("收利主流程异常", False, str(exc)))
+            try:
+                now = self.futures.legs(self.symbol)
+                if (now.long_qty > 0) != (now.short_qty > 0):
+                    must_refill = True
+                    if refill_qty <= 0:
+                        refill_qty = now.long_qty if now.long_qty > 0 else now.short_qty
+            except Exception:
+                must_refill = True
+        finally:
+            if must_refill:
+                steps.extend(
+                    self._guarantee_refill_after_harvest(
+                        refill_qty=refill_qty,
+                        closed_side=side,
+                        wait_stable=wait_stable,
+                    )
+                )
+
         restored = self.futures.legs(self.symbol)
 
-        # 补仓后若现货仍有残留，再扫一次（用同一预选产品）
-        if self.pipeline.spot_needs_move() or self._spot_settle_left():
-            residual = self._spot_profit_to_earn(product=self._harvest_earn_product or planned)
-            steps.extend(residual)
-            if _subscribed(residual) and not self.settings.dry_run:
-                time.sleep(max(int(self.settings.settle_seconds or 0), 2))
-            steps.extend(self._fund_after_earn(residual, check_idle_ldusdt=False))
+        # 补仓后若现货仍有残留，再扫一次（对冲已齐才做；失败不影响仓位）
+        if restored.missing_side is None:
+            try:
+                if self.pipeline.spot_needs_move() or self._spot_settle_left():
+                    residual = self._spot_profit_to_earn(product=self._harvest_earn_product or planned)
+                    steps.extend(residual)
+                    if _subscribed(residual) and not self.settings.dry_run:
+                        time.sleep(max(int(self.settings.settle_seconds or 0), 2))
+                    steps.extend(self._fund_after_earn(residual, check_idle_ldusdt=False))
+            except Exception as exc:
+                steps.append(StepResult("补仓后归集异常", False, str(exc)))
 
         if restored.missing_side is None:
             steps.append(StepResult("收利完成", True, "对冲已齐。要放大仓位请点「加仓」"))
@@ -629,6 +635,97 @@ class HedgeCycle:
                 )
             )
         return steps
+
+    def _guarantee_refill_after_harvest(
+        self,
+        *,
+        refill_qty: Decimal,
+        closed_side: str,
+        wait_stable: bool = True,
+    ) -> list[StepResult]:
+        """平盈利腿后的硬保证：补回对冲；实在补不齐则市价平掉裸仓。本函数不向外抛异常。"""
+        out: list[StepResult] = []
+        try:
+            legs = self.futures.legs(self.symbol)
+            if legs.missing_side is None:
+                out.append(StepResult("补仓检查", True, f"对冲已齐：{self._legs_text(legs)}"))
+                return out
+            if legs.long_qty <= 0 and legs.short_qty <= 0:
+                out.append(StepResult("补仓检查", True, "仓位已空，无需补"))
+                return out
+
+            miss = legs.missing_side
+            if miss in {"LONG", "SHORT"}:
+                qty = legs.short_qty if miss == "LONG" else legs.long_qty
+                if qty <= 0:
+                    qty = refill_qty
+                order = "BUY" if miss == "LONG" else "SELL"
+                try:
+                    if wait_stable:
+                        out.extend(self._wait_until_stable("补仓前", timeout=45))
+                except Exception as exc:
+                    out.append(StepResult("补仓前平稳跳过", True, str(exc)))
+                try:
+                    refill_steps = self._quote_side(order, miss, qty, reduce_only=False)
+                    out.extend(refill_steps)
+                    after = self.futures.legs(self.symbol)
+                    if after.missing_side is None or (
+                        (miss == "SHORT" and after.short_qty > 0) or (miss == "LONG" and after.long_qty > 0)
+                    ):
+                        if any(_no_margin(item) for item in refill_steps):
+                            out.append(
+                                StepResult(
+                                    "补仓已齐",
+                                    True,
+                                    f"过程中曾 -2019，但 {miss} 已到位：{self._legs_text(after)}",
+                                )
+                            )
+                    elif any(_no_margin(item) for item in refill_steps):
+                        out.append(StepResult("补仓保证金不足", False, f"{miss} -2019，改走恢复/平裸仓"))
+                except Exception as exc:
+                    out.append(StepResult("补仓下单异常", False, str(exc)))
+
+            try:
+                out.extend(self._restore_harvest_balance(wait_stable=False))
+            except Exception as exc:
+                out.append(StepResult("恢复对冲异常", False, str(exc)))
+        except Exception as exc:
+            out.append(StepResult("强制补仓异常", False, str(exc)))
+        finally:
+            try:
+                legs = self.futures.legs(self.symbol)
+                if (legs.long_qty > 0) != (legs.short_qty > 0):
+                    out.append(
+                        StepResult(
+                            "裸仓兜底",
+                            False,
+                            f"仍单边，市价平掉避免爆仓：{self._legs_text(legs)}",
+                        )
+                    )
+                    out.extend(self._flatten_if_naked())
+            except Exception as exc:
+                out.append(StepResult("平裸仓失败", False, str(exc)))
+        return out
+
+    def emergency_hedge_guard(self) -> list[StepResult]:
+        """收利/动作异常后的裸仓守卫：有单边就补或平。不向外抛异常。"""
+        try:
+            legs = self.futures.legs(self.symbol)
+        except Exception as exc:
+            return [StepResult("裸仓守卫", False, f"读仓失败：{exc}")]
+        if legs.missing_side is None:
+            return []
+        if legs.long_qty <= 0 and legs.short_qty <= 0:
+            return []
+        qty = legs.long_qty if legs.long_qty > 0 else legs.short_qty
+        closed = "SHORT" if legs.long_qty > 0 and legs.short_qty <= 0 else "LONG"
+        return [
+            StepResult("裸仓守卫", True, f"检测到单边，强制补齐/平仓：{self._legs_text(legs)}")
+        ] + self._guarantee_refill_after_harvest(
+            refill_qty=qty,
+            closed_side=closed,
+            wait_stable=False,
+        )
 
     def _spot_settle_left(self) -> bool:
         try:

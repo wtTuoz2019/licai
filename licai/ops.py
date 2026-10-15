@@ -971,6 +971,14 @@ class OpsService:
             err = exc
             steps.append(StepResult("异常中断", False, str(exc)))
         finally:
+            # 收利：无论成败/抛错，收尾再扫一遍裸仓（补齐或市价双平）
+            if action == "harvest":
+                try:
+                    extra = cycle.emergency_hedge_guard()
+                    if extra:
+                        steps.extend(extra)
+                except Exception as guard_exc:
+                    steps.append(StepResult("收尾裸仓守卫失败", False, str(guard_exc)))
             # 无论成功、失败还是中途抛错，都落库 + jsonl，避免重启后看不到开单过程
             self._persist_action_log(account, action, steps, auto=auto, error=err)
 
