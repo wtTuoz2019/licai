@@ -561,7 +561,7 @@ class OpsService:
         out["migrate"] = True
         out["reason"] = (
             f"已换套保到 {current_symbol}，旧仓仍在：{tip}。"
-            "点「一键收利」将等平稳全平旧仓，再自动开新对冲。"
+            "点「一键收利」将等 MACD 金叉/死叉 + 平稳后挂单全平旧仓，再自动开新对冲。"
         )
         return out
 

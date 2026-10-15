@@ -1591,7 +1591,7 @@
       const others = s.other_positions || [];
       if (others.length) {
         const tip = others.map((r) => `${r.symbol} ${r.side} ${r.qty}`).join("，");
-        setActionMsg(`已换套保，旧仓仍在：${tip}。点「一键收利」将等平稳全平旧仓，再自动开新对冲。`);
+        setActionMsg(`已换套保，旧仓仍在：${tip}。点「一键收利」将等金叉/死叉+平稳后挂单全平旧仓，再自动开新对冲。`);
       }
       const sw = s.switch || {};
       $("btn-switch").disabled = !sw.can_click;
@@ -1744,8 +1744,8 @@
         const others = live.other_positions || [];
         const tip = others.map((r) => `${r.symbol} ${r.side} ${r.qty}`).join("，") || "旧仓";
         const body = unstable
-          ? `将市价全平旧仓（${tip}），再在 ${(live.symbol || "").toUpperCase() || "新套保"} 开对冲。当前价格不稳，滑点可能更大。`
-          : `将等平稳后全平旧仓（${tip}），再在 ${(live.symbol || "").toUpperCase() || "新套保"} 自动开对冲。`;
+          ? `将跳过等金叉/死叉，挂单尽量平净旧仓（${tip}），再在 ${(live.symbol || "").toUpperCase() || "新套保"} 开对冲。当前不稳，不成交时可能市价扫尾。`
+          : `将等 MACD 金叉/死叉 + 平稳后，挂单全平旧仓（${tip}），再在 ${(live.symbol || "").toUpperCase() || "新套保"} 自动开对冲（最长约等 45 分钟）。`;
         const ok = await confirmAction({
           title: "换币迁仓",
           body,

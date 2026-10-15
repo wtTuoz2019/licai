@@ -125,12 +125,13 @@ def _detect_cross(rows: list[dict]) -> MacdState | None:
     return state
 
 
-def _load_state(url: str | None, *, timeout: float = 4.0) -> MacdState | None:
+def _load_state(url: str | None, *, timeout: float = 4.0, force: bool = False) -> MacdState | None:
     endpoint = (url or DEFAULT_URL).strip() or DEFAULT_URL
     now = time.monotonic()
-    hit = _cache.get(endpoint)
-    if hit and now - hit[0] < _CACHE_TTL:
-        return hit[1]
+    if not force:
+        hit = _cache.get(endpoint)
+        if hit and now - hit[0] < _CACHE_TTL:
+            return hit[1]
     try:
         resp = requests.get(endpoint, timeout=timeout, proxies={"http": None, "https": None})
         resp.raise_for_status()
@@ -143,20 +144,20 @@ def _load_state(url: str | None, *, timeout: float = 4.0) -> MacdState | None:
         return None
 
 
-def fetch_macd_state(url: str | None = None, *, timeout: float = 4.0) -> MacdState | None:
+def fetch_macd_state(url: str | None = None, *, timeout: float = 4.0, force: bool = False) -> MacdState | None:
     """最新涨跌方向；失败返回 None。"""
-    return _load_state(url, timeout=timeout)
+    return _load_state(url, timeout=timeout, force=force)
 
 
-def fetch_macd_bias(url: str | None = None, *, timeout: float = 4.0) -> str | None:
+def fetch_macd_bias(url: str | None = None, *, timeout: float = 4.0, force: bool = False) -> str | None:
     """返回 bull / bear；失败 None。"""
-    state = _load_state(url, timeout=timeout)
+    state = _load_state(url, timeout=timeout, force=force)
     return None if state is None else state.bias
 
 
-def fetch_macd_cross(url: str | None = None, *, timeout: float = 4.0) -> MacdState | None:
+def fetch_macd_cross(url: str | None = None, *, timeout: float = 4.0, force: bool = False) -> MacdState | None:
     """仅在刚交叉时返回；无交叉或失败返回 None。"""
-    state = _load_state(url, timeout=timeout)
+    state = _load_state(url, timeout=timeout, force=force)
     if state is None or not state.cross:
         return None
     return state

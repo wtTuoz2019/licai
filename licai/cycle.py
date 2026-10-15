@@ -6,7 +6,7 @@ from decimal import ROUND_DOWN, Decimal
 from .client import BinanceAPIError
 from .config import d, fmt_amount, is_mmr_sentinel, settle_asset_of
 from .futures import FuturesAPI, HedgeLegs
-from .macd import fetch_macd_state
+from .macd import fetch_macd_cross, fetch_macd_state
 from .monitor import min_harvest_profit, price_stability, resolve_harvest_fee
 from .earn import FlexibleProduct
 from .pipeline import Pipeline, StepResult
@@ -339,13 +339,14 @@ class HedgeCycle:
     def migrate_symbol_and_enter(
         self, others: list[str] | None = None, *, wait_stable: bool = True
     ) -> list[StepResult]:
-        """换套保后迁仓：等平稳 → 市价全平旧币种 → 在新套保币对开对冲。"""
+        """换套保后迁仓：等 MACD 金叉/死叉 + 平稳 → 挂单全平旧仓 → 开新对冲。"""
         others = list(others or self._other_open_symbols())
         steps: list[StepResult] = [
             StepResult(
                 "换币迁仓",
                 True,
-                f"当前套保 {self.symbol}，将全平旧仓 {'、'.join(others) or '（无）'}，再自动开新对冲",
+                f"当前套保 {self.symbol}，将等金叉/死叉后挂单全平旧仓 "
+                f"{'、'.join(others) or '（无）'}，再自动开新对冲",
             )
         ]
         if not others:
@@ -367,8 +368,72 @@ class HedgeCycle:
         steps.extend(self.setup_once(force_hedge=True))
         return steps
 
+    def _wait_until_macd_cross(self, purpose: str, *, timeout: float | None = None) -> list[StepResult]:
+        """等到金叉/死叉那一根再动手；超时不阻断，继续挂单平仓。"""
+        if self.settings.dry_run:
+            return [StepResult("等 MACD", True, f"dry-run 跳过（{purpose}）", dry_run=True)]
+        if not bool(getattr(self.settings, "macd_auto_harvest", True)):
+            return [StepResult("等 MACD", True, f"MACD 过滤关闭，跳过（{purpose}）")]
+        limit = timeout
+        if limit is None:
+            limit = float(getattr(self.settings, "migrate_macd_wait_seconds", 2700) or 2700)
+        limit = max(0.0, float(limit))
+        if limit <= 0:
+            return []
+        url = getattr(self.settings, "macd_indicator_url", None) or ""
+        # 已在交叉上：立刻用
+        try:
+            hit = fetch_macd_cross(url, force=True)
+        except Exception:
+            hit = None
+        if hit is not None:
+            return [
+                StepResult(
+                    "MACD 交叉",
+                    True,
+                    f"{purpose}：已是 {hit.label}@{hit.time}，先挂单平仓",
+                )
+            ]
+        deadline = time.monotonic() + limit
+        steps = [
+            StepResult(
+                "等 MACD",
+                True,
+                f"{purpose}：等待金叉/死叉，最多 {int(limit)}s",
+            )
+        ]
+        last_log = time.monotonic()
+        while time.monotonic() < deadline:
+            time.sleep(15.0)
+            try:
+                hit = fetch_macd_cross(url, force=True)
+            except Exception:
+                hit = None
+            if hit is not None:
+                steps.append(
+                    StepResult(
+                        "MACD 交叉",
+                        True,
+                        f"{purpose}：{hit.label}@{hit.time}，开始挂单平旧仓",
+                    )
+                )
+                return steps
+            now = time.monotonic()
+            if now - last_log >= 120:
+                left = max(0, int(deadline - now))
+                steps.append(StepResult("等 MACD", True, f"{purpose}：仍无交叉，约剩 {left}s"))
+                last_log = now
+        steps.append(
+            StepResult(
+                "等 MACD 超时",
+                True,
+                f"{purpose}：已等 {int(limit)}s 未等到金叉/死叉，改平稳后挂单平仓",
+            )
+        )
+        return steps
+
     def _close_symbol_fully(self, symbol: str, *, wait_stable: bool) -> list[StepResult]:
-        """市价减仓清空指定币对双边（临时切换 self.symbol）。"""
+        """挂单清空指定币对双边（尽量 GTX；扫尾才市价）。临时切换 self.symbol。"""
         steps: list[StepResult] = []
         symbol = (symbol or "").upper()
         if not symbol:
@@ -377,41 +442,54 @@ class HedgeCycle:
         try:
             self.symbol = symbol
             self.settle_asset = settle_asset_of(symbol)
-            steps.append(StepResult("全平旧仓", True, f"开始全平 {symbol}"))
+            steps.append(StepResult("全平旧仓", True, f"开始挂单全平 {symbol}"))
+            prefer = "LONG"
             if wait_stable:
+                try:
+                    steps.extend(self._wait_until_macd_cross(f"全平 {symbol} 前"))
+                except Exception as exc:
+                    steps.append(StepResult("等 MACD 跳过", True, str(exc)))
+                try:
+                    cross = fetch_macd_cross(
+                        getattr(self.settings, "macd_indicator_url", None) or "", force=False
+                    )
+                    if cross is not None:
+                        prefer = cross.harvest_side
+                        steps.append(
+                            StepResult(
+                                "平仓顺序",
+                                True,
+                                f"{cross.label} 优先挂单平 {prefer}，再平另一边",
+                            )
+                        )
+                except Exception:
+                    pass
                 try:
                     steps.extend(self._wait_until_stable(f"全平 {symbol} 前"))
                 except Exception as exc:
                     steps.append(StepResult("全平前平稳跳过", True, str(exc)))
-            for _ in range(8):
-                try:
-                    self.futures.cancel_open(symbol)
-                except BinanceAPIError:
-                    pass
+
+            legs = self.futures.legs(symbol)
+            if legs.long_qty <= 0 and legs.short_qty <= 0:
+                steps.append(StepResult("旧仓已空", True, f"{symbol} 已清零"))
+                return steps
+
+            # 金叉收空 / 死叉收多：先平时机腿，再平另一边；都尽量挂单
+            order = [prefer, "SHORT" if prefer == "LONG" else "LONG"]
+            for side in order:
                 legs = self.futures.legs(symbol)
-                if legs.long_qty <= 0 and legs.short_qty <= 0:
-                    steps.append(StepResult("旧仓已空", True, f"{symbol} 已清零"))
-                    return steps
-                try:
-                    bid, ask = self.futures.book(symbol, force=True)
-                    tick, step = self.futures.filters(symbol)
-                except BinanceAPIError as exc:
-                    steps.append(StepResult("全平读盘失败", False, str(exc)))
-                    return steps
-                if legs.long_qty > 0:
-                    qty = self.futures.round_qty(legs.long_qty, step)
-                    px = self.futures.round_price(bid, tick)
-                    steps.append(self._place("SELL", "LONG", qty, px, True, market=True))
-                if legs.short_qty > 0:
-                    qty = self.futures.round_qty(legs.short_qty, step)
-                    px = self.futures.round_price(ask, tick)
-                    steps.append(self._place("BUY", "SHORT", qty, px, True, market=True))
-                self._wait_until(
-                    lambda: (
-                        (lambda cur: cur.long_qty <= 0 and cur.short_qty <= 0)(self.futures.legs(symbol))
-                    ),
-                    timeout=2.0,
+                qty = legs.long_qty if side == "LONG" else legs.short_qty
+                if qty <= 0:
+                    continue
+                steps.append(
+                    StepResult(
+                        f"挂单平 {side}",
+                        True,
+                        f"{symbol} {side} {fmt_amount(qty)}，GTX 优先",
+                    )
                 )
+                steps.extend(self._close_winner_for_harvest(side, qty, wait_stable=wait_stable))
+
             legs = self.futures.legs(symbol)
             if legs.long_qty <= 0 and legs.short_qty <= 0:
                 steps.append(StepResult("旧仓已空", True, f"{symbol} 已清零"))
