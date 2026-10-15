@@ -527,7 +527,7 @@
             <span class="muted">USDT</span>
             <button type="button" id="btn-save-tp">保存</button>
             <button type="button" id="btn-tp-auto" hidden>恢复自动</button>
-            <label class="auto-toggle" title="无仓须金叉/死叉那一根且严平稳才自动开仓；有仓须金叉收空/死叉收多，并用更宽的收利平稳。手动入场/收利不受影响">
+            <label class="auto-toggle" title="无仓须金叉/死叉与严平稳同时满足才开仓；有仓须金叉/死叉与收利级平稳同时满足才收。手动入场/收利不受影响">
               <input type="checkbox" id="auto-harvest" />
               自动收利
             </label>
@@ -2078,7 +2078,7 @@
           persistFunds();
         }
         setActionMsg(on
-          ? "已开启自动：无仓须金叉/死叉+严平稳开仓；有仓须金叉/死叉+收利宽平稳"
+          ? "已开启自动：无仓须交叉与严平稳同时满足；有仓须交叉与收利平稳同时满足"
           : "已关闭自动收利");
         await pollLive();
       } catch (err) {
