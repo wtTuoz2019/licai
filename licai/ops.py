@@ -565,15 +565,16 @@ class OpsService:
             "missing": legs.missing_side,
         }
 
-    def _other_positions(self, futures, symbol: str, legs=None) -> list[dict]:
-        """当前套保以外仍有仓的币对（换币后旧仓）；带双边数量与浮盈便于页面展示。"""
+    def _other_positions(self, futures, symbol: str, legs=None) -> tuple[list[dict], str | None]:
+        """当前套保以外的仓。返回 (列表, 错误)。读失败时错误非空，列表不可当作「已空」。"""
         try:
             rows = futures.open_um_symbols()
-        except Exception:
-            return []
+        except Exception as exc:
+            return [], str(exc)
         cur = (symbol or "").upper()
         out: list[dict] = []
         seen: set[str] = set()
+        errors: list[str] = []
         for row in rows or []:
             sym = str(row.get("symbol") or "").upper()
             if not sym or sym == cur or sym in seen:
@@ -581,20 +582,8 @@ class OpsService:
             seen.add(sym)
             try:
                 ol = futures.legs(sym)
-            except Exception:
-                out.append(
-                    {
-                        "symbol": sym,
-                        "side": row.get("side") or "",
-                        "qty": row.get("qty") or "0",
-                        "long_qty": row.get("qty") if (row.get("side") or "").upper() == "LONG" else "0",
-                        "short_qty": row.get("qty") if (row.get("side") or "").upper() == "SHORT" else "0",
-                        "long_pnl": "0",
-                        "short_pnl": "0",
-                        "long_entry": "",
-                        "short_entry": "",
-                    }
-                )
+            except Exception as exc:
+                errors.append(f"{sym} 读仓失败：{exc}")
                 continue
             if ol.long_qty <= 0 and ol.short_qty <= 0:
                 continue
@@ -617,7 +606,7 @@ class OpsService:
                     "short_entry": fmt_amount(ol.short_entry) if ol.short_entry > 0 else "",
                 }
             )
-        return out
+        return out, ("；".join(errors) if errors else None)
 
     @staticmethod
     def _apply_migrate_harvest_advice(
@@ -707,8 +696,9 @@ class OpsService:
             data["uni_mmr"] = format_uni_mmr(mmr, has_pos)
             data["price"] = stability.as_dict().get("mid") or data.get("price") or "0"
             data["legs"] = self._legs_payload(legs)
-            others = self._other_positions(futures, settings.hedge_symbol, legs)
+            others, others_err = self._other_positions(futures, settings.hedge_symbol, legs)
             data["other_positions"] = others
+            data["other_positions_error"] = others_err or ""
             data["stability"] = stability.as_dict()
             data["enter"] = enter_advice(legs, stability, d(data.get("spot_usdt") or "0"), plan)
             data["harvest"] = self._apply_migrate_harvest_advice(
@@ -801,7 +791,7 @@ class OpsService:
             spot_usdt = pipe.spot_cash("USDT")
         except Exception:
             pass
-        others = self._other_positions(futures, settings.hedge_symbol, legs)
+        others, others_err = self._other_positions(futures, settings.hedge_symbol, legs)
         armed = self.migrate_arm(account.id)
         return {
             "ok": True,
@@ -818,6 +808,7 @@ class OpsService:
             "migrate_armed": bool(armed),
             "legs": self._legs_payload(legs),
             "other_positions": others,
+            "other_positions_error": others_err or "",
             "stability": stability.as_dict(),
             "enter": enter_advice(legs, stability, spot_usdt, plan),
             "harvest": self._apply_migrate_harvest_advice(
@@ -914,7 +905,7 @@ class OpsService:
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
         mmr_text = format_uni_mmr(mmr, has_pos)
         lev, lev_tgt = _display_leverage(legs, settings)
-        others = self._other_positions(futures, settings.hedge_symbol, legs)
+        others, others_err = self._other_positions(futures, settings.hedge_symbol, legs)
         armed = self.migrate_arm(account.id)
         return {
             **base,
@@ -943,6 +934,7 @@ class OpsService:
             "margin": margin,
             "legs": self._legs_payload(legs),
             "other_positions": others,
+            "other_positions_error": others_err or "",
             "migrate_armed": bool(armed),
             "stability": stability.as_dict(),
             "enter": enter,

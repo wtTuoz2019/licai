@@ -271,11 +271,8 @@ class FuturesAPI:
         return self._legs_from_rows(symbol, rows or [])
 
     def open_um_symbols(self) -> list[dict]:
-        """当前有仓的 U 本位合约（用于发现套保币对设错）。"""
-        try:
-            rows = self._um_signed("GET", "/fapi/v2/positionRisk", "/papi/v1/um/positionRisk")
-        except BinanceAPIError:
-            return []
+        """当前有仓的 U 本位合约（用于发现套保币对设错）。读失败抛错，避免当成空仓。"""
+        rows = self._um_signed("GET", "/fapi/v2/positionRisk", "/papi/v1/um/positionRisk")
         if isinstance(rows, dict):
             rows = [rows]
         out: list[dict] = []

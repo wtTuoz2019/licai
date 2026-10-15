@@ -137,7 +137,24 @@ class AutoHarvestWorker:
         try:
             force = bool(arm.get("force"))
             live = self.ops.monitor(account)
+            read_err = ""
+            if not live.get("ok"):
+                read_err = str(live.get("error") or "监控失败")
+            else:
+                read_err = str(live.get("other_positions_error") or "")
             others = (live or {}).get("other_positions") or []
+            if read_err:
+                now = time.monotonic()
+                if now - float(arm.get("last_event_at") or 0) >= 120:
+                    self.ops.store.add_event(
+                        account.id,
+                        "harvest",
+                        False,
+                        f"迁仓挂起保留：读仓失败，不当作旧仓已清（{read_err[:240]}）",
+                    )
+                    self.ops.touch_migrate_event(account.id)
+                _print(f"迁仓挂起保留 account={account.id} 读仓失败 {read_err[:200]}")
+                return True
             if not others:
                 self.ops.clear_migrate_arm(account.id)
                 self.ops.store.add_event(
@@ -145,6 +162,67 @@ class AutoHarvestWorker:
                 )
                 self.ops.invalidate_snapshot(account.id)
                 _print(f"迁仓挂起取消 account={account.id}：旧仓已清")
+                return True
+
+            naked = [
+                str(r.get("symbol") or "")
+                for r in others
+                if str(r.get("side") or "").upper() in {"LONG", "SHORT"} and r.get("symbol")
+            ]
+            if naked:
+                try:
+                    pipe = pipeline_for(account, self.ops.base, dry_run=False, ops=self.ops)
+                    cycle = HedgeCycle(pipe)
+                    rescue_steps = []
+                    for sym in naked:
+                        rescue_steps.extend(cycle.rescue_naked_symbol(sym))
+                except Exception as exc:
+                    log.exception("账号 %s 旧仓单边守卫失败", account.id)
+                    self.ops.store.add_event(
+                        account.id, "harvest", False, f"旧仓单边守卫失败：{exc}"[:500]
+                    )
+                    self.ops.touch_migrate_event(account.id)
+                    return True
+                fails = [s for s in rescue_steps if not getattr(s, "ok", True)]
+                detail = "；".join(
+                    f"{getattr(s, 'name', '')}: {getattr(s, 'detail', '')}"
+                    for s in (fails or rescue_steps[-3:])
+                )
+                if fails:
+                    self.ops.store.add_event(
+                        account.id, "harvest", False, f"旧仓单边未平净：{detail}"[:500]
+                    )
+                    self.ops.touch_migrate_event(account.id)
+                    _print(f"旧仓单边未平净 account={account.id} {detail[:200]}")
+                    return True
+                if rescue_steps:
+                    self.ops.store.add_event(
+                        account.id, "harvest", True, f"旧仓单边已市价平净：{detail}"[:500]
+                    )
+                    _print(f"旧仓单边已平 account={account.id} {detail[:200]}")
+                again = self.ops.monitor(account)
+                if again.get("ok") and not again.get("other_positions_error"):
+                    left = again.get("other_positions") or []
+                    if not left:
+                        pipe = pipeline_for(account, self.ops.base, dry_run=False, ops=self.ops)
+                        cycle = HedgeCycle(pipe)
+                        open_steps = cycle.setup_once(force_hedge=True)
+                        open_fails = [s for s in open_steps if not getattr(s, "ok", True)]
+                        open_detail = "；".join(
+                            f"{getattr(s, 'name', '')}: {getattr(s, 'detail', '')}"
+                            for s in (open_fails or open_steps[-3:])
+                        )
+                        self.ops.store.add_event(
+                            account.id,
+                            "harvest",
+                            not open_fails,
+                            (("旧仓已清，开新对冲：" if not open_fails else "旧仓已清但开新失败：") + open_detail)[:500],
+                        )
+                        if not open_fails:
+                            self.ops.clear_migrate_arm(account.id)
+                        self.ops.refresh_account_snapshot(account)
+                        return True
+                self.ops.refresh_account_snapshot(account)
                 return True
 
             tip = "、".join(

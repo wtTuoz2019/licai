@@ -607,6 +607,16 @@ class HedgeCycle:
                 steps.extend(self._close_winner_for_harvest(side, qty, wait_stable=False))
 
             legs = self.futures.legs(symbol)
+            if (legs.long_qty > 0) != (legs.short_qty > 0):
+                steps.append(
+                    StepResult(
+                        "旧仓单边",
+                        True,
+                        f"{symbol} 半平后只剩一边，立刻市价清掉，不等下一次交叉",
+                    )
+                )
+                steps.extend(self._flatten_if_naked())
+                legs = self.futures.legs(symbol)
             if legs.long_qty <= 0 and legs.short_qty <= 0:
                 steps.append(StepResult("旧仓已空", True, f"{symbol} 已清零"))
             else:
@@ -617,6 +627,34 @@ class HedgeCycle:
                         f"{symbol} 仍剩 多 {fmt_amount(legs.long_qty)} / 空 {fmt_amount(legs.short_qty)}",
                     )
                 )
+            return steps
+        finally:
+            self.symbol = old_sym
+            self.settle_asset = old_settle
+
+    def rescue_naked_symbol(self, symbol: str) -> list[StepResult]:
+        """旧币对只剩一边时市价平净。两边都在则不动。"""
+        symbol = (symbol or "").upper()
+        if not symbol:
+            return []
+        old_sym, old_settle = self.symbol, self.settle_asset
+        try:
+            self.symbol = symbol
+            self.settle_asset = settle_asset_of(symbol)
+            try:
+                legs = self.futures.legs(symbol)
+            except Exception as exc:
+                return [StepResult("旧仓单边检查", False, f"{symbol} 读仓失败：{exc}")]
+            if (legs.long_qty > 0) == (legs.short_qty > 0):
+                return []
+            steps = [
+                StepResult(
+                    "旧仓单边",
+                    True,
+                    f"{symbol} 只剩一边，立刻市价平净：{self._legs_text(legs)}",
+                )
+            ]
+            steps.extend(self._flatten_if_naked())
             return steps
         finally:
             self.symbol = old_sym
