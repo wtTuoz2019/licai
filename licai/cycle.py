@@ -569,9 +569,9 @@ class HedgeCycle:
             must_refill = True
             refill_qty = after.short_qty if side == "LONG" else after.long_qty
 
-            # 全额转出 → 申购理财 → 回注保证金（失败只记步骤，绝不中断补仓）
+            # 转出浮盈去理财 → 回注保证金 → 再补仓（失败只记步骤，绝不中断补仓）
             try:
-                steps.extend(self._profit_to_spot(pnl))
+                steps.extend(self._profit_to_spot(pnl, refill_qty=refill_qty))
             except Exception as exc:
                 steps.append(StepResult("转出现货异常", False, str(exc)))
             earn_steps: list[StepResult] = []
@@ -968,10 +968,83 @@ class HedgeCycle:
             )
         return steps
 
-    def _profit_to_spot(self, realized: Decimal) -> list[StepResult]:
+    def _refill_margin_buffer(self, refill_qty: Decimal) -> Decimal:
+        """估补仓所需保证金垫：名义/杠杆 × 1.25，至少 8U。"""
+        qty = max(refill_qty, Decimal("0"))
+        if qty <= 0:
+            return Decimal("8")
+        mid = Decimal("0")
+        try:
+            bid, ask = self.futures.book(self.symbol, force=True)
+            if bid > 0 and ask > 0:
+                mid = (bid + ask) / Decimal("2")
+        except Exception:
+            mid = Decimal("0")
+        if mid <= 0:
+            try:
+                legs = self.futures.legs(self.symbol)
+                mid = legs.long_entry or legs.short_entry or Decimal("0")
+            except Exception:
+                mid = Decimal("0")
+        lev = max(int(self.settings.hedge_leverage or 1), 1)
+        im = (qty * mid / Decimal(lev)) if mid > 0 else Decimal("0")
+        return max(im * Decimal("1.25"), Decimal("8"))
+
+    def _harvest_transfer_amount(
+        self,
+        transferable: Decimal,
+        realized: Decimal,
+        refill_qty: Decimal,
+    ) -> tuple[Decimal, str]:
+        """尽量转出浮盈去理财；有安全余裕再转闲置；小账户不抽干补仓垫。
+
+        - 浮盈优先：可转额度内尽量转满本次 realized
+        - 闲置加码：仅在「可转 − 补仓留垫」之上再转（兼容可转尽转）
+        - 小账户（权益 < 300）：只转浮盈，多余可转额度留作补仓
+        """
+        realized = max(realized, Decimal("0"))
+        transferable = max(transferable, Decimal("0"))
+        if transferable < 1:
+            return Decimal("0"), "可转不足 1"
+        profit_part = min(transferable, realized)
+        buffer = self._refill_margin_buffer(refill_qty)
+        safe_cap = max(Decimal("0"), transferable - buffer)
+
+        equity = Decimal("0")
+        try:
+            equity = d(self.futures.account_risk().get("equity") or 0)
+        except Exception:
+            equity = Decimal("0")
+
+        small = equity > 0 and equity < Decimal("300")
+        if small:
+            amount = profit_part
+            note = (
+                f"小账户权益约 {fmt_amount(equity)}，只转浮盈 {fmt_amount(amount)}"
+                f"（可转 {fmt_amount(transferable)}，留垫约 {fmt_amount(buffer)} 给补仓）"
+            )
+        else:
+            # 浮盈必转（额度内）；安全上限更高时再转闲置
+            amount = min(transferable, max(profit_part, safe_cap))
+            if amount <= profit_part + Decimal("0.01"):
+                note = (
+                    f"转出浮盈 {fmt_amount(amount)}"
+                    f"（可转 {fmt_amount(transferable)}，留垫约 {fmt_amount(buffer)}）"
+                )
+            else:
+                note = (
+                    f"转出 {fmt_amount(amount)}=浮盈 {fmt_amount(profit_part)}"
+                    f"+闲置（可转 {fmt_amount(transferable)}，安全上限 {fmt_amount(safe_cap)}，"
+                    f"留垫约 {fmt_amount(buffer)}）"
+                )
+        if amount < 1:
+            return Decimal("0"), note + "；估完不足 1，跳过转出先补仓"
+        return amount.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN), note
+
+    def _profit_to_spot(self, realized: Decimal, *, refill_qty: Decimal = Decimal("0")) -> list[StepResult]:
         steps: list[StepResult] = []
         asset = self.settle_asset
-        # 顺序不变：先尽量转出现货申购理财，再补仓。可转尽转。
+        # 先尽量把浮盈转到现货申购理财，再补仓；转出额带补仓留垫，避免抽干保证金
         collect = self._mutate(f"归集统一账户 {asset}", lambda: self.futures.collect_to_margin(asset))
         steps.append(collect)
         transferable = Decimal("0")
@@ -1022,8 +1095,20 @@ class HedgeCycle:
                 )
             )
             return steps
-        amount = transferable
-        detail = f"最大可转出 {fmt_amount(amount)} {asset} 转到现货（本次浮盈约 {fmt_amount(realized)}）"
+        amount, plan_note = self._harvest_transfer_amount(transferable, realized, refill_qty)
+        if amount < 1:
+            steps.append(
+                StepResult(
+                    "转出现货",
+                    True,
+                    f"{plan_note}；最大可转出 {fmt_amount(transferable)}，本次浮盈约 {fmt_amount(realized)}",
+                )
+            )
+            return steps
+        detail = (
+            f"{plan_note}；实转 {fmt_amount(amount)} {asset} 到现货"
+            f"（可转 {fmt_amount(transferable)}，浮盈约 {fmt_amount(realized)}）"
+        )
         if realized >= 1 and amount + 1 < realized * Decimal("0.3"):
             detail += (
                 f"；可转出远小于浮盈，多半是剩余腿仍占用保证金"
