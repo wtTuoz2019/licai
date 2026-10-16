@@ -116,6 +116,11 @@ class AutoHarvestWorker:
                 self._maybe_daily_earn(account)
             except Exception:
                 log.exception("账号 %s 每日理财检查失败", account.id)
+            # 开了自动收利且有旧套保仓：自动挂起迁仓，不必再点按钮
+            try:
+                self._maybe_auto_arm_migrate(account)
+            except Exception:
+                log.exception("账号 %s 自动挂起迁仓失败", account.id)
             # 换币迁仓挂起：与是否开自动收利无关，后台等到时机再执行
             try:
                 self._maybe_armed_migrate(account)
@@ -128,8 +133,41 @@ class AutoHarvestWorker:
             except Exception:
                 log.exception("账号 %s 自动开仓/收利失败", account.id)
 
+    def _maybe_auto_arm_migrate(self, account) -> bool:
+        """自动收利开启时：发现旧套保仓就挂起迁仓，等交叉+平稳后执行。"""
+        if not account.auto_harvest:
+            return False
+        if self.ops.migrate_arm(account.id):
+            return False
+        try:
+            live = self.ops.monitor(account)
+        except Exception:
+            return False
+        if not live.get("ok"):
+            return False
+        if live.get("other_positions_error"):
+            return False
+        others = live.get("other_positions") or []
+        if not others:
+            return False
+        tip = "、".join(
+            f"{r.get('symbol')} 多{r.get('long_qty') or 0}/空{r.get('short_qty') or 0}"
+            for r in others[:6]
+        ) or "旧仓"
+        sym = (live.get("symbol") or account.hedge_symbol or "").upper()
+        self.ops.arm_migrate(account.id, force=False)
+        detail = (
+            f"自动挂起迁仓（等金叉/死叉与平稳）：{tip}，完成后开 {sym or '新套保'}。"
+            "开了自动收利，无需再点「迁仓开新」。"
+        )
+        self.ops.store.add_event(account.id, "harvest", True, detail[:500])
+        self.ops.touch_migrate_event(account.id)
+        self.ops.invalidate_snapshot(account.id)
+        _print(f"自动挂起迁仓 account={account.id} {detail[:200]}")
+        return True
+
     def _maybe_armed_migrate(self, account) -> bool:
-        """手动挂起的换币迁仓：时机到了才动手，否则写进度事件。"""
+        """挂起的换币迁仓：时机到了才动手，否则写进度事件。"""
         arm = self.ops.migrate_arm(account.id)
         if not arm:
             return False
@@ -444,6 +482,12 @@ class AutoHarvestWorker:
         try:
             live = self.ops.monitor(account)
             if not live.get("ok"):
+                return
+            # 旧套保还在：只走迁仓，禁止在新币对上空开/收利/加仓
+            others = live.get("other_positions") or []
+            if others or (live.get("harvest") or {}).get("migrate"):
+                if not self.ops.migrate_arm(account.id):
+                    self._maybe_auto_arm_migrate(account)
                 return
             # 现货加了 U：先申购理财入保证金（不等交叉）
             if self._maybe_sweep_spot(account, live):

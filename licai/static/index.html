@@ -1483,22 +1483,30 @@
         ? (h.reason || "可以收利")
         : (need > 0 ? `还差 ${gap.toFixed(2)} 到收利门槛` : (h.reason || ""));
       if (accLive.auto_harvest) {
-        const flat = toNum(legs.long_qty) <= 0 && toNum(legs.short_qty) <= 0;
-        if (flat) {
-          why = ((s.stability && s.stability.stable)
-            ? "自动开仓待命：无仓且已平稳，等金叉/死叉那一根会双边入场。 "
-            : "自动开仓已开：无仓，须金叉/死叉 + 严平稳才双边开仓。 ") + why;
+        if (h.migrate) {
+          why = (h.migrate_armed
+            ? "自动迁仓待命：等金叉/死叉与收利级平稳同时满足后全平旧仓再开新套保。 "
+            : "自动收利已开：有旧套保仓，后台会自动挂起等时机迁仓。 ") + (h.reason || why);
         } else {
-          why = (h.can_click
-            ? "自动收利待命：浮盈/冷却/收利平稳已够，等金叉/死叉与平稳同时满足才收。 "
-            : "自动收利已开：浮盈达标+冷却后，须金叉/死叉与收利级平稳同时满足才收。 ") + why;
+          const flat = toNum(legs.long_qty) <= 0 && toNum(legs.short_qty) <= 0;
+          if (flat) {
+            why = ((s.stability && s.stability.stable)
+              ? "自动开仓待命：无仓且已平稳，等金叉/死叉那一根会双边入场。 "
+              : "自动开仓已开：无仓，须金叉/死叉 + 严平稳才双边开仓。 ") + why;
+          } else {
+            why = (h.can_click
+              ? "自动收利待命：浮盈/冷却/收利平稳已够，等金叉/死叉与平稳同时满足才收。 "
+              : "自动收利已开：浮盈达标+冷却后，须金叉/死叉与收利级平稳同时满足才收。 ") + why;
+          }
         }
       }
       $("harvest-why").textContent = why;
       $("btn-harvest").title = h.reason || "";
       $("btn-harvest").textContent = h.migrate_armed
         ? "迁仓待命中"
-        : (h.migrate ? "迁仓开新" : "一键收利");
+        : (h.migrate
+          ? (accLive.auto_harvest ? "强行迁仓" : "迁仓开新")
+          : "一键收利");
       const en = s.enter || {};
       const scaleBox = $("scale-box");
       const scaleEl = $("scale-why");
@@ -1674,10 +1682,13 @@
         // 只在迁仓状态变化时提示一次，避免每次刷新都刷一条
         if (tipKey !== _migrateTipKey) {
           _migrateTipKey = tipKey;
+          const autoOn = !!(s.account && s.account.auto_harvest);
           setActionMsg(
             armed
               ? `旧仓仍在，迁仓已挂起：后台等到金叉/死叉与平稳同时满足后会自动全平再开 ${s.symbol || "新套保"}。`
-              : `已换套保，旧仓见下方黄色区。点「迁仓开新」会挂起任务（不堵页面），后台等时机后执行。`
+              : (autoOn
+                ? `已换套保，旧仓见下方黄色区。自动收利已开，后台会自动等时机迁仓；着急可点「强行迁仓」。`
+                : `已换套保，旧仓见下方黄色区。点「迁仓开新」会挂起任务（不堵页面），后台等时机后执行。`)
           );
         }
       } else {
@@ -1781,9 +1792,12 @@
       box.hidden = false;
       const armed = !!(s.migrate_armed || (s.harvest || {}).migrate_armed);
       if (head) {
+        const autoOn = !!(s.account && s.account.auto_harvest);
         head.textContent = armed
           ? `旧套保仓位 · 迁仓待命中（等交叉与平稳）→ 将开 ${(s.symbol || "").toUpperCase() || "新套保"}`
-          : `旧套保仓位（已换到 ${(s.symbol || "").toUpperCase() || "新套保"}，尚未迁仓）`;
+          : (autoOn
+            ? `旧套保仓位（已换到 ${(s.symbol || "").toUpperCase() || "新套保"}，自动收利会等时机迁仓）`
+            : `旧套保仓位（已换到 ${(s.symbol || "").toUpperCase() || "新套保"}，尚未迁仓）`);
       }
       list.innerHTML = "";
       others.forEach((r) => {
@@ -1905,17 +1919,23 @@
         const tip = others.map((r) =>
           `${r.symbol} 多${r.long_qty || 0}/空${r.short_qty || 0}`
         ).join("，") || "旧仓";
-        const body = unstable
+        const autoOn = !!(live.account && live.account.auto_harvest);
+        const armed = !!(live.migrate_armed || (live.harvest || {}).migrate_armed);
+        // 自动收利已开：后台会自动挂起；按钮默认当「强行」用（或未挂起时补挂起）
+        const asForce = unstable || autoOn;
+        const body = asForce
           ? `将挂起强行迁仓：尽快挂单平旧仓（${tip}），再开 ${(live.symbol || "").toUpperCase() || "新套保"}。不堵页面，进度看事件。`
           : `将挂起迁仓：后台等到金叉/死叉与收利级平稳同时满足后，挂单全平（${tip}），再开 ${(live.symbol || "").toUpperCase() || "新套保"}。不堵页面。`;
         const ok = await confirmAction({
           title: "换币迁仓",
-          body,
-          okText: unstable ? "强行挂起" : "挂起迁仓",
+          body: armed && autoOn
+            ? `迁仓已在待命。确认强行尽快平旧仓（${tip}）再开 ${(live.symbol || "").toUpperCase() || "新套保"}？`
+            : body,
+          okText: asForce ? "强行挂起" : "挂起迁仓",
           danger: true,
         });
         if (!ok) return;
-        if (unstable) {
+        if (asForce) {
           payload.force = true;
           payload.mode = "force";
         }

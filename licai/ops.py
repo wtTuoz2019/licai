@@ -610,7 +610,12 @@ class OpsService:
 
     @staticmethod
     def _apply_migrate_harvest_advice(
-        advice: dict, others: list[dict], current_symbol: str, *, armed: bool = False
+        advice: dict,
+        others: list[dict],
+        current_symbol: str,
+        *,
+        armed: bool = False,
+        auto_harvest: bool = False,
     ) -> dict:
         """当前套保无仓但旧币种有仓：一键收利改为「全平旧仓 + 开新对冲」。"""
         if not others:
@@ -624,12 +629,19 @@ class OpsService:
         out["migrate"] = True
         out["migrate_armed"] = bool(armed)
         out["force_ok"] = not armed
+        # 未挂起时可点：自动收利开着时按钮用于强行；未开自动时用于挂起
         out["can_click"] = not armed
         out["stable_ok"] = bool(advice.get("stable_ok"))
         if armed:
             out["reason"] = (
                 f"迁仓已挂起：旧仓 {tip}。后台等到金叉/死叉与收利级平稳同时满足后，"
                 f"会挂单全平再开 {current_symbol}。可在事件里看进度。"
+            )
+        elif auto_harvest:
+            out["reason"] = (
+                f"已换套保到 {current_symbol}，旧仓仍在：{tip}。"
+                "自动收利已开，后台会自动等交叉与平稳后迁仓；"
+                "不稳时可点「一键收利」强行尽快平。"
             )
         else:
             out["reason"] = (
@@ -706,6 +718,7 @@ class OpsService:
                 others,
                 settings.hedge_symbol,
                 armed=bool(self.migrate_arm(account.id)),
+                auto_harvest=bool(account.auto_harvest),
             )
             data["account"] = account.public_dict()
             data["events"] = _events_payload(account.id, self.store.recent_events(account.id, 30))
@@ -816,6 +829,7 @@ class OpsService:
                 others,
                 settings.hedge_symbol,
                 armed=bool(armed),
+                auto_harvest=bool(account.auto_harvest),
             ),
             "events": _events_payload(account.id, self.store.recent_events(account.id, 30)),
         }
@@ -944,6 +958,7 @@ class OpsService:
                 others,
                 settings.hedge_symbol,
                 armed=bool(armed),
+                auto_harvest=bool(account.auto_harvest),
             ),
             "switch": switch,
             "holdings": wallet.get("holdings") or [],
@@ -1056,10 +1071,39 @@ class OpsService:
             side = (harvest_side or "").upper() or None
             if side not in {"LONG", "SHORT"}:
                 side = None
-            # 自动收利：可按 MACD 指定腿；手动仍可强行。换币迁仓仅手动挂起。
+            # 自动收利：可按 MACD 指定腿；手动仍可强行。
+            # 换币迁仓：自动收利开着时后台自动挂起等时机；手动点可挂起/强行。
             if auto and harvest.get("migrate"):
-                allowed = False
-            elif auto:
+                others = (live or {}).get("other_positions") or []
+                tip = "、".join(
+                    f"{r.get('symbol')} 多{r.get('long_qty') or 0}/空{r.get('short_qty') or 0}"
+                    for r in others[:6]
+                ) or "旧仓"
+                try:
+                    sym = pipe.settings.hedge_symbol
+                except Exception:
+                    sym = (live or {}).get("symbol") or ""
+                prev = self.migrate_arm(account.id)
+                self.arm_migrate(account.id, force=False)
+                detail = (
+                    f"自动挂起迁仓（等金叉/死叉与平稳）：{tip}，完成后开 {sym or '新套保'}。"
+                    if not prev
+                    else f"迁仓已在待命：{tip} → {sym or '新套保'}"
+                )
+                if not prev:
+                    self.store.add_event(account.id, "harvest", True, detail[:500])
+                    self.touch_migrate_event(account.id)
+                    self.invalidate_snapshot(account.id)
+                return {
+                    "ok": True,
+                    "blocked": False,
+                    "queued": True,
+                    "migrate_armed": True,
+                    "live": True,
+                    "reason": detail,
+                    "steps": [{"name": "迁仓挂起", "ok": True, "detail": detail}],
+                }
+            if auto:
                 if side:
                     allowed = self._auto_side_harvest_ok(live, harvest, side)
                 else:
@@ -1067,12 +1111,9 @@ class OpsService:
             else:
                 allowed = harvest.get("can_click") or (force and harvest.get("force_ok"))
             if not allowed:
-                if auto and harvest.get("migrate"):
-                    reason = "换币迁仓仅手动点「一键收利」，自动收利不迁仓"
-                else:
-                    reason = harvest.get("reason") or live.get("error") or "现在不适合平仓"
-                    if auto and side:
-                        reason = f"自动收利({side})未满足：{reason}"
+                reason = harvest.get("reason") or live.get("error") or "现在不适合平仓"
+                if auto and side:
+                    reason = f"自动收利({side})未满足：{reason}"
                 # 自动拦截是常态轮询，不写事件；手动点了被拦才记
                 if not auto:
                     self.store.add_event(account.id, action, False, "已拦截：" + reason[:500])
