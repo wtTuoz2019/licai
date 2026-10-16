@@ -795,12 +795,21 @@ class Pipeline:
 
         holdings, usdt_amt = split("USDT", "flexible")
         ld = pm.get("LDUSDT", Decimal("0"))
-        show = max(usdt_amt, ld)
-        if show > 0:
-            product = self._usdt_flex_product()
-            if ld > 0 and ld >= usdt_amt:
-                product = replace(product, margin_token="LDUSDT", raw={**product.raw, "located": "pm"})
-            holdings.append((product, show))
+        # 理财钱包的 USDT 活期（现货 LDUSDT）和统一账户里的 LDUSDT 是两笔。
+        # 用 max 合并时，PM 数量更大就会把整笔标成保证金，可转出为 0，钱包仓再也进不了换年化。
+        # 活期接口在全部划入统一账户后通常是 0；现货没有 LD 时不要把接口余额再算一遍。
+        try:
+            spot_ld = self.earn.spot_free("LDUSDT")
+        except BinanceAPIError:
+            spot_ld = Decimal("0")
+        flex = self._usdt_flex_product()
+        if usdt_amt > 0 and (ld <= 0 or spot_ld >= SPOT_MIN):
+            holdings.append((flex, usdt_amt))
+        if ld > 0:
+            holdings.append((
+                replace(flex, margin_token="LDUSDT", raw={**flex.raw, "located": "pm"}),
+                ld,
+            ))
 
         holdings, bfusd_amt = split("BFUSD", "bfusd")
         bfusd_show = max(bfusd_amt, pm.get("BFUSD", Decimal("0")))
@@ -1905,28 +1914,33 @@ class Pipeline:
             ]
         moved_out = Decimal("0")
         if source.asset == "USDT" and source.kind == "flexible":
+            requested = amount
             back, moved = self._return_pm_earn("LDUSDT", amount, has_hedge=has_hedge)
             steps.extend(back)
             if any(not s.ok for s in back):
                 return steps
-            if any(s.name == "暂停换产品" for s in back):
-                # 占保锁在统一账户：停。仅当持仓标记不在 PM、理财侧确有余额时才继续赎
-                if source.raw.get("located") == "pm":
-                    return steps
+            paused = any(s.name == "暂停换产品" for s in back)
+            # 占保锁在统一账户：停。理财钱包里的活期和 PM 不是同一笔，转不出也要赎钱包。
+            if paused and source.raw.get("located") == "pm":
+                return steps
+            if paused or moved > 0:
+                if moved > 0 and not self.settings.dry_run:
+                    self.earn.invalidate()
                 earn_bal = self._flexible_product_balance(source)
-                if earn_bal < SPOT_MIN:
+                if paused and earn_bal < SPOT_MIN:
                     return steps
-                steps.append(
-                    StepResult(
-                        "理财侧已有余额，继续赎回",
-                        True,
-                        f"统一账户暂不可转，理财 {source.asset} 约 {fmt_amount(earn_bal)}，按理财余额赎回",
+                if paused:
+                    steps.append(
+                        StepResult(
+                            "理财侧已有余额，继续赎回",
+                            True,
+                            f"统一账户暂不可转，理财 {source.asset} 约 {fmt_amount(earn_bal)}，按理财余额赎回",
+                        )
                     )
-                )
-                amount = min(amount, earn_bal)
-            elif moved > 0:
-                amount = moved
-                moved_out = moved
+                # 刚从统一账户转回的和本来就在理财钱包的，一起赎，别只赎转出的那截
+                redeemable = earn_bal if earn_bal > 0 else moved
+                amount = min(requested, redeemable)
+                moved_out = amount if amount > 0 else moved
         if source.kind in {"bfusd", "rwusd"}:
             # BFUSD/RWUSD 常在统一账户里；earn-asset-transfer 不支持，先转现货再赎
             try:
