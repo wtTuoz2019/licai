@@ -1924,12 +1924,12 @@
         // 自动收利已开：后台会自动挂起；按钮默认当「强行」用（或未挂起时补挂起）
         const asForce = unstable || autoOn;
         const body = asForce
-          ? `将挂起强行迁仓：尽快挂单平旧仓（${tip}），再开 ${(live.symbol || "").toUpperCase() || "新套保"}。不堵页面，进度看事件。`
-          : `将挂起迁仓：后台等到金叉/死叉与收利级平稳同时满足后，挂单全平（${tip}），再开 ${(live.symbol || "").toUpperCase() || "新套保"}。不堵页面。`;
+          ? `将挂起强行迁仓：尽快挂单平旧仓（${tip}）；清完后等下次交叉再开 ${(live.symbol || "").toUpperCase() || "新套保"}。不堵页面，进度看事件。`
+          : `将挂起迁仓：后台等到金叉/死叉与收利级平稳后挂单全平（${tip}）；清完后等下次交叉再开 ${(live.symbol || "").toUpperCase() || "新套保"}。不堵页面。`;
         const ok = await confirmAction({
           title: "换币迁仓",
           body: armed && autoOn
-            ? `迁仓已在待命。确认强行尽快平旧仓（${tip}）再开 ${(live.symbol || "").toUpperCase() || "新套保"}？`
+            ? `迁仓已在待命。确认强行尽快挂单平旧仓（${tip}）？清完后仍等下次交叉再开 ${(live.symbol || "").toUpperCase() || "新套保"}。`
             : body,
           okText: asForce ? "强行挂起" : "挂起迁仓",
           danger: true,
