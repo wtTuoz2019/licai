@@ -764,7 +764,9 @@ class HedgeCycle:
         self.leverage_cap = applied
         self.leverage_unlock_at = data.get("unlock_at")
         self.leverage_cap_changed = True
-        return [StepResult("设置杠杆", True, data.get("note") or f"已设置 {applied}x")]
+        note = data.get("note") or f"已设置 {applied}x"
+        # unchanged：冲高失败保持原倍数，算成功提示，不是回退失败
+        return [StepResult("设置杠杆", True, note)]
 
     def _use_actual_leverage(self, legs: HedgeLegs | None = None) -> int:
         """算仓只用交易所实际杠杆；目标倍数只用于尝试上调。"""

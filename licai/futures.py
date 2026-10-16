@@ -186,10 +186,26 @@ class FuturesAPI:
         return data
 
     def apply_best_leverage(self, symbol: str, target: int) -> dict:
+        """尽量设到 target。冲高失败时绝不主动降到低于当前杠杆。"""
+        target = int(target or 0)
+        try:
+            current = int(self.current_leverage(symbol) or 0)
+        except Exception:
+            current = 0
+
         order: list[int] = []
-        for lev in [target, *LEVERAGE_LADDER]:
-            if lev > 0 and lev <= target and lev not in order:
+        if current > 0 and 0 < target < current:
+            # 用户主动降杠杆：只试目标值，不走阶梯乱降
+            order = [target]
+        else:
+            for lev in [target, *LEVERAGE_LADDER]:
+                if lev <= 0 or lev > target or lev in order:
+                    continue
+                # 上调失败时不要试比当前还低的档，避免 20→冲100→被写成 5
+                if current > 0 and lev < current:
+                    continue
                 order.append(lev)
+
         last_exc: BinanceAPIError | None = None
         unlock_at = None
         kind = ""
@@ -210,13 +226,30 @@ class FuturesAPI:
                     unlock_at = unlock
                 if parsed_kind:
                     kind = parsed_kind
-                if cap > 0 and cap not in seen:
+                # 接口给的上限若低于当前杠杆：保持原样，绝不回退
+                if cap > 0 and current > 0 and cap < current:
+                    break
+                if cap > 0 and cap not in seen and (current <= 0 or cap >= current):
                     order.insert(i, cap)
                 continue
             data["requested"] = target
             data["leverage"] = int(data.get("leverage") or lev)
             data["unlock_at"] = unlock_at
             applied = int(data["leverage"])
+            # 交易所若意外返回更低倍数，也不接受回退
+            if current > 0 and applied < current and target >= current:
+                return {
+                    "requested": target,
+                    "leverage": current,
+                    "capped": True,
+                    "unchanged": True,
+                    "unlock_at": unlock_at,
+                    "note": (
+                        f"目标 {target}x 未提高到当前以上，保持原杠杆 {current}x"
+                        + (f"（{kind}）" if kind else "")
+                        + "。"
+                    ),
+                }
             if applied < target:
                 data["capped"] = True
                 who = kind or "账号限制"
@@ -229,6 +262,22 @@ class FuturesAPI:
                 data["capped"] = False
                 data["note"] = f"已设置 {applied}x {symbol}"
             return data
+
+        # 全部失败：保持原杠杆，不降档
+        if current > 0 and target >= current:
+            who = kind or "账号限制"
+            if unlock_at:
+                later = f"{unlock_at.replace('T', ' ').replace('+00:00', ' UTC')} 后可再试更高。"
+            else:
+                later = "以后可在设置里再点「设置杠杆」试更高。"
+            return {
+                "requested": target,
+                "leverage": current,
+                "capped": True,
+                "unchanged": True,
+                "unlock_at": unlock_at,
+                "note": f"目标 {target}x 未成功（{who}），保持原杠杆 {current}x。{later}",
+            }
         if last_exc:
             raise last_exc
         raise BinanceAPIError("无法设置杠杆")
