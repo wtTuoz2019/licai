@@ -309,8 +309,11 @@ class Pipeline:
                 overs.append((apr, product, have - want))
             elif want > have:
                 shorts.append((apr, product, want - have))
+        # 未进任何年化档的持仓：只有产品当前仍可选时才算「超额」；
+        # 地区黑名单/不可申购的产品（如临时禁用 RWUSD）绝不能当成 0% 倒卖出去。
+        slice_keys = {self._alloc_key(p) for p, _apr, _cap in slices}
         for key, amt in left.items():
-            if amt > 0:
+            if amt > 0 and key in slice_keys:
                 overs.append((Decimal("0"), by_key[key], amt))
         overs.sort(key=lambda item: item[0])
         shorts.sort(key=lambda item: item[0], reverse=True)
@@ -1671,7 +1674,8 @@ class Pipeline:
                     remaining, mmr, equity, full=full, hedge_open=hedge_open
                 )
                 if batch <= 0:
-                    if full and remaining > 0:
+                    # 有对冲：绝不能因 MMR 不够/读失败而整笔强赎；无仓才允许清尾
+                    if full and (not hedge_open) and remaining > 0:
                         steps.append(
                             StepResult(
                                 "清尾数",
@@ -1700,8 +1704,17 @@ class Pipeline:
                         )
                     )
                     return steps
-                # 本批若本身已是尘埃，改整笔赎，避免按金额被拒
+                # 本批若本身已是尘埃：仅真正的灰尘才整笔赎；有仓且剩余较大时停住
                 if full and batch < dust_cut:
+                    if hedge_open and remaining >= dust_cut:
+                        steps.append(
+                            StepResult(
+                                "暂停换产品",
+                                True,
+                                f"uniMMR={fmt_amount(mmr, 4)}，可赎空间过小，先停。剩下 {fmt_amount(remaining, 4)} 下次再点",
+                            )
+                        )
+                        return steps
                     steps.extend(_redeem(product, remaining, redeem_all=True))
                     self._soften_dust_failures(steps)
                     remaining = Decimal("0")
@@ -1790,7 +1803,8 @@ class Pipeline:
             risk = self.futures.account_risk()
             return risk.get("uni_mmr") or Decimal("0"), risk.get("equity") or Decimal("0")
         except BinanceAPIError:
-            return Decimal("1"), Decimal("0")
+            # 读失败：返回哨兵，有仓时换年化必须停，绝不能当成可整笔赎回
+            return Decimal("0"), Decimal("0")
 
     def _next_switch_batch(
         self,
@@ -1809,13 +1823,16 @@ class Pipeline:
             q = remaining.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
             return q if q > 0 else remaining
         safe = self.settings.switch_safe_uni_mmr
+        # 有对冲时：MMR 读不到 / 权益为 0 → 停，不臆测可赎完
+        if hedge_open and (is_mmr_sentinel(mmr) or equity <= 0):
+            return Decimal("0")
         if not is_mmr_sentinel(mmr) and mmr < safe:
             return Decimal("0")
         if equity > 0 and mmr > 0 and not is_mmr_sentinel(mmr):
             # 赎回瞬间保证金会少一块：只取把 uniMMR 压到安全线之上仍富余的空间
             cap = equity * (Decimal("1") - safe / mmr) * (Decimal("0.9") if full else Decimal("0.8"))
         else:
-            # 无权益/无仓：其它活期多半还不在保证金里，允许一次赎完
+            # 无仓/无权益读数：允许按剩余估（上面 hedge_open 已拦截）
             cap = remaining
         if cap <= 0:
             return Decimal("0")
@@ -1826,9 +1843,11 @@ class Pipeline:
                 if remaining <= cap:
                     batch = remaining
             q = batch.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-            # 不到 0.01 的尾数：仍返回原值，后续走 redeemAll 清掉
+            # 量化为 0：仅真灰尘返回原值；否则返回 0 让上层暂停
             if q <= 0 and remaining > 0:
-                return remaining
+                if remaining < Decimal("0.01"):
+                    return remaining
+                return Decimal("0")
             return q
         # 保守路径（入场有仓等）：仍用配置的单批上限与比例，但上限不超过当前 MMR 空间
         hard = self.settings.switch_batch_usdt

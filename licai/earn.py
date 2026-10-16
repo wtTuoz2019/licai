@@ -404,7 +404,11 @@ class EarnAPI:
         )
 
     def rwusd_apr(self) -> Decimal:
-        return self._special_apr("/sapi/v1/rwusd/history/rateHistory")
+        apr = self._special_apr("/sapi/v1/rwusd/history/rateHistory")
+        if apr > 0:
+            return apr
+        # rateHistory 偶发空窗时，用理财首页预估，避免被当成 0% 倒卖
+        return self._homepage_apr("RWUSD")
 
     def rwusd_product(self) -> FlexibleProduct:
         return self._special_product("RWUSD", "rwusd", self.rwusd_apr())
