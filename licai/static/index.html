@@ -96,6 +96,7 @@
     button.ghost { background: transparent; }
     button.danger { background: #6b1f2a; border-color: #a33; }
     button:disabled { opacity: .4; cursor: not-allowed; }
+    button.busy-btn { opacity: .75; cursor: wait; }
     .ops button.good:disabled {
       opacity: 1;
       background: #15241c;
@@ -108,6 +109,22 @@
       border-color: #3a3018;
       color: #8a7a58;
     }
+    #action-msg {
+      margin: 10px 0 0;
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #0e141b;
+      color: var(--text);
+      white-space: pre-wrap;
+      max-height: 7.5em;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    #action-msg.ok { border-color: #1d5c3a; color: var(--good); }
+    #action-msg.bad { border-color: #6b1f2a; color: var(--bad); }
+    #action-msg[hidden] { display: none !important; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
     #lev-edit { width: 72px; flex: 0 0 72px; padding: 8px; }
     .row[hidden], #modal-spin[hidden], #modal-actions[hidden] { display: none !important; }
@@ -874,8 +891,10 @@
       scale: { title: "加仓", hint: "在 uniMMR 安全线内，两边一起放大仓位。" },
       harvest: { title: "一键收利", hint: "平掉盈利腿并补仓。USDC 本位会先换成 USDT 再买理财。" },
       switch: { title: "换更高年化", hint: "只换理财：把较低年化赎回，申购当前最高，再划回统一账户。不开仓。" },
-      leverage: { title: "设置杠杆", hint: "先按输入倍数去交易所设置；算仓始终用实际落地的倍数。100 不行会落到允许的最高档。" },
+      leverage: { title: "设置杠杆", hint: "按输入倍数设置。冲高失败会保持当前倍数，不会往回降。" },
     };
+    let _actionMsgTimer = 0;
+    let _migrateTipKey = "";
 
     function hideModal() {
       busy = false;
@@ -1628,11 +1647,18 @@
       const others = s.other_positions || [];
       if (others.length) {
         const armed = !!(s.migrate_armed || (s.harvest || {}).migrate_armed);
-        setActionMsg(
-          armed
-            ? `旧仓仍在，迁仓已挂起：后台等到金叉/死叉与平稳同时满足后会自动全平再开 ${s.symbol || "新套保"}。`
-            : `已换套保，旧仓见下方黄色区。点「迁仓开新」会挂起任务（不堵页面），后台等时机后执行。`
-        );
+        const tipKey = `${selected}:${armed ? "armed" : "idle"}:${others.map((r) => r.symbol).join(",")}`;
+        // 只在迁仓状态变化时提示一次，避免每次刷新都刷一条
+        if (tipKey !== _migrateTipKey) {
+          _migrateTipKey = tipKey;
+          setActionMsg(
+            armed
+              ? `旧仓仍在，迁仓已挂起：后台等到金叉/死叉与平稳同时满足后会自动全平再开 ${s.symbol || "新套保"}。`
+              : `已换套保，旧仓见下方黄色区。点「迁仓开新」会挂起任务（不堵页面），后台等时机后执行。`
+          );
+        }
+      } else {
+        _migrateTipKey = "";
       }
       const sw = s.switch || {};
       $("btn-switch").disabled = !sw.can_click;
@@ -1695,8 +1721,13 @@
       return accountsCache.find((a) => Number(a.id) === Number(selected)) || null;
     }
 
-    function setActionMsg(text) {
+    function setActionMsg(text, kind) {
       const el = $("action-msg");
+      if (_actionMsgTimer) {
+        clearTimeout(_actionMsgTimer);
+        _actionMsgTimer = 0;
+      }
+      el.classList.remove("ok", "bad");
       if (!text) {
         el.hidden = true;
         el.textContent = "";
@@ -1704,6 +1735,13 @@
       }
       el.hidden = false;
       el.textContent = text;
+      if (kind === "ok" || kind === "bad") el.classList.add(kind);
+      // 短成功提示自动收起，避免一直占着
+      if (kind === "ok" && String(text).length < 160) {
+        _actionMsgTimer = setTimeout(() => {
+          if (el.textContent === text) setActionMsg("");
+        }, 6000);
+      }
     }
 
     function renderOtherPositions(s) {
@@ -1757,11 +1795,21 @@
       if (data.queued || data.migrate_armed) {
         return "已挂起：" + (data.reason || "后台等时机迁仓");
       }
-      const rows = (data.steps || []).map((s) => {
-        const t = s.at ? `${s.at} ` : "";
-        return `${s.ok ? "✓" : "✗"} ${t}${s.name}：${s.detail || ""}`;
-      });
-      return (data.ok ? "完成" : "失败") + (rows.length ? "\n" + rows.join("\n") : "");
+      const steps = data.steps || [];
+      if (!steps.length) return data.ok ? "完成" : "失败";
+      // 一两步：直接给结论，不刷整页步骤
+      if (steps.length <= 2) {
+        const last = steps[steps.length - 1];
+        const mark = data.ok && last.ok ? "✓" : "✗";
+        return `${mark} ${last.name}：${(last.detail || "").slice(0, 180)}`;
+      }
+      const fails = steps.filter((s) => !s.ok);
+      if (fails.length) {
+        const f = fails[0];
+        return `失败：${f.name} — ${(f.detail || "").slice(0, 120)}\n详情点下方最近操作`;
+      }
+      const last = steps[steps.length - 1];
+      return `完成：${last.name} — ${(last.detail || "").slice(0, 120)}\n详情点下方最近操作`;
     }
 
     async function act(action) {
@@ -1859,16 +1907,26 @@
         if (!choice) return;
         payload.force = true;
         payload.mode = "force";
+      } else if (action === "leverage" || action === "switch") {
+        // 换年化 / 设杠杆：点了就跑，不再弹空白确认
+      } else if (action === "enter" || action === "harvest") {
+        const ok = await confirmAction({
+          title: meta.title,
+          body: meta.hint || "",
+          okText: "确认",
+          danger: true,
+        });
+        if (!ok) return;
       } else {
         const ok = await confirmAction({
           title: meta.title,
-          body: "",
+          body: meta.hint || "",
           okText: "确认",
           danger: true,
         });
         if (!ok) return;
       }
-      showLoading(meta.title, "全部步骤完成后刷新账户…");
+      showLoading(meta.title, action === "leverage" ? "正在设置…" : "执行中，完成后自动刷新…");
       try {
         const data = await api(`/api/accounts/${selected}/actions`, {
           method: "POST",
@@ -1884,10 +1942,11 @@
           }
         }
         hideModal();
-        setActionMsg(formatActionResult(data));
+        const msg = formatActionResult(data);
+        setActionMsg(msg, data.ok && !data.blocked ? "ok" : "bad");
       } catch (err) {
         hideModal();
-        setActionMsg(err.message);
+        setActionMsg(err.message, "bad");
       }
     }
 
@@ -2183,10 +2242,14 @@
       if (!selected || busy) return;
       const n = Math.round(Number($("lev-edit") && $("lev-edit").value));
       if (!Number.isFinite(n) || n < 1 || n > 125) {
-        setActionMsg("杠杆填 1 到 125");
+        setActionMsg("杠杆填 1 到 125", "bad");
         return;
       }
+      const btn = $("btn-set-leverage");
+      const oldLabel = btn.textContent;
       busy = true;
+      btn.classList.add("busy-btn");
+      btn.textContent = "设置中…";
       try {
         const acc = await api(`/api/accounts/${selected}`, {
           method: "PATCH",
@@ -2199,11 +2262,15 @@
         }
         if ($("lev-target")) $("lev-target").textContent = String(n);
       } catch (err) {
-        setActionMsg(err.message);
+        setActionMsg(err.message, "bad");
         busy = false;
+        btn.classList.remove("busy-btn");
+        btn.textContent = oldLabel;
         return;
       }
       busy = false;
+      btn.classList.remove("busy-btn");
+      btn.textContent = oldLabel;
       act("leverage");
     };
     $("btn-enter").onclick = () => act("enter");
@@ -2212,12 +2279,6 @@
     $("btn-switch").onclick = () => act("switch");
     $("btn-proxy").onclick = async () => {
       if (!selected || busy) return;
-      const ok = await confirmAction({
-        title: "保存代理",
-        body: "",
-        okText: "确认",
-      });
-      if (!ok) return;
       showLoading("保存中", "请稍候");
       try {
         await api(`/api/accounts/${selected}`, {
@@ -2227,19 +2288,20 @@
         $("edit-proxy-box").hidden = true;
         await loadAccounts();
         await refresh({ force: true });
-        setActionMsg("已保存");
+        setActionMsg("代理已保存", "ok");
       } catch (err) {
-        setActionMsg(err.message);
+        setActionMsg(err.message, "bad");
       } finally {
         hideModal();
       }
     };
     $("btn-delete").onclick = async () => {
       if (!selected || busy) return;
+      const acc = currentAccount();
       const ok = await confirmAction({
         title: "解绑账号",
-        body: "",
-        okText: "确认",
+        body: `确认解绑 ${acc && acc.name ? acc.name : "#" + selected}？本地配置会删掉，交易所仓位不受影响。`,
+        okText: "确认解绑",
         danger: true,
       });
       if (!ok) return;
