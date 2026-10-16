@@ -147,12 +147,7 @@ class AutoHarvestWorker:
             if read_err:
                 now = time.monotonic()
                 if now - float(arm.get("last_event_at") or 0) >= 120:
-                    self.ops.store.add_event(
-                        account.id,
-                        "harvest",
-                        False,
-                        f"迁仓挂起保留：读仓失败，不当作旧仓已清（{read_err[:240]}）",
-                    )
+                    # 读仓失败是中间态，只打控制台，不写页面事件刷屏
                     self.ops.touch_migrate_event(account.id)
                 _print(f"迁仓挂起保留 account={account.id} 读仓失败 {read_err[:200]}")
                 return True

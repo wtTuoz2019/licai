@@ -1073,7 +1073,9 @@ class OpsService:
                     reason = harvest.get("reason") or live.get("error") or "现在不适合平仓"
                     if auto and side:
                         reason = f"自动收利({side})未满足：{reason}"
-                self.store.add_event(account.id, action, False, ("自动收利已拦截：" if auto else "已拦截：") + reason[:500])
+                # 自动拦截是常态轮询，不写事件；手动点了被拦才记
+                if not auto:
+                    self.store.add_event(account.id, action, False, "已拦截：" + reason[:500])
                 return {
                     "ok": False,
                     "blocked": True,
@@ -1116,7 +1118,8 @@ class OpsService:
             allowed = enter.get("scale_ok") or force
             if not allowed:
                 reason = enter.get("reason") or "当前不能加仓（uniMMR 不够或已开满）"
-                self.store.add_event(account.id, action, False, "已拦截：" + reason[:500])
+                if not auto:
+                    self.store.add_event(account.id, action, False, "已拦截：" + reason[:500])
                 return {
                     "ok": False,
                     "blocked": True,
@@ -1129,7 +1132,8 @@ class OpsService:
             switch = snap.get("switch") or {}
             if not switch.get("can_click"):
                 reason = switch.get("reason") or "现在不适合换产品"
-                self.store.add_event(account.id, action, False, "已拦截：" + reason[:500])
+                if not auto:
+                    self.store.add_event(account.id, action, False, "已拦截：" + reason[:500])
                 return {
                     "ok": False,
                     "blocked": True,
@@ -1209,6 +1213,54 @@ class OpsService:
             "snapshot": snap,
         }
 
+    @staticmethod
+    def _is_noise_action_log(
+        action: str,
+        steps: list[StepResult],
+        *,
+        auto: bool,
+        error: Exception | None,
+    ) -> bool:
+        """自动空跑（已满仓/暂不加/仅设杠杆）不写事件，避免刷屏。"""
+        if not auto or error is not None:
+            return False
+        if not steps:
+            return True
+        noise_names = {"仓位已满", "暂不加仓", "加仓跳过", "设置杠杆", "查询杠杆", "读取杠杆"}
+        # 真正动过仓/理财的步骤才值得记
+        for s in steps:
+            if s.name in noise_names:
+                continue
+            if any(
+                k in s.name
+                for k in (
+                    "开仓",
+                    "加仓",
+                    "平仓",
+                    "收利",
+                    "赎回",
+                    "申购",
+                    "划转",
+                    "兑换",
+                    "换产品",
+                    "归集",
+                    "入金",
+                    "对冲",
+                    "挂单",
+                    "市价",
+                    "迁仓",
+                )
+            ):
+                return False
+            if not s.ok:
+                return False
+        # 只剩噪声名，或纯「开始分批」之类无成交
+        if action == "scale" and any(s.name == "仓位已满" for s in steps):
+            return True
+        if action == "scale" and any(s.name == "暂不加仓" for s in steps):
+            return True
+        return all(s.name in noise_names for s in steps)
+
     def _persist_action_log(
         self,
         account: Account,
@@ -1218,6 +1270,8 @@ class OpsService:
         auto: bool = False,
         error: Exception | None = None,
     ) -> None:
+        if self._is_noise_action_log(action, steps, auto=auto, error=error):
+            return
         ok = _action_ok(steps, error=error)
         summary = _event_summary(steps, limit=12000)
         if error is not None and "异常中断" not in summary:
