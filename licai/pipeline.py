@@ -225,6 +225,28 @@ class Pipeline:
         slices.sort(key=lambda item: item[1], reverse=True)
         return slices
 
+    def _flexible_product_balance(self, product: FlexibleProduct) -> Decimal:
+        """理财钱包里该活期产品的可用余额（不含统一账户占保部分）。"""
+        try:
+            self.earn.invalidate()
+            rows = self.earn.positions(product.asset)
+        except Exception:
+            return Decimal("0")
+        total = Decimal("0")
+        pid = str(product.product_id or "")
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            if pid and str(row.get("productId") or "") not in {"", pid}:
+                continue
+            total += d(
+                row.get("totalAmount")
+                or row.get("amount")
+                or row.get("collateralAmount")
+                or 0
+            )
+        return total
+
     def _movable_holding_amount(self, product: FlexibleProduct, amount: Decimal) -> Decimal:
         """统一账户里当保证金的仓，只能按可转回额度算可换数量；转不出的不要反复列入换年化。"""
         if amount <= 0:
@@ -1885,9 +1907,24 @@ class Pipeline:
         if source.asset == "USDT" and source.kind == "flexible":
             back, moved = self._return_pm_earn("LDUSDT", amount, has_hedge=has_hedge)
             steps.extend(back)
-            if any(not s.ok for s in back) or any(s.name == "暂停换产品" for s in back):
+            if any(not s.ok for s in back):
                 return steps
-            if source.raw.get("located") == "pm" and moved > 0:
+            if any(s.name == "暂停换产品" for s in back):
+                # 占保锁在统一账户：停。仅当持仓标记不在 PM、理财侧确有余额时才继续赎
+                if source.raw.get("located") == "pm":
+                    return steps
+                earn_bal = self._flexible_product_balance(source)
+                if earn_bal < SPOT_MIN:
+                    return steps
+                steps.append(
+                    StepResult(
+                        "理财侧已有余额，继续赎回",
+                        True,
+                        f"统一账户暂不可转，理财 {source.asset} 约 {fmt_amount(earn_bal)}，按理财余额赎回",
+                    )
+                )
+                amount = min(amount, earn_bal)
+            elif moved > 0:
                 amount = moved
                 moved_out = moved
         if source.kind in {"bfusd", "rwusd"}:
