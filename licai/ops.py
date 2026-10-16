@@ -1221,45 +1221,50 @@ class OpsService:
         auto: bool,
         error: Exception | None,
     ) -> bool:
-        """自动空跑（已满仓/暂不加/仅设杠杆）不写事件，避免刷屏。"""
+        """自动空跑（已满仓/暂不加/仅设杠杆/无成交暂停）不写事件，避免刷屏。"""
         if not auto or error is not None:
             return False
         if not steps:
             return True
-        noise_names = {"仓位已满", "暂不加仓", "加仓跳过", "设置杠杆", "查询杠杆", "读取杠杆"}
-        # 真正动过仓/理财的步骤才值得记
+        # 任何失败步骤都要记（含加仓跳过 FAIL）
+        if any(not s.ok for s in steps):
+            return False
+        soft_noise = {"仓位已满", "暂不加仓", "加仓跳过", "设置杠杆", "查询杠杆", "读取杠杆", "开始分批换产品", "暂停换产品", "本轮结束"}
+        # 真正动过仓/理财才值得记（不含空泛的「换产品/加仓」字样）
+        real_keys = (
+            "随保证金加仓",
+            "加仓完成",
+            "开仓",
+            "平仓",
+            "收利",
+            "赎回",
+            "申购",
+            "划转",
+            "兑换",
+            "归集",
+            "入金",
+            "对冲",
+            "挂单",
+            "市价",
+            "迁仓",
+            "转回",
+            "转入统一",
+        )
+        has_real = False
         for s in steps:
-            if s.name in noise_names:
+            if s.name in soft_noise:
                 continue
-            if any(
-                k in s.name
-                for k in (
-                    "开仓",
-                    "加仓",
-                    "平仓",
-                    "收利",
-                    "赎回",
-                    "申购",
-                    "划转",
-                    "兑换",
-                    "换产品",
-                    "归集",
-                    "入金",
-                    "对冲",
-                    "挂单",
-                    "市价",
-                    "迁仓",
-                )
-            ):
-                return False
-            if not s.ok:
-                return False
-        # 只剩噪声名，或纯「开始分批」之类无成交
-        if action == "scale" and any(s.name == "仓位已满" for s in steps):
+            if any(k in s.name for k in real_keys):
+                has_real = True
+                break
+        if has_real:
+            return False
+        if action == "scale":
             return True
-        if action == "scale" and any(s.name == "暂不加仓" for s in steps):
+        if action == "switch":
+            # 纯暂停/开场白、没有申购划转 → 噪声
             return True
-        return all(s.name in noise_names for s in steps)
+        return all(s.name in soft_noise for s in steps)
 
     def _persist_action_log(
         self,

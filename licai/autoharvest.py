@@ -379,10 +379,31 @@ class AutoHarvestWorker:
                 (s.get("name") == "暂停换产品") or ("先不动" in str(s.get("detail") or ""))
                 for s in steps
             )
+            subscribed = any(
+                s.get("ok") and ("申购" in str(s.get("name") or ""))
+                for s in steps
+            )
+            margin_locked = any(
+                s.get("name") == "暂停换产品"
+                and (
+                    "留作保证金" in str(s.get("detail") or "")
+                    or "最多能转回" in str(s.get("detail") or "")
+                )
+                for s in steps
+            )
             if paused:
+                # 已换出一部分，或剩余被保证金锁死：今日不再空转刷事件
+                if subscribed or margin_locked:
+                    self._mark_earn_day_done(account.id, day)
+                    why = "已换出一部分，剩余保证金占用" if subscribed else "可转额度被保证金占用"
+                    _print(
+                        f"每日自动换年化结束 account={account.id} ok={ok} "
+                        f"{why}，今日不再重试：{detail[:400]}"
+                    )
+                    return
                 _print(
                     f"每日自动换年化暂缓 account={account.id} ok={ok} "
-                    f"碰到安全线/批次不足，今日稍后重试：{detail[:400]}"
+                    f"碰到安全线，稍后重试：{detail[:400]}"
                 )
                 return
             if not ok:
@@ -391,7 +412,7 @@ class AutoHarvestWorker:
                     f"今日稍后重试：{detail[:500]}"
                 )
                 return
-            # 真正换完（或无需再换）才记今日完成
+            # 真正换完才记今日完成
             self._mark_earn_day_done(account.id, day)
             _print(f"每日自动换年化结束 account={account.id} ok={ok} {detail[:500]}")
         finally:
@@ -526,7 +547,13 @@ class AutoHarvestWorker:
             pick = fails or steps[-4:]
             detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
         if ok and bool(getattr(self.ops.base, "macd_auto_harvest", True)):
-            self._remember_cross(account.id)
+            # 已满仓/暂不加 不算真正加仓，不能吃掉这根交叉
+            soft = any(
+                (s.get("name") or "") in {"仓位已满", "暂不加仓", "加仓跳过"}
+                for s in steps
+            )
+            if not soft:
+                self._remember_cross(account.id)
         _print(f"自动加仓结束 account={account.id} ok={ok} {detail[:500]}")
         return True
 

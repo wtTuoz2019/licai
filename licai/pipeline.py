@@ -1592,7 +1592,8 @@ class Pipeline:
                 legs = self.futures.legs(self.settings.hedge_symbol)
                 has_hedge = legs.long_qty > 0 or legs.short_qty > 0
             except Exception:
-                has_hedge = False
+                # 读仓失败按有仓处理，避免误走整笔强赎
+                has_hedge = True
         hedge_open = bool(has_hedge)
         total_left = sum((amt for _src, amt, _dst, _note in moves), Decimal("0"))
         min_b = max(self.settings.switch_min_batch, Decimal("1"))
@@ -1734,7 +1735,8 @@ class Pipeline:
                 if any(not s.ok for s in fresh):
                     return steps
                 if any(s.name == "暂停换产品" for s in fresh):
-                    # 这一笔转不出来就换下一种持仓，不要把已经申购的产品卡在统一账户外面
+                    # 转不出则换下一种持仓；有对冲时绝不随后清尾强赎
+                    remaining = Decimal("0")
                     break
                 pulled = [s for s in fresh if s.name == "转回数量"]
                 remaining -= d(pulled[-1].detail) if pulled else batch
@@ -1764,14 +1766,15 @@ class Pipeline:
                     )
                 )
                 return steps
-            if full and remaining > 0:
+            # 清尾数仅无对冲时；有仓剩余留给下次（可转额度/uniMMR 恢复后再动）
+            if full and remaining > 0 and not hedge_open:
                 steps.append(
                     StepResult("清尾数", True, f"{product.asset} 循环后仍剩 {fmt_amount(remaining)}，整笔赎回")
                 )
                 steps.extend(_redeem(product, remaining, redeem_all=True))
                 self._soften_dust_failures(steps)
                 remaining = Decimal("0")
-            elif 0 < remaining < self.settings.switch_min_batch:
+            elif 0 < remaining < self.settings.switch_min_batch and not hedge_open:
                 mmr, equity = self._mmr_equity()
                 if self._next_switch_batch(remaining, mmr, equity, full=full, hedge_open=hedge_open) >= remaining:
                     steps.extend(_redeem(product, remaining))
