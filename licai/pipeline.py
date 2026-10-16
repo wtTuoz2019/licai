@@ -1540,13 +1540,23 @@ class Pipeline:
                         f"点「换年化」会按各产品额度申购，当前优先 {target.asset}，年化 {apr_choice_text(target)}"
                     ),
                 }
-            locked = any(amt > 0 for _p, amt in holdings)
-            reason = "已经按各产品自己的额度配在更高年化上，不用换"
-            if locked:
+            stuck: list[str] = []
+            for product, amount in holdings:
+                if amount < SPOT_MIN:
+                    continue
+                movable = self._movable_holding_amount(product, amount)
+                if movable >= SPOT_MIN:
+                    continue
+                # 已经在最高年化上、只是可转出为 0：那是保证金，不是还没换的低收益仓
+                if target is not None and self._alloc_key(product) == self._alloc_key(target):
+                    continue
+                stuck.append(product.asset)
+            if stuck:
                 reason = (
-                    "没有可转出的低收益仓可换（有对冲时统一账户里的 LDUSDT/BFUSD "
-                    "常被占作保证金，可转回为 0 就先不动）"
+                    f"{'/'.join(stuck)} 在统一账户里当保证金，当前可转回不足 1，先不动"
                 )
+            else:
+                reason = "已经按各产品自己的额度配在更高年化上，不用换"
             return {
                 "needed": False,
                 "can_click": False,
