@@ -305,11 +305,13 @@ def settings_for_account(
         target = int(base.hedge_leverage_target or base.hedge_leverage or 1)
     effective = target
     # 目标倍数用于尝试上调；有仓时算仓以交易所实际杠杆为准（ops/cycle 会覆盖）。
-    # 仅在交易所明确限时（有未到期的解禁时间）时，预览按上限压一档。
+    # 子账户硬上限（无解禁时间）或未到期的限时上限：展示/预览按上限压，避免无仓时把目标当成实际。
     cap = int(leverage_cap) if leverage_cap else 0
     unlock = _unlock_dt(leverage_unlock_at)
-    if cap > 0 and unlock is not None and datetime.now(timezone.utc) < unlock:
-        effective = min(target, cap)
+    if cap > 0:
+        unlocked = unlock is not None and datetime.now(timezone.utc) >= unlock
+        if not unlocked:
+            effective = min(target, cap)
     custom_tp = Decimal("0")
     if take_profit_custom and take_profit_usdt:
         custom_tp = d(take_profit_usdt)

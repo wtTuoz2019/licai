@@ -170,6 +170,13 @@
       color: var(--muted);
     }
     .lev-chip b { color: var(--text); font-weight: 650; }
+    .lev-chip em {
+      font-style: normal;
+      margin-left: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 500;
+    }
     .ops { display: flex; gap: 6px; flex-wrap: wrap; }
     .ops button { padding: 8px 14px; font-weight: 600; }
     .funds {
@@ -520,7 +527,7 @@
             <span class="acct-id" id="acct-id-now"></span>
             <span class="sym" id="symbol-now">-</span>
             <span class="lev-chip" id="settle-chip" hidden><b id="settle-asset"></b></span>
-            <span class="lev-chip"><b id="lev">-</b>x</span>
+            <span class="lev-chip" id="lev-chip"><b id="lev">-</b><span id="lev-unit">x</span><em id="lev-tgt-hint" hidden></em></span>
             <span id="stable-pill" class="pill wait">-</span>
           </div>
           <div class="ops">
@@ -596,7 +603,7 @@
             </div>
           </div>
           <p class="muted">出口 IP <b id="ip">-</b> · <span id="proxy-mode"></span> · 代理 <b id="proxy-now">默认</b> · <span id="snap-age"></span></p>
-          <p class="muted">杠杆 目标 <b id="lev-target">-</b> · 实际 <b id="lev-actual">-</b></p>
+          <p class="muted">杠杆 目标 <b id="lev-target">-</b> · 实际 <b id="lev-actual">-</b>（顶栏只显示实际；子账户常被锁 5x）</p>
           <div class="row">
             <button type="button" id="btn-set-leverage">设置杠杆</button>
             <input id="lev-edit" type="number" min="1" max="125" step="1" placeholder="100" title="目标杠杆：尝试提到这个倍数；算仓用实际倍数" />
@@ -1160,6 +1167,31 @@
       else el.classList.add("up");
     }
 
+    function setLevDisplay(s) {
+      const act = Number(s && s.leverage || 0) || 0;
+      const tgt = Number(
+        (s && s.account && s.account.hedge_leverage) || (s && s.leverage_target) || 0
+      ) || 0;
+      const levEl = $("lev");
+      const hint = $("lev-tgt-hint");
+      const chip = $("lev-chip") || (levEl && levEl.closest(".lev-chip"));
+      if (levEl) levEl.textContent = act > 0 ? String(act) : "-";
+      const levAct = $("lev-actual");
+      if (levAct) levAct.textContent = act > 0 ? String(act) : "-";
+      const levTgt = $("lev-target");
+      if (levTgt) levTgt.textContent = tgt > 0 ? String(tgt) : "-";
+      const mismatch = act > 0 && tgt > 0 && act !== tgt;
+      if (hint) {
+        hint.hidden = !mismatch;
+        hint.textContent = mismatch ? `目标${tgt}` : "";
+      }
+      if (chip) {
+        chip.title = mismatch
+          ? `实际 ${act}x（交易所/账号上限），目标 ${tgt}x 尚未拉上去`
+          : (act ? `杠杆 ${act}x` : "");
+      }
+    }
+
     function esc(s) {
       return String(s || "").replace(/[&<>"']/g, (ch) => ({
         "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -1418,21 +1450,8 @@
       if (!s || !sameAccount(s.account && s.account.id)) return;
       if (s.ok === false) return;
       if (s.uni_mmr != null) setMmr(s.uni_mmr || "-");
-      if (s.leverage != null) $("lev").textContent = s.leverage;
-      const levAct = $("lev-actual");
-      if (levAct && s.leverage != null) levAct.textContent = s.leverage || "-";
-      const levTgt = $("lev-target");
-      if (levTgt) {
-        const tgt = (s.account && s.account.hedge_leverage) || s.leverage_target || "";
-        if (tgt) levTgt.textContent = tgt;
-      }
-      const levChip = $("lev") && $("lev").closest(".lev-chip");
-      if (levChip) {
-        const tgt = Number((s.account && s.account.hedge_leverage) || s.leverage_target || 0) || 0;
-        const act = Number(s.leverage || 0) || 0;
-        levChip.title = tgt && act && tgt !== act
-          ? `实际 ${act}x · 目标 ${tgt}x`
-          : (act ? `杠杆 ${act}x` : "");
+      if (s.leverage != null || s.leverage_target != null || (s.account && s.account.hedge_leverage != null)) {
+        setLevDisplay(s);
       }
       const price = s.price || (s.stability && s.stability.mid) || "";
       if (price) $("mid-price").textContent = price;
@@ -1647,13 +1666,9 @@
         settleEl.textContent = settle || "";
         settleChip.hidden = !settle;
       }
-      $("lev").textContent = s.leverage || "-";
-      const levAct = $("lev-actual");
-      if (levAct) levAct.textContent = s.leverage || "-";
-      const levTgt = $("lev-target");
+      setLevDisplay(s);
       const levInput = $("lev-edit");
       const target = (s.account && s.account.hedge_leverage) || s.leverage_target || "";
-      if (levTgt) levTgt.textContent = target || "-";
       if (levInput && document.activeElement !== levInput) {
         levInput.value = target || "";
         levInput.placeholder = s.leverage_target ? String(s.leverage_target) : "100";

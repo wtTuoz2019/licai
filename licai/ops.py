@@ -246,11 +246,22 @@ def _harvest_notional(
 
 
 def _display_leverage(legs, settings: Settings) -> tuple[int, int]:
-    """返回 (展示用实际杠杆, 目标杠杆)。无仓时用 settings 里已按上限压过的有效倍数。"""
+    """返回 (展示用实际杠杆, 目标杠杆)。
+
+    有仓用交易所仓位杠杆。无仓不用目标冒充实际：优先有效倍数（已含子账户上限），
+    再退到 leverage_cap；都没有才显示目标。
+    """
     target = int(settings.hedge_leverage_target or settings.hedge_leverage or 0)
     actual = int(getattr(legs, "leverage", 0) or 0)
     if actual <= 0:
-        actual = int(settings.hedge_leverage or target or 0)
+        effective = int(settings.hedge_leverage or 0)
+        cap = int(settings.leverage_cap or 0)
+        if effective > 0:
+            actual = effective
+        elif cap > 0:
+            actual = min(target, cap) if target > 0 else cap
+        else:
+            actual = target
     if target <= 0:
         target = actual
     return actual, target
