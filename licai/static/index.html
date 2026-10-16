@@ -1485,7 +1485,7 @@
       if (accLive.auto_harvest) {
         if (h.migrate) {
           why = (h.migrate_armed
-            ? "自动迁仓待命：等金叉/死叉与收利级平稳同时满足后全平旧仓再开新套保。 "
+            ? "自动迁仓待命：等金叉/死叉与收利级平稳后挂单全平旧仓；清完再等下次交叉开新套保。 "
             : "自动收利已开：有旧套保仓，后台会自动挂起等时机迁仓。 ") + (h.reason || why);
         } else {
           const flat = toNum(legs.long_qty) <= 0 && toNum(legs.short_qty) <= 0;
@@ -1685,7 +1685,7 @@
           const autoOn = !!(s.account && s.account.auto_harvest);
           setActionMsg(
             armed
-              ? `旧仓仍在，迁仓已挂起：后台等到金叉/死叉与平稳同时满足后会自动全平再开 ${s.symbol || "新套保"}。`
+              ? `旧仓仍在，迁仓已挂起：后台等到金叉/死叉与平稳后会挂单全平；清完再等下次交叉开 ${s.symbol || "新套保"}。`
               : (autoOn
                 ? `已换套保，旧仓见下方黄色区。自动收利已开，后台会自动等时机迁仓；着急可点「强行迁仓」。`
                 : `已换套保，旧仓见下方黄色区。点「迁仓开新」会挂起任务（不堵页面），后台等时机后执行。`)

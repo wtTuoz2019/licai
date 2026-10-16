@@ -308,7 +308,7 @@ class HedgeCycle:
         allow_migrate: bool = True,
         auto: bool = False,
     ) -> list[StepResult]:
-        # 换币后手动收利：当前套保无仓但旧币种仍有仓 → 全平旧仓再开新对冲
+        # 换币后手动收利：当前套保无仓但旧币种仍有仓 → 挂单全平旧仓（开仓留给下次交叉）
         legs = self.futures.legs(self.symbol)
         if allow_migrate and legs.long_qty <= 0 and legs.short_qty <= 0:
             others = self._other_open_symbols()
@@ -431,8 +431,9 @@ class HedgeCycle:
         wait_stable: bool = True,
         prefer: str | None = None,
     ) -> list[StepResult]:
-        """换套保后迁仓：金叉/死叉与平稳同时满足 → 挂单全平旧仓 → 开新对冲。
+        """换套保后迁仓：金叉/死叉与平稳同时满足 → 挂单全平旧仓。
 
+        全平后不开新仓，留给自动开仓等下一根交叉+入场平稳再开。
         wait_stable=True 时会阻塞等到时机（仅测试/兼容）；后台挂起路径应先
         migrate_timing_ready 再以 wait_stable=False 调用。
         """
@@ -442,11 +443,11 @@ class HedgeCycle:
                 "换币迁仓",
                 True,
                 f"当前套保 {self.symbol}，挂单全平旧仓 "
-                f"{'、'.join(others) or '（无）'}，再自动开新对冲",
+                f"{'、'.join(others) or '（无）'}；清完后等下次交叉再开 {self.symbol}",
             )
         ]
         if not others:
-            steps.extend(self.setup_once(force_hedge=True))
+            steps.append(StepResult("旧仓已空", True, "没有旧套保仓，等自动开仓时机"))
             return steps
         for sym in others:
             steps.extend(
@@ -462,8 +463,13 @@ class HedgeCycle:
                     )
                 )
                 return steps
-        steps.append(StepResult("旧仓已清", True, "开始在新套保币对开仓"))
-        steps.extend(self.setup_once(force_hedge=True))
+        steps.append(
+            StepResult(
+                "旧仓已清",
+                True,
+                f"已挂单平净。新套保 {self.symbol} 等下一根金叉/死叉与入场平稳再开，不立刻重开",
+            )
+        )
         return steps
 
     def _wait_until_macd_and_stable(

@@ -157,7 +157,8 @@ class AutoHarvestWorker:
         sym = (live.get("symbol") or account.hedge_symbol or "").upper()
         self.ops.arm_migrate(account.id, force=False)
         detail = (
-            f"自动挂起迁仓（等金叉/死叉与平稳）：{tip}，完成后开 {sym or '新套保'}。"
+            f"自动挂起迁仓（等金叉/死叉与平稳）：{tip}，先挂单全平；"
+            f"清完后等下次交叉再开 {sym or '新套保'}。"
             "开了自动收利，无需再点「迁仓开新」。"
         )
         self.ops.store.add_event(account.id, "harvest", True, detail[:500])
@@ -238,22 +239,15 @@ class AutoHarvestWorker:
                 if again.get("ok") and not again.get("other_positions_error"):
                     left = again.get("other_positions") or []
                     if not left:
-                        pipe = pipeline_for(account, self.ops.base, dry_run=False, ops=self.ops)
-                        cycle = HedgeCycle(pipe)
-                        open_steps = cycle.setup_once(force_hedge=True)
-                        open_fails = [s for s in open_steps if not getattr(s, "ok", True)]
-                        open_detail = "；".join(
-                            f"{getattr(s, 'name', '')}: {getattr(s, 'detail', '')}"
-                            for s in (open_fails or open_steps[-3:])
-                        )
+                        # 单边清净后也不立刻开仓，留给自动开仓等下一根交叉
+                        self.ops.clear_migrate_arm(account.id)
+                        self._remember_cross(account.id)
                         self.ops.store.add_event(
                             account.id,
                             "harvest",
-                            not open_fails,
-                            (("旧仓已清，开新对冲：" if not open_fails else "旧仓已清但开新失败：") + open_detail)[:500],
+                            True,
+                            "旧仓单边已清。新套保等下一根金叉/死叉与入场平稳再开，不立刻重开",
                         )
-                        if not open_fails:
-                            self.ops.clear_migrate_arm(account.id)
                         self.ops.refresh_account_snapshot(account)
                         return True
                 self.ops.refresh_account_snapshot(account)
@@ -320,10 +314,12 @@ class AutoHarvestWorker:
                 account.id,
                 "harvest",
                 ok,
-                (("迁仓完成：" if ok else "迁仓未完成：") + detail)[:500],
+                (("迁仓完成（仅全平，等下次开仓）：" if ok else "迁仓未完成：") + detail)[:500],
             )
             if ok:
                 self.ops.clear_migrate_arm(account.id)
+                # 吃掉本根交叉，避免同一根马上又自动开新套保
+                self._remember_cross(account.id)
             else:
                 self.ops.touch_migrate_event(account.id)
             self.ops.refresh_account_snapshot(account)

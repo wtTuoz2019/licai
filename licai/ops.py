@@ -617,7 +617,7 @@ class OpsService:
         armed: bool = False,
         auto_harvest: bool = False,
     ) -> dict:
-        """当前套保无仓但旧币种有仓：一键收利改为「全平旧仓 + 开新对冲」。"""
+        """当前套保无仓但旧币种有仓：一键收利改为「挂单全平旧仓」；开仓留给下次交叉。"""
         if not others:
             return advice
         tip = "、".join(
@@ -634,20 +634,20 @@ class OpsService:
         out["stable_ok"] = bool(advice.get("stable_ok"))
         if armed:
             out["reason"] = (
-                f"迁仓已挂起：旧仓 {tip}。后台等到金叉/死叉与收利级平稳同时满足后，"
-                f"会挂单全平再开 {current_symbol}。可在事件里看进度。"
+                f"迁仓已挂起：旧仓 {tip}。后台等到金叉/死叉与收利级平稳后会挂单全平；"
+                f"清完后等下次交叉再开 {current_symbol}。可在事件里看进度。"
             )
         elif auto_harvest:
             out["reason"] = (
                 f"已换套保到 {current_symbol}，旧仓仍在：{tip}。"
-                "自动收利已开，后台会自动等交叉与平稳后迁仓；"
-                "不稳时可点「一键收利」强行尽快平。"
+                "自动收利已开，后台会自动等交叉与平稳后挂单全平旧仓，"
+                "再等下次交叉开新仓；不稳时可点「一键收利」强行尽快平。"
             )
         else:
             out["reason"] = (
                 f"已换套保到 {current_symbol}，旧仓仍在：{tip}。"
-                "点「迁仓开新」会挂起任务（不堵页面），后台等到交叉与平稳同时满足后执行；"
-                "不稳时可强行挂起并尽快平仓。"
+                "点「迁仓开新」会挂起任务（不堵页面），后台等到交叉与平稳后挂单全平；"
+                "清完后等下次交叉再开。不稳时可强行挂起尽快平仓。"
             )
         return out
 
@@ -1086,9 +1086,10 @@ class OpsService:
                 prev = self.migrate_arm(account.id)
                 self.arm_migrate(account.id, force=False)
                 detail = (
-                    f"自动挂起迁仓（等金叉/死叉与平稳）：{tip}，完成后开 {sym or '新套保'}。"
+                    f"自动挂起迁仓（等金叉/死叉与平稳）：{tip}，先挂单全平；"
+                    f"清完后等下次交叉再开 {sym or '新套保'}。"
                     if not prev
-                    else f"迁仓已在待命：{tip} → {sym or '新套保'}"
+                    else f"迁仓已在待命：{tip} → 全平后等下次开 {sym or '新套保'}"
                 )
                 if not prev:
                     self.store.add_event(account.id, "harvest", True, detail[:500])
@@ -1138,7 +1139,8 @@ class OpsService:
                 self.arm_migrate(account.id, force=force)
                 detail = (
                     f"已挂起迁仓（{'强行尽快平' if force else '等金叉/死叉与平稳同时满足'}）："
-                    f"{tip}，完成后开 {sym or '新套保'}。后台执行，可看事件进度。"
+                    f"{tip}，先挂单全平；清完后等下次交叉再开 {sym or '新套保'}。"
+                    "后台执行，可看事件进度。"
                 )
                 self.store.add_event(account.id, "harvest", True, detail[:500])
                 self.touch_migrate_event(account.id)
