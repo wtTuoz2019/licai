@@ -174,7 +174,7 @@
     .ops button { padding: 8px 14px; font-weight: 600; }
     .funds {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 8px;
     }
     .funds + .funds { margin-top: 8px; }
@@ -535,7 +535,12 @@
         <div id="error" class="err" hidden></div>
         <div class="funds">
           <div class="kpi"><span>现价</span><b id="mid-price">-</b></div>
-          <div class="kpi"><span>账户总额</span><b id="equity">-</b></div>
+          <div class="kpi" title="币安统一账户权益，已含仓位浮盈浮亏；不是理财本金合计">
+            <span>账户权益</span><b id="equity">-</b>
+          </div>
+          <div class="kpi" title="当前套保多空浮盈合计（未实现）">
+            <span>仓位浮盈</span><b id="pos-upnl">-</b>
+          </div>
           <div class="kpi"><span>昨日收益</span><b id="earn-yesterday">-</b></div>
           <div class="kpi"><span>uniMMR</span><b id="mmr">-</b></div>
         </div>
@@ -827,6 +832,7 @@
       $("lev").textContent = "-";
       $("mid-price").textContent = "-";
       $("equity").textContent = "-";
+      setPosUpnl({});
       $("earn-yesterday").textContent = "-";
       setMmr("-");
       $("spot").textContent = "-";
@@ -1125,6 +1131,22 @@
       const n = toNum(v);
       if (n > 0) el.classList.add("up");
       if (n < 0) el.classList.add("down");
+    }
+
+    function setPosUpnl(legs) {
+      const el = $("pos-upnl");
+      if (!el) return;
+      const longP = toNum(legs && legs.long_pnl);
+      const shortP = toNum(legs && legs.short_pnl);
+      const parts = [];
+      if (Number.isFinite(longP)) parts.push(longP);
+      if (Number.isFinite(shortP)) parts.push(shortP);
+      if (!parts.length) {
+        el.textContent = "-";
+        el.classList.remove("up", "down");
+        return;
+      }
+      setPnl(el, parts.reduce((a, b) => a + b, 0));
     }
 
     function setMmr(text) {
@@ -1427,6 +1449,7 @@
       $("short-entry").textContent = "仓位价 " + (toNum(shortEntry) > 0 ? shortEntry : "-");
       setPnl($("long-pnl"), legs.long_pnl);
       setPnl($("short-pnl"), legs.short_pnl);
+      setPosUpnl(legs);
       renderOtherPositions(s);
       const h = s.harvest || {};
       $("fee").textContent = h.round_trip_fee || "-";
