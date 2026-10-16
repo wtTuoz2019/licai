@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, replace
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Any, Callable
 
 from .client import BinanceAPIError, BinanceClient
@@ -1533,18 +1533,23 @@ class Pipeline:
             leftover, mmr, equity, full=True, hedge_open=hedge_open
         )
         can = next_batch > 0
-        max_batches = 50  # 与 switch_to_best(full=True) 一致：尽量一次换完
         if not is_mmr_sentinel(mmr) and mmr < safe:
             reason = f"当前 uniMMR={fmt_amount(mmr, 4)} 低于安全线 {fmt_amount(safe, 4)}，先不要赎回换产品"
         elif next_batch <= 0:
             reason = "这批按 uniMMR 估出来能赎的数量太小，先不要动"
         else:
             plan = "；".join(note for _src, _amt, _dst, note in moves[:4])
+            if next_batch >= leftover:
+                batch_hint = f"当前空间够一次换完约 {fmt_amount(leftover, 2)} USDT"
+            else:
+                batch_hint = (
+                    f"当前空间本批约 {fmt_amount(next_batch, 2)} / 剩余 {fmt_amount(leftover, 2)} USDT，"
+                    f"会按赎回后最新 uniMMR 继续下一批"
+                )
             reason = (
                 f"按各产品额度凑更高收益：{plan}。"
-                f"本批最多 {fmt_amount(next_batch, 2)} USDT，按赎回瞬间保证金暂时少一块来估，"
-                f"目标 uniMMR ≥ {fmt_amount(safe, 4)}。"
-                f"点一次会尽量换完（最多 {max_batches} 批），只有碰到安全线才停下。"
+                f"{batch_hint}（目标 uniMMR ≥ {fmt_amount(safe, 4)}）。"
+                f"点一次会按实际情况自动分批，换完或碰到安全线才停。"
             )
         return {
             "needed": True,
@@ -1586,20 +1591,26 @@ class Pipeline:
             except Exception:
                 has_hedge = False
         hedge_open = bool(has_hedge)
-        max_batches = 50 if full else self.settings.switch_max_batches
+        total_left = sum((amt for _src, amt, _dst, _note in moves), Decimal("0"))
+        min_b = max(self.settings.switch_min_batch, Decimal("1"))
+        # 批次数按剩余仓位估，再留余量；真正停条件是换完或碰到 uniMMR 安全线
+        if full:
+            need = int((total_left / min_b).to_integral_value(rounding=ROUND_UP)) + len(moves) + 5
+            max_batches = max(20, min(need, 200))
+        else:
+            max_batches = self.settings.switch_max_batches
         compared = self._apr_comparison()
         if full and not hedge_open:
             start_detail = (
                 f"按各产品额度凑更高收益：{plan_text}。"
-                f"无对冲仓，整笔归集（不按 uniMMR 估批），最多 {max_batches} 批。"
+                f"无对冲仓，按剩余整笔归集（约 {max_batches} 批封顶）。"
                 f"比较 {compared}"
             )
         else:
             start_detail = (
                 f"按各产品额度凑更高收益：{plan_text}。"
-                f"{'尽量一次换完，' if full else ''}"
-                f"每批按 uniMMR≥{fmt_amount(self.settings.switch_safe_uni_mmr, 4)} 估赎回量，"
-                f"最多 {max_batches} 批。比较 {compared}"
+                f"每批按当时 uniMMR≥{fmt_amount(self.settings.switch_safe_uni_mmr, 4)} 自动估赎回量，"
+                f"换完或碰到安全线为止（约 {max_batches} 批封顶）。比较 {compared}"
             )
         steps = [StepResult("开始分批换产品", True, start_detail)]
         if full and not hedge_open and not self.settings.dry_run:
@@ -1790,22 +1801,18 @@ class Pipeline:
         full: bool = False,
         hedge_open: bool = True,
     ) -> Decimal:
+        """按当时 uniMMR / 权益 / 剩余仓位估本批赎回量，不写死固定额度。"""
         if remaining <= 0:
             return Decimal("0")
-        # 无对冲仓：赎回不影响保证金，不必按 uniMMR 砍批次
+        # 无对冲仓：赎回不影响保证金，一次尽量赎完
         if full and not hedge_open:
-            hard = max(self.settings.switch_batch_usdt, Decimal("2000"))
-            batch = min(remaining, hard)
-            q = batch.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-            if q <= 0 and remaining > 0:
-                return remaining
-            if remaining - q > 0 and remaining - q < self.settings.switch_min_batch and remaining <= hard:
-                return remaining.quantize(Decimal("0.01"), rounding=ROUND_DOWN) or remaining
-            return q
+            q = remaining.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            return q if q > 0 else remaining
         safe = self.settings.switch_safe_uni_mmr
         if not is_mmr_sentinel(mmr) and mmr < safe:
             return Decimal("0")
         if equity > 0 and mmr > 0 and not is_mmr_sentinel(mmr):
+            # 赎回瞬间保证金会少一块：只取把 uniMMR 压到安全线之上仍富余的空间
             cap = equity * (Decimal("1") - safe / mmr) * (Decimal("0.9") if full else Decimal("0.8"))
         else:
             # 无权益/无仓：其它活期多半还不在保证金里，允许一次赎完
@@ -1813,9 +1820,8 @@ class Pipeline:
         if cap <= 0:
             return Decimal("0")
         if full:
-            # 入场归集：在安全线内尽量整笔换到最高年化；单笔仍封顶，避免一次过大
-            hard = max(self.settings.switch_batch_usdt, Decimal("2000"))
-            batch = min(remaining, cap, hard)
+            # 换年化：本批 = min(剩余, 当前可腾出的保证金空间)，能一次就一次
+            batch = min(remaining, cap)
             if remaining - batch > 0 and remaining - batch < self.settings.switch_min_batch:
                 if remaining <= cap:
                     batch = remaining
@@ -1824,6 +1830,7 @@ class Pipeline:
             if q <= 0 and remaining > 0:
                 return remaining
             return q
+        # 保守路径（入场有仓等）：仍用配置的单批上限与比例，但上限不超过当前 MMR 空间
         hard = self.settings.switch_batch_usdt
         pct = remaining * self.settings.switch_batch_pct
         raw = min(remaining, cap, pct if pct > 0 else remaining, hard)
