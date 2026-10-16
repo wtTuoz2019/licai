@@ -1524,8 +1524,16 @@ class Pipeline:
                 "remaining": "0",
                 "reason": reason,
             }
-        next_batch = self._next_switch_batch(leftover, mmr, equity)
+        try:
+            legs = self.futures.legs(self.settings.hedge_symbol)
+            hedge_open = legs.long_qty > 0 or legs.short_qty > 0
+        except Exception:
+            hedge_open = True
+        next_batch = self._next_switch_batch(
+            leftover, mmr, equity, full=True, hedge_open=hedge_open
+        )
         can = next_batch > 0
+        max_batches = 50  # 与 switch_to_best(full=True) 一致：尽量一次换完
         if not is_mmr_sentinel(mmr) and mmr < safe:
             reason = f"当前 uniMMR={fmt_amount(mmr, 4)} 低于安全线 {fmt_amount(safe, 4)}，先不要赎回换产品"
         elif next_batch <= 0:
@@ -1535,7 +1543,8 @@ class Pipeline:
             reason = (
                 f"按各产品额度凑更高收益：{plan}。"
                 f"本批最多 {fmt_amount(next_batch, 2)} USDT，按赎回瞬间保证金暂时少一块来估，"
-                f"目标 uniMMR ≥ {fmt_amount(safe, 4)}。点一次最多 {self.settings.switch_max_batches} 批。"
+                f"目标 uniMMR ≥ {fmt_amount(safe, 4)}。"
+                f"点一次会尽量换完（最多 {max_batches} 批），只有碰到安全线才停下。"
             )
         return {
             "needed": True,
@@ -1559,7 +1568,7 @@ class Pipeline:
     def switch_to_best(self, *, full: bool = False, has_hedge: bool | None = None) -> list[StepResult]:
         """把非目标活期换成当前最高年化产品。
 
-        full=True：一键入场用。无仓时尽量一次赎完；有仓时仍守 uniMMR 安全线，但放宽批次数。
+        full=True：换年化/入场用。无仓时尽量一次赎完；有仓时仍守 uniMMR，但放宽单批与批次数，尽量一次换完。
         has_hedge：是否已有对冲仓。无仓时不按 uniMMR 估赎回量（文案与批次都跳过）。
         """
         try:
@@ -1588,7 +1597,7 @@ class Pipeline:
         else:
             start_detail = (
                 f"按各产品额度凑更高收益：{plan_text}。"
-                f"{'入场归集其它活期，' if full else ''}"
+                f"{'尽量一次换完，' if full else ''}"
                 f"每批按 uniMMR≥{fmt_amount(self.settings.switch_safe_uni_mmr, 4)} 估赎回量，"
                 f"最多 {max_batches} 批。比较 {compared}"
             )
