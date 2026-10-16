@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from . import earn as earn_mod
@@ -33,7 +33,7 @@ def _qty(legs: dict, key: str):
 class AutoHarvestWorker:
     """后台轮询：
 
-    - 每日：拉全部理财奖励记录；仅开启自动收利、且 auto_switch_earn 时，按各产品额度自动换到更高年化
+    - 每日：等理财利息到账后，自动换年化一次（需开自动收利且 auto_switch_earn）
     - 账号开启「自动收利」时：无仓须金叉/死叉与严平稳同时满足才开仓；
       有仓须金叉/死叉与收利级平稳同时满足，且浮盈达标才收利
     手动一键入场/收利不受影响。
@@ -44,7 +44,7 @@ class AutoHarvestWorker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_cross_key = ""
-        # account_id -> UTC 日期，每日理财检查只跑一次（落盘，重启不重试）
+        # account_id -> UTC 日期：利息到账并完成换年化检查后才记完成（落盘）
         self._earn_day_done: dict[int, str] = self._load_earn_day_done()
 
     @staticmethod
@@ -298,8 +298,19 @@ class AutoHarvestWorker:
         finally:
             self.ops.end_action(account.id)
 
+    def _interest_arrived(self, live: dict) -> bool:
+        """理财利息是否已到账（奖励记录落在今天或昨天 UTC）。"""
+        src = str(live.get("earn_yesterday_source") or "")
+        amt = d(live.get("earn_yesterday") or "0")
+        reward_day = str(live.get("earn_yesterday_day") or "")
+        if src != "records" or amt <= 0 or not reward_day:
+            return False
+        today = self._utc_day()
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        return reward_day in {today, yesterday}
+
     def _maybe_daily_earn(self, account) -> None:
-        """每日拉一次全部理财奖励；有低收益稳定币仓且安全时自动换到最高年化。"""
+        """利息到账后每日自动换年化一次；有低收益稳定币仓且安全时换到最高年化。"""
         day = self._utc_day()
         if self._earn_day_done.get(account.id) == day:
             return
@@ -311,11 +322,14 @@ class AutoHarvestWorker:
             self.ops.invalidate_snapshot(account.id)
             live = self.ops.snapshot(account, force=True)
             if not live.get("ok"):
-                _print(f"每日理财检查跳过 account={account.id}：{live.get('error') or '快照失败'}")
+                _print(f"每日换年化跳过 account={account.id}：{live.get('error') or '快照失败'}")
                 return
             yday = live.get("earn_yesterday") or "0"
             src = live.get("earn_yesterday_source") or ""
-            _print(f"每日理财收益 account={account.id} 昨日={yday} source={src}")
+            reward_day = live.get("earn_yesterday_day") or ""
+            _print(
+                f"每日理财收益 account={account.id} 昨日={yday} day={reward_day} source={src}"
+            )
 
             if not account.auto_harvest:
                 _print(f"每日换年化跳过 account={account.id}：未开自动收利，只在手动点「换年化」时换")
@@ -326,6 +340,14 @@ class AutoHarvestWorker:
                 self._mark_earn_day_done(account.id, day)
                 return
 
+            earn_total = d(live.get("earn_total") or "0")
+            if earn_total > 0 and not self._interest_arrived(live):
+                _print(
+                    f"每日换年化等待利息到账 account={account.id} "
+                    f"昨日={yday} day={reward_day} source={src}"
+                )
+                return
+
             switch = live.get("switch") or {}
             if not switch.get("needed"):
                 _print(f"每日换年化跳过 account={account.id}：已是最高或无需换")
@@ -334,10 +356,8 @@ class AutoHarvestWorker:
             if not switch.get("can_click"):
                 _print(
                     f"每日换年化暂缓 account={account.id}："
-                    f"{switch.get('reason') or 'uniMMR/批次不够'}"
+                    f"{switch.get('reason') or 'uniMMR/批次不够'}（利息已到，安全线够了再换）"
                 )
-                # 今天仍算检查过，避免每分钟重试打爆；安全线恢复后次日再换
-                self._mark_earn_day_done(account.id, day)
                 return
 
             # 先打上今日已处理，避免重启/异常后同一天反复空转

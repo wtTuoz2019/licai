@@ -877,6 +877,7 @@ class Pipeline:
             "earn_total": fmt_amount(usdt_flex + bfusd + other, 4),
             "earn_yesterday": fmt_amount(yday_amt, 4) if yday_amt > 0 else "0",
             "earn_yesterday_source": str(yday.get("source") or "none"),
+            "earn_yesterday_day": str(yday.get("day") or ""),
             "earn_yesterday_error": "; ".join(str(x) for x in yday_errs[:3]) if yday_errs else "",
             "holdings": holdings,
             "next_buy": next_buy,

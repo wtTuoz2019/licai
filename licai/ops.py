@@ -924,6 +924,7 @@ class OpsService:
             "bfusd": wallet.get("bfusd") or "0",
             "earn_yesterday": wallet.get("earn_yesterday") or "0",
             "earn_yesterday_source": wallet.get("earn_yesterday_source") or "none",
+            "earn_yesterday_day": wallet.get("earn_yesterday_day") or "",
             "earn_yesterday_error": wallet.get("earn_yesterday_error") or "",
             "price": stability.as_dict().get("mid") or "0",
             "wallet_status": wallet.get("status") or "",
@@ -1222,7 +1223,13 @@ class OpsService:
         if error is not None and "异常中断" not in summary:
             summary = (summary + "；" if summary else "") + f"异常中断[FAIL]: {error}"
         if auto:
-            prefix = "自动开仓：" if action == "enter" else "自动收利："
+            prefix = {
+                "enter": "自动开仓：",
+                "switch": "自动换年化：",
+                "scale": "自动加仓：",
+                "sweep": "自动归集：",
+                "harvest": "自动收利：",
+            }.get(action, "自动：")
             summary = prefix + summary
         try:
             self.store.add_event(account.id, action, ok, summary[:12000])
