@@ -599,7 +599,7 @@ class OpsService:
             if ol.long_qty <= 0 and ol.short_qty <= 0:
                 continue
             if ol.long_qty > 0 and ol.short_qty > 0:
-                side = "BOTH"
+                side = "BOTH" if ol.long_qty == ol.short_qty else "IMBALANCE"
             elif ol.long_qty > 0:
                 side = "LONG"
             else:
@@ -1220,6 +1220,8 @@ class OpsService:
 
         steps: list[StepResult] = []
         err: Exception | None = None
+        hedge_actions = {"harvest", "enter", "scale"}
+        need_hedge_guard = action in hedge_actions and mode != "earn_only"
         try:
             steps = list(run() or [])
             if getattr(cycle, "leverage_cap_changed", False):
@@ -1232,14 +1234,30 @@ class OpsService:
             err = exc
             steps.append(StepResult("异常中断", False, str(exc)))
         finally:
-            # 收利：无论成败/抛错，收尾再扫一遍裸仓（补齐或市价双平）
-            if action == "harvest":
+            # 开仓/收利/加仓：无论成败/抛错，收尾再扫一遍缺口（补齐、削齐或市价平裸仓）
+            if need_hedge_guard:
                 try:
                     extra = cycle.emergency_hedge_guard()
                     if extra:
                         steps.extend(extra)
                 except Exception as guard_exc:
                     steps.append(StepResult("收尾裸仓守卫失败", False, str(guard_exc)))
+                # 硬闸写入步骤：结束后仍有敞口则记失败，绝不靠中间「对冲平衡」冒充成功
+                try:
+                    legs = cycle.futures.legs(cycle.symbol)
+                    safe = legs.missing_side is None or (
+                        legs.long_qty <= 0 and legs.short_qty <= 0
+                    )
+                    if not safe:
+                        steps.append(
+                            StepResult(
+                                "对冲校验",
+                                False,
+                                f"结束后仍缺口：{cycle._legs_text(legs)}",
+                            )
+                        )
+                except Exception as check_exc:
+                    steps.append(StepResult("对冲校验失败", False, str(check_exc)))
             # 无论成功、失败还是中途抛错，都落库 + jsonl，避免重启后看不到开单过程
             self._persist_action_log(account, action, steps, auto=auto, error=err)
 

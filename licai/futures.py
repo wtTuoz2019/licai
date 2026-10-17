@@ -348,6 +348,11 @@ class FuturesAPI:
         symbol = symbol.upper()
         long_qty = short_qty = long_pnl = short_pnl = long_entry = short_entry = Decimal("0")
         leverage = 0
+        step = Decimal("0")
+        try:
+            _, step = self.filters(symbol)
+        except Exception:
+            step = Decimal("0")
         for row in rows or []:
             row_sym = str(row.get("symbol") or "").upper()
             if row_sym and row_sym != symbol:
@@ -377,6 +382,10 @@ class FuturesAPI:
                 if entry <= 0 and qty > 0 and mark > 0:
                     entry = mark + (pnl / qty)
                 short_entry = entry if entry > 0 else short_entry
+        # 按步进抹掉不可成交的粉尘差，避免永久 IMBALANCE 却补不了
+        if step > 0:
+            long_qty = self.round_qty(long_qty, step)
+            short_qty = self.round_qty(short_qty, step)
         return HedgeLegs(long_qty, short_qty, long_pnl, short_pnl, long_entry, short_entry, leverage)
 
     def available_usdt(self) -> Decimal:

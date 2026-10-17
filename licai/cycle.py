@@ -639,7 +639,7 @@ class HedgeCycle:
             self.settle_asset = old_settle
 
     def rescue_naked_symbol(self, symbol: str) -> list[StepResult]:
-        """旧币对只剩一边时市价平净。两边都在则不动。"""
+        """旧币对单边裸仓或数量不等：立刻市价平净/削齐，不等交叉。"""
         symbol = (symbol or "").upper()
         if not symbol:
             return []
@@ -651,6 +651,19 @@ class HedgeCycle:
                 legs = self.futures.legs(symbol)
             except Exception as exc:
                 return [StepResult("旧仓单边检查", False, f"{symbol} 读仓失败：{exc}")]
+            miss = legs.missing_side
+            if miss is None or (legs.long_qty <= 0 and legs.short_qty <= 0):
+                return []
+            if miss == "IMBALANCE":
+                steps = [
+                    StepResult(
+                        "旧仓数量不等",
+                        True,
+                        f"{symbol} 多空不等，立刻削齐：{self._legs_text(legs)}",
+                    )
+                ]
+                steps.extend(self._flatten_if_naked())
+                return steps
             if (legs.long_qty > 0) == (legs.short_qty > 0):
                 return []
             steps = [
@@ -1084,15 +1097,14 @@ class HedgeCycle:
                     refill_steps = self._quote_side(order, miss, qty, reduce_only=False)
                     out.extend(refill_steps)
                     after = self.futures.legs(self.symbol)
-                    if after.missing_side is None or (
-                        (miss == "SHORT" and after.short_qty > 0) or (miss == "LONG" and after.long_qty > 0)
-                    ):
+                    # 必须真正齐仓；仅「缺的那边有一点量」仍可能是 IMBALANCE，不算到位
+                    if after.missing_side is None:
                         if any(_no_margin(item) for item in refill_steps):
                             out.append(
                                 StepResult(
                                     "补仓已齐",
                                     True,
-                                    f"过程中曾 -2019，但 {miss} 已到位：{self._legs_text(after)}",
+                                    f"过程中曾 -2019，但对冲已齐：{self._legs_text(after)}",
                                 )
                             )
                     elif any(_no_margin(item) for item in refill_steps):
@@ -1109,12 +1121,14 @@ class HedgeCycle:
         finally:
             try:
                 legs = self.futures.legs(self.symbol)
-                if (legs.long_qty > 0) != (legs.short_qty > 0):
+                if legs.missing_side is None or (legs.long_qty <= 0 and legs.short_qty <= 0):
+                    pass
+                else:
                     out.append(
                         StepResult(
                             "裸仓兜底",
                             False,
-                            f"仍单边，市价平掉避免爆仓：{self._legs_text(legs)}",
+                            f"仍有缺口，市价削平/平掉避免敞口：{self._legs_text(legs)}",
                         )
                     )
                     out.extend(self._flatten_if_naked())
@@ -1123,7 +1137,7 @@ class HedgeCycle:
         return out
 
     def emergency_hedge_guard(self) -> list[StepResult]:
-        """收利/动作异常后的裸仓守卫：有单边就补或平。不向外抛异常。"""
+        """收利/动作异常后的守卫：单边补或平；数量不等则削齐。不向外抛异常。"""
         try:
             legs = self.futures.legs(self.symbol)
         except Exception as exc:
@@ -1132,6 +1146,10 @@ class HedgeCycle:
             return []
         if legs.long_qty <= 0 and legs.short_qty <= 0:
             return []
+        if legs.missing_side == "IMBALANCE":
+            return [
+                StepResult("裸仓守卫", True, f"检测到数量不等，强制削齐：{self._legs_text(legs)}")
+            ] + self._flatten_if_naked()
         qty = legs.long_qty if legs.long_qty > 0 else legs.short_qty
         closed = "SHORT" if legs.long_qty > 0 and legs.short_qty <= 0 else "LONG"
         return [
@@ -1412,6 +1430,20 @@ class HedgeCycle:
                     max(legs.long_qty, legs.short_qty), True, market=True, aggressive=True, flatten=True
                 )
             )
+            self._wait_until(
+                lambda: self.futures.legs(self.symbol).missing_side is None,
+                timeout=1.0,
+            )
+            after = self.futures.legs(self.symbol)
+            if after.missing_side is None:
+                steps.append(StepResult("对冲已齐", True, self._legs_text(after)))
+            else:
+                steps.extend(self._flatten_if_naked())
+                after = self.futures.legs(self.symbol)
+                if after.missing_side is not None and not (
+                    after.long_qty <= 0 and after.short_qty <= 0
+                ):
+                    steps.append(StepResult("收利后仍缺口", False, self._legs_text(after)))
         return steps
 
     def _refill_margin_buffer(self, refill_qty: Decimal) -> Decimal:
@@ -1850,8 +1882,18 @@ class HedgeCycle:
                 steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
             return steps
         if legs.long_qty > 0 and legs.short_qty > 0:
-            steps.append(StepResult("数量仍不一致", True, "市价补腿后仍不等，平掉多出来的一边"))
+            steps.append(StepResult("数量仍不一致", False, "市价补腿后仍不等，平掉多出来的一边"))
             steps.extend(self._hedge_pass(Decimal("0"), True, market=True, aggressive=True, flatten=True))
+            self._wait_until(
+                lambda: self.futures.legs(self.symbol).missing_side is None,
+                timeout=1.0,
+            )
+            legs = self.futures.legs(self.symbol)
+            if legs.missing_side is None:
+                steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
+                return steps
+            # 削不平则继续走 flatten（含 IMBALANCE 削重腿）
+            steps.extend(self._flatten_if_naked())
             legs = self.futures.legs(self.symbol)
             if legs.missing_side is None:
                 steps.append(StepResult("对冲平衡", True, self._legs_text(legs)))
@@ -1864,6 +1906,7 @@ class HedgeCycle:
         return steps
 
     def _flatten_if_naked(self) -> list[StepResult]:
+        """单边裸仓市价平净；多空数量不等则先削重腿。绝不对 IMBALANCE 空返回。"""
         steps: list[StepResult] = []
         for _ in range(3):
             try:
@@ -1876,6 +1919,30 @@ class HedgeCycle:
                 return steps
             if legs.missing_side is None:
                 return steps
+            if legs.long_qty > 0 and legs.short_qty > 0 and legs.long_qty != legs.short_qty:
+                steps.append(
+                    StepResult(
+                        "数量拉平",
+                        True,
+                        f"收尾削重腿：{self._legs_text(legs)}",
+                    )
+                )
+                steps.extend(
+                    self._hedge_pass(
+                        max(legs.long_qty, legs.short_qty),
+                        True,
+                        market=True,
+                        aggressive=True,
+                        flatten=True,
+                    )
+                )
+                self._wait_until(
+                    lambda: self.futures.legs(self.symbol).missing_side is None,
+                    timeout=1.0,
+                )
+                if self.futures.legs(self.symbol).missing_side is None:
+                    return steps
+                continue
             bid, ask = self.futures.book(self.symbol, force=True)
             tick, step = self.futures.filters(self.symbol)
             if legs.long_qty > 0 and legs.short_qty <= 0:
@@ -1887,6 +1954,7 @@ class HedgeCycle:
                 px = self.futures.round_price(ask, tick)
                 steps.append(self._place("BUY", "SHORT", qty, px, True, market=True))
             else:
+                steps.append(StepResult("收尾无解", False, self._legs_text(legs)))
                 return steps
             flat = self._wait_until(
                 lambda: (
@@ -2848,6 +2916,10 @@ class HedgeCycle:
             steps.append(self._place("BUY", "LONG", diff, ask, False, market=True))
         else:
             steps.append(self._place("SELL", "SHORT", diff, bid, False, market=True))
+        self._wait_until(
+            lambda: self.futures.legs(self.symbol).missing_side is None,
+            timeout=1.0,
+        )
         return steps
 
     def _add_both(self, add: Decimal) -> list[StepResult]:

@@ -199,10 +199,12 @@ class AutoHarvestWorker:
                 _print(f"迁仓挂起取消 account={account.id}：旧仓已清")
                 return True
 
+            # 单边或数量不等都立刻救；BOTH 且等量才继续等交叉
             naked = [
                 str(r.get("symbol") or "")
                 for r in others
-                if str(r.get("side") or "").upper() in {"LONG", "SHORT"} and r.get("symbol")
+                if str(r.get("side") or "").upper() in {"LONG", "SHORT", "IMBALANCE"}
+                and r.get("symbol")
             ]
             if naked:
                 try:
@@ -479,6 +481,13 @@ class AutoHarvestWorker:
             live = self.ops.monitor(account)
             if not live.get("ok"):
                 return
+            legs = live.get("legs") or {}
+            missing = legs.get("missing")
+            # 当前币对有缺口：无论是否迁仓待命，都先补齐，禁止带着敞口干等
+            if missing in {"LONG", "SHORT", "IMBALANCE"}:
+                if self._maybe_repair_hedge(account, live):
+                    did_trade = True
+                return
             # 旧套保还在：只走迁仓，禁止在新币对上空开/收利/加仓
             others = live.get("other_positions") or []
             if others or (live.get("harvest") or {}).get("migrate"):
@@ -492,15 +501,15 @@ class AutoHarvestWorker:
                 live = self.ops.monitor(account)
                 if not live.get("ok"):
                     return
-            legs = live.get("legs") or {}
+                legs = live.get("legs") or {}
+                missing = legs.get("missing")
+                if missing in {"LONG", "SHORT", "IMBALANCE"}:
+                    if self._maybe_repair_hedge(account, live):
+                        did_trade = True
+                    return
             flat = _qty(legs, "long_qty") <= 0 and _qty(legs, "short_qty") <= 0
-            missing = legs.get("missing")
             if flat:
                 if self._maybe_enter(account, live):
-                    did_trade = True
-            elif missing in {"LONG", "SHORT", "IMBALANCE"}:
-                # 对冲缺口优先于收利/加仓：立刻强行补齐，避免带着敞口继续跑
-                if self._maybe_repair_hedge(account, live):
                     did_trade = True
             else:
                 # 有仓且已齐：优先收利；否则在好时机自动加仓
@@ -603,9 +612,7 @@ class AutoHarvestWorker:
         return True
 
     def _maybe_repair_hedge(self, account, live: dict) -> bool:
-        """多空缺口（缺一边或数量不等）：不等平稳/交叉，立刻强行补齐。"""
-        if self.ops.migrate_arm(account.id):
-            return False
+        """多空缺口（缺一边或数量不等）：不等平稳/交叉，立刻强行补齐。迁仓待命中也要修当前币对。"""
         missing = (live.get("legs") or {}).get("missing")
         _print(f"自动补齐对冲 account={account.id} missing={missing}")
         result = self.ops.run_action(
