@@ -494,11 +494,16 @@ class AutoHarvestWorker:
                     return
             legs = live.get("legs") or {}
             flat = _qty(legs, "long_qty") <= 0 and _qty(legs, "short_qty") <= 0
+            missing = legs.get("missing")
             if flat:
                 if self._maybe_enter(account, live):
                     did_trade = True
+            elif missing in {"LONG", "SHORT", "IMBALANCE"}:
+                # 对冲缺口优先于收利/加仓：立刻强行补齐，避免带着敞口继续跑
+                if self._maybe_repair_hedge(account, live):
+                    did_trade = True
             else:
-                # 有仓：优先收利；否则在好时机自动加仓
+                # 有仓且已齐：优先收利；否则在好时机自动加仓
                 if self._maybe_harvest(account, live):
                     did_trade = True
                 elif self._maybe_scale(account, live):
@@ -595,6 +600,31 @@ class AutoHarvestWorker:
             if not soft:
                 self._remember_cross(account.id)
         _print(f"自动加仓结束 account={account.id} ok={ok} {detail[:500]}")
+        return True
+
+    def _maybe_repair_hedge(self, account, live: dict) -> bool:
+        """多空缺口（缺一边或数量不等）：不等平稳/交叉，立刻强行补齐。"""
+        if self.ops.migrate_arm(account.id):
+            return False
+        missing = (live.get("legs") or {}).get("missing")
+        _print(f"自动补齐对冲 account={account.id} missing={missing}")
+        result = self.ops.run_action(
+            account,
+            "enter",
+            force=True,
+            mode="force",
+            _locked=True,
+            auto=True,
+            with_snapshot=False,
+        )
+        ok = bool(result.get("ok"))
+        detail = result.get("reason") or ""
+        steps = result.get("steps") or []
+        if steps:
+            fails = [s for s in steps if not s.get("ok")]
+            pick = fails or steps[-4:]
+            detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+        _print(f"自动补齐对冲结束 account={account.id} ok={ok} {detail[:500]}")
         return True
 
     def _maybe_enter(self, account, live: dict) -> bool:
