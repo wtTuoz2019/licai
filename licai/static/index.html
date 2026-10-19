@@ -1540,40 +1540,40 @@
       const scaleBtn = $("btn-scale");
       const scaleEdit = $("scale-edit");
       const autoScaleBox = $("auto-scale");
-      const hasHedge =
-        toNum(legs.long_qty) > 0 && toNum(legs.short_qty) > 0 && !legs.missing;
-      if (scaleBox) scaleBox.hidden = !hasHedge;
-      if (autoScaleBox && document.activeElement !== autoScaleBox) {
-        autoScaleBox.checked = !!accLive.auto_scale;
-      }
-      if (scaleEdit && document.activeElement !== scaleEdit) {
-        scaleEdit.value =
-          accLive.scale_add_qty != null && Number(accLive.scale_add_qty) > 0
-            ? accLive.scale_add_qty
-            : "";
-      }
-      if (scaleEl) {
-        const parts = [];
-        if (accLive.auto_scale && accLive.scale_add_qty && Number(accLive.scale_add_qty) > 0) {
-          parts.push(
-            `已挂起两边各加 ${accLive.scale_add_qty}，等金叉/死叉与平稳后自动加一次；成功后自动关闭`
-          );
-        } else if (accLive.scale_add_qty && Number(accLive.scale_add_qty) > 0) {
-          parts.push(`已保存两边各加 ${accLive.scale_add_qty}（勾选自动加仓后才会挂起）`);
+      // 没有可加空间时不展示加仓设置/数字，避免误以为还能设
+      const canScale = !!en.scale_ok;
+      if (scaleBox) scaleBox.hidden = !canScale;
+      if (canScale) {
+        if (autoScaleBox && document.activeElement !== autoScaleBox) {
+          autoScaleBox.checked = !!accLive.auto_scale;
         }
-        if (en.scale_ok) {
+        if (scaleEdit && document.activeElement !== scaleEdit) {
+          scaleEdit.value =
+            accLive.scale_add_qty != null && Number(accLive.scale_add_qty) > 0
+              ? accLive.scale_add_qty
+              : "";
+        }
+        if (scaleEl) {
+          const parts = [];
+          if (accLive.auto_scale && accLive.scale_add_qty && Number(accLive.scale_add_qty) > 0) {
+            parts.push(
+              `已挂起两边各加 ${accLive.scale_add_qty}，等金叉/死叉与平稳后自动加一次；成功后自动关闭`
+            );
+          } else if (accLive.scale_add_qty && Number(accLive.scale_add_qty) > 0) {
+            parts.push(`已保存两边各加 ${accLive.scale_add_qty}（勾选自动加仓后才会挂起）`);
+          }
           parts.push(
             `可加仓：目标 ${en.target_qty}，现在 ${en.current_qty}，两边各加 ${en.add_qty}` +
               (en.uni_mmr ? `，uniMMR ${en.uni_mmr}` : "")
           );
-        } else if (hasHedge && en.reason) {
-          parts.push(en.reason);
+          scaleEl.textContent = parts.join(" · ");
         }
-        scaleEl.textContent = parts.join(" · ");
+      } else if (scaleEl) {
+        scaleEl.textContent = "";
       }
       if (scaleBtn) {
-        scaleBtn.disabled = !en.scale_ok;
-        scaleBtn.title = en.scale_ok
+        scaleBtn.disabled = !canScale;
+        scaleBtn.title = canScale
           ? (en.reason || "两边一起加仓（按保证金尽量加满）")
           : (en.reason || "当前不能加仓");
       }
