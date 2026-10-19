@@ -62,10 +62,16 @@ def _action_ok(steps: list[StepResult], *, error: Exception | None = None) -> bo
             if s.name in {"PostOnly 改价", "第二腿追价", "单边兜底", "挂单未齐", "本轮平仓挂单超时"}:
                 continue
             text = str(s.detail or "").lower()
+            name = str(s.name or "")
             # ReduceOnly 拒单但仓位已平，或理财代币划转失败但仓位已齐，不盖掉收利成功
             if "-2022" in text or "reduceonly" in text:
                 continue
             if "-3027" in text or "not a valid margin asset" in text:
+                continue
+            # BFUSD 等资产 earn-asset-transfer 常直接 -1100；钱已在理财计息，对冲已齐不算失败
+            if "-1100" in text or "illegal characters" in text:
+                continue
+            if "从理财转入统一账户" in name or name.endswith("暂留"):
                 continue
             # 其它失败（保证金不够、异常等）仍算失败
             return False

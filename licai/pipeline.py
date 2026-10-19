@@ -1128,6 +1128,12 @@ class Pipeline:
         )
         return [note, *self._spot_via_ldusdt(asset, amount)]
 
+    @staticmethod
+    def _earn_transfer_unsupported(exc_or_detail: object) -> bool:
+        """earn-asset-transfer 对部分资产（常见 BFUSD）直接 -1100，不是余额问题。"""
+        text = str(exc_or_detail or "").lower()
+        return "-1100" in text or "illegal characters" in text
+
     def _fund_earn_token(
         self, asset: str, amount: Decimal, *, allow_redeem_fallback: bool = False
     ) -> list[StepResult]:
@@ -1141,12 +1147,37 @@ class Pipeline:
                     f"{asset} {fmt_amount(amount)} < {fmt_amount(SPOT_MIN)}，不划转不赎回",
                 )
             ]
+        unsupported = False
         try:
             cap = self.futures.earn_to_pm_balance(asset)
         except BinanceAPIError as exc:
-            # -1100 等查询异常时仍按持仓量尝试转入，避免误走赎回
-            cap = amount
-            steps.append(StepResult(f"查询 {asset} 可转入", True, str(exc)))
+            if self._earn_transfer_unsupported(exc):
+                # 接口根本不认该资产：不必再 POST 划转（还会再吃一次 -1100 FAIL）
+                unsupported = True
+                cap = Decimal("0")
+                steps.append(
+                    StepResult(
+                        f"查询 {asset} 可转入",
+                        True,
+                        f"理财划转接口不支持 {asset}（{exc}），改暂留计息",
+                    )
+                )
+            else:
+                # 其它查询异常仍按持仓量尝试转入，避免误走赎回
+                cap = amount
+                steps.append(StepResult(f"查询 {asset} 可转入", True, str(exc)))
+        if unsupported:
+            if not allow_redeem_fallback:
+                steps.append(
+                    StepResult(
+                        f"{asset} 暂留",
+                        True,
+                        f"{asset} 不能走 earn-asset-transfer 入统一账户，留在理财继续计息",
+                    )
+                )
+                return steps
+            # 入场急需保证金：走赎回 → LDUSDT
+            return [*steps, *self._spot_via_ldusdt(asset, amount)]
         move = min(amount, cap) if cap > 0 else amount
         move = move.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
         if move >= SPOT_MIN:
@@ -1154,7 +1185,26 @@ class Pipeline:
                 f"{asset} {fmt_amount(move)} 从理财转入统一账户",
                 lambda qty=move: self.futures.earn_to_pm(asset, qty),
             )
-            steps.append(step)
+            if (not step.ok) and self._earn_transfer_unsupported(step.detail):
+                # 不把 -1100 留成 FAIL，避免收利已齐却整单显示失败
+                steps.append(
+                    StepResult(
+                        f"{asset} 划转入账跳过",
+                        True,
+                        f"理财划转接口不支持 {asset}（{step.detail}），暂留计息",
+                    )
+                )
+                if not allow_redeem_fallback:
+                    steps.append(
+                        StepResult(
+                            f"{asset} 暂留",
+                            True,
+                            f"{asset} 暂不能入统一账户，留在理财/现货继续计息（不赎回改低年化）",
+                        )
+                    )
+                    return steps
+            else:
+                steps.append(step)
             if step.ok and not step.dry_run:
                 self.earn.invalidate()
             if step.ok:
@@ -1165,13 +1215,14 @@ class Pipeline:
             else:
                 # 转入失败：默认留着继续吃利息，不赎回砸成 USDT 活期
                 if not allow_redeem_fallback:
-                    steps.append(
-                        StepResult(
-                            f"{asset} 暂留",
-                            True,
-                            f"{asset} 暂不能入统一账户，留在理财/现货继续计息（不赎回改低年化）",
+                    if not any(s.name == f"{asset} 暂留" for s in steps):
+                        steps.append(
+                            StepResult(
+                                f"{asset} 暂留",
+                                True,
+                                f"{asset} 暂不能入统一账户，留在理财/现货继续计息（不赎回改低年化）",
+                            )
                         )
-                    )
                     return steps
         if not allow_redeem_fallback:
             steps.append(
