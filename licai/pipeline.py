@@ -1849,9 +1849,14 @@ class Pipeline:
                 if (not full) and remaining < self.settings.switch_min_batch:
                     break
                 mmr, equity = self._mmr_equity()
-                batch = self._next_switch_batch(
-                    remaining, mmr, equity, full=full, hedge_open=hedge_open
-                )
+                # 理财/现货仓（非统一账户保证金）赎回不影响 uniMMR，可整笔换到更高年化
+                located = str((product.raw or {}).get("located") or "")
+                if located != "pm":
+                    batch = remaining
+                else:
+                    batch = self._next_switch_batch(
+                        remaining, mmr, equity, full=full, hedge_open=hedge_open
+                    )
                 if batch <= 0:
                     # 有对冲：绝不能因 MMR 不够/读失败而整笔强赎；无仓才允许清尾
                     if full and (not hedge_open) and remaining > 0:

@@ -255,13 +255,14 @@ class HedgeCycle:
         bought = _subscribed(steps)
         if bought and not self.settings.dry_run:
             time.sleep(max(int(self.settings.settle_seconds or 0), 3))
-        # 地区墙暂停后禁止 BFUSD 赎回空转；只尝试理财代币直接入统一账户
+        # 换年化后只尝试把 RWUSD/LDUSDT 直接划入统一账户。
+        # 禁止 BFUSD 赎回改走低年化 USDT 活期（会把刚换/待换的高收益仓砸掉）。
         if bought or self.pipeline.spot_needs_move():
             steps.extend(
                 self._fund_after_earn(
                     steps,
-                    check_idle_ldusdt=not paused,
-                    allow_redeem_fallback=not region_stop,
+                    check_idle_ldusdt=not paused and not region_stop,
+                    allow_redeem_fallback=False,
                 )
             )
         return steps
