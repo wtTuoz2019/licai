@@ -1914,7 +1914,8 @@
         payload.mode = "force";
       } else if (action === "scale") {
         const en = live.enter || {};
-        if (!en.scale_ok && !unstable) {
+        // 没有可加空间时一律拦住（含价格不稳），避免用理财总额误报「还能加」
+        if (!en.scale_ok) {
           setActionMsg(en.reason || "当前不能加仓");
           return;
         }

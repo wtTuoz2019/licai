@@ -210,6 +210,18 @@ def format_uni_mmr(mmr: Decimal, has_pos: bool) -> str:
     return fmt_amount(mmr, 4)
 
 
+def _sizing_collateral(risk: dict, fallback: Decimal = Decimal("0")) -> Decimal:
+    """开仓/加仓预估本金：与 cycle._scale_to_collateral 一致，优先 PM equity。
+
+    理财总额常大于统一账户权益（钱在赚币里），用 earn 会把「可加仓」算得过大，
+    确认框会显示还能加、点下去却已按安全上限开满。
+    """
+    equity = d(risk.get("equity") or 0)
+    if equity > 0:
+        return equity
+    return d(fallback or 0)
+
+
 def _events_payload(account_id: int, events) -> list[dict]:
     return [
         {
@@ -687,9 +699,8 @@ class OpsService:
                 stability = Stability(
                     settings.hedge_symbol, mid, Decimal("1"), Decimal("1"), Decimal("1"), False, "价格未刷新"
                 )
-            coll = d(data.get("collateral_usdt") or data.get("bfusd") or "0")
-            if coll <= 0:
-                coll = risk.get("equity") or Decimal("0")
+            fallback = d(data.get("collateral_usdt") or data.get("bfusd") or "0")
+            coll = _sizing_collateral(risk, fallback)
             fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
             last_harvest = self.store.last_ok_action_at(account.id, "harvest")
             sized = _sizing_settings(settings, legs)
@@ -782,12 +793,11 @@ class OpsService:
         except Exception as exc:
             return {"ok": False, "error": f"价格监控失败: {exc}"}
         last_harvest = self.store.last_ok_action_at(account.id, "harvest")
-        coll = Decimal("0")
+        fallback = Decimal("0")
         hit = self._snap_cache.get(account.id)
         if hit:
-            coll = d(hit[1].get("collateral_usdt") or hit[1].get("bfusd") or "0")
-        if coll <= 0:
-            coll = risk.get("equity") or Decimal("0")
+            fallback = d(hit[1].get("collateral_usdt") or hit[1].get("bfusd") or "0")
+        coll = _sizing_collateral(risk, fallback)
         fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
         sized = _sizing_settings(settings, legs)
         plan = position_plan(
@@ -897,9 +907,11 @@ class OpsService:
         risk = fetched.get("risk") or {"uni_mmr": Decimal("0"), "equity": Decimal("0"), "available": Decimal("0")}
         stability = fetched["stability"]
         spot_usdt = d(wallet.get("spot_usdt") or "0")
-        collateral = d(wallet.get("earn_total") or "0") + spot_usdt
+        # 页面「理财总额」仍展示 earn；算仓/加仓预估改用 PM equity，与真实加仓一致
+        earn_collateral = d(wallet.get("earn_total") or "0") + spot_usdt
         mmr = risk.get("uni_mmr") or Decimal("0")
         equity = risk.get("equity") or Decimal("0")
+        sizing_coll = _sizing_collateral(risk, earn_collateral)
         last_harvest = self.store.last_ok_action_at(account.id, "harvest")
         fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
         filters = fetched.get("filters")
@@ -908,7 +920,7 @@ class OpsService:
         plan = position_plan(
             sized,
             stability.mid,
-            collateral,
+            sizing_coll,
             legs,
             mmr,
             lambda q: futures.round_qty(q, step),
@@ -919,10 +931,10 @@ class OpsService:
             price_stability(futures, settings, purpose="harvest"),
             sized,
             last_harvest,
-            principal=collateral,
+            principal=sizing_coll,
             fee=fee,
             notional=_harvest_notional(
-                legs, stability.mid, plan, collateral=collateral, settings=sized
+                legs, stability.mid, plan, collateral=sizing_coll, settings=sized
             ),
         )
         enter = enter_advice(legs, stability, spot_usdt, plan)
@@ -948,7 +960,7 @@ class OpsService:
             "leverage": lev,
             "leverage_target": lev_tgt,
             "live_poll_seconds": int(settings.live_poll_seconds),
-            "collateral_usdt": fmt_amount(collateral, 4),
+            "collateral_usdt": fmt_amount(earn_collateral, 4),
             "spot_usdt": wallet.get("spot_usdt") or fmt_amount(spot_usdt, 4),
             "earn_total": wallet.get("earn_total") or "0",
             "usdt_flexible": wallet.get("usdt_flexible") or "0",
@@ -963,7 +975,7 @@ class OpsService:
             "next_buy": wallet.get("next_buy"),
             "uni_mmr": mmr_text,
             "pm_equity": margin.get("equity") or "0",
-            "account_total": margin.get("equity") or fmt_amount(collateral, 4),
+            "account_total": margin.get("equity") or fmt_amount(earn_collateral, 4),
             "margin": margin,
             "legs": self._legs_payload(legs),
             "other_positions": others,
