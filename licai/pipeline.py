@@ -248,12 +248,16 @@ class Pipeline:
         return total
 
     def _movable_holding_amount(self, product: FlexibleProduct, amount: Decimal) -> Decimal:
-        """统一账户里当保证金的仓，只能按可转回额度算可换数量；转不出的不要反复列入换年化。"""
+        """统一账户里当保证金的仓，只能按可转回额度算可换数量；转不出的不要反复列入换年化。
+
+        理财/现货里的 BFUSD、RWUSD（未标 located=pm）应整笔可赎可换，不能因
+        earn-asset-transfer -1100 被误判成「锁在统一账户」。
+        """
         if amount <= 0:
             return Decimal("0")
         located = str((product.raw or {}).get("located") or "")
-        in_pm = located == "pm" or product.kind in {"bfusd", "rwusd"}
-        if not in_pm:
+        # 只有明确在统一账户的仓才按可转回额度截断
+        if located != "pm":
             return amount
         try:
             legs = self.futures.legs(self.settings.hedge_symbol)
