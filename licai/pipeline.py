@@ -445,11 +445,14 @@ class Pipeline:
     def _region_blocked_detail(detail: object) -> bool:
         text = str(detail or "")
         low = text.lower()
+        # 到账时差/额度不足也会 -9000 + available balance，不能当成地区墙永久拉黑
+        if "available balance" in low or "higher than the available" in low:
+            return False
         return (
-            "-9000" in text
-            or "not available in your region" in low
+            "not available in your region" in low
             or "address verification" in low
             or "local regulations" in low
+            or ("-9000" in text and "available" not in low)
         )
 
     def _mark_asset_unavailable(self, asset: str, detail: object) -> bool:
