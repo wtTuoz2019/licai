@@ -79,7 +79,7 @@ class AutoHarvestWorker:
         if bool(getattr(self.ops.base, "auto_switch_earn", True)):
             extras.append("每日换低收益理财")
         if bool(getattr(self.ops.base, "auto_sweep_spot", True)):
-            extras.append("闲置现货自动申购")
+            extras.append("闲置保证金/现货自动申购最高年化")
         if bool(getattr(self.ops.base, "auto_scale", True)):
             extras.append("金叉/死叉自动加仓")
         extra = "；".join(extras) if extras else "无额外理财自动化"
@@ -527,22 +527,35 @@ class AutoHarvestWorker:
             self.ops.end_action(account.id)
 
     def _maybe_sweep_spot(self, account, live: dict) -> bool:
-        """现货闲置稳定币 → 申购理财并入统一账户。返回是否实际跑过申购。"""
+        """统一账户可转出闲置 U / 现货闲置 → 申购当前最高年化。返回是否实际跑过。"""
         if not bool(getattr(self.ops.base, "auto_sweep_spot", True)):
             return False
         spot = d(live.get("spot_usdt") or "0")
         if spot < 1:
-            # monitor 旧版可能没带 spot_usdt；再读快照缓存
             spot = self.ops._idle_spot(account)
-        # 其它稳定币闲置也从 wallet_status / holdings 难直接读；现货 USDT 是主路径
-        if spot < 1:
+        withdrawable = d(live.get("withdrawable_usdt") or "0")
+        if spot < 1 and withdrawable < 1:
+            # 实时探一下可转出，避免闲置 U 一直压在统一账户
+            try:
+                pipe = pipeline_for(account, self.ops.base, dry_run=True, ops=self.ops)
+                settle = str(getattr(pipe.settings, "hedge_symbol", "") or "")
+                from .config import settle_asset_of
+
+                asset = settle_asset_of(settle) or "USDT"
+                withdrawable = d(pipe.futures.max_withdraw(asset) or "0")
+            except Exception:
+                withdrawable = d("0")
+        if spot < 1 and withdrawable < 1:
             return False
-        _print(f"自动归集现货 account={account.id} spot_usdt={spot}")
+        _print(
+            f"自动归集闲置 account={account.id} spot_usdt={spot} "
+            f"withdrawable={withdrawable}"
+        )
         result = self.ops.run_action(
             account,
-            "enter",
+            "sweep",
             force=False,
-            mode="earn_only",
+            mode=None,
             _locked=True,
             auto=True,
             with_snapshot=False,
@@ -554,7 +567,7 @@ class AutoHarvestWorker:
             fails = [s for s in steps if not s.get("ok")]
             pick = fails or steps[-4:]
             detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
-        _print(f"自动归集现货结束 account={account.id} ok={ok} {detail[:500]}")
+        _print(f"自动归集闲置结束 account={account.id} ok={ok} {detail[:500]}")
         return True
 
     def _maybe_scale(self, account, live: dict) -> bool:

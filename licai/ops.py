@@ -1218,6 +1218,9 @@ class OpsService:
             run = lambda: cycle.switch_earn()
         elif action == "leverage":
             run = lambda: cycle.apply_leverage()
+        elif action in {"sweep", "recycle", "fund"}:
+            # 闲置保证金/现货 → 当前最高年化理财
+            run = lambda: cycle.recycle_idle_to_earn()
         else:
             run = lambda: cycle.setup_once(
                 force_hedge=force or mode == "force",
@@ -1307,7 +1310,19 @@ class OpsService:
         # 任何失败步骤都要记（含加仓跳过 FAIL）
         if any(not s.ok for s in steps):
             return False
-        soft_noise = {"仓位已满", "暂不加仓", "加仓跳过", "设置杠杆", "查询杠杆", "读取杠杆", "开始分批换产品", "暂停换产品", "本轮结束"}
+        soft_noise = {
+            "仓位已满",
+            "暂不加仓",
+            "加仓跳过",
+            "设置杠杆",
+            "查询杠杆",
+            "读取杠杆",
+            "开始分批换产品",
+            "暂停换产品",
+            "本轮结束",
+            "闲置保证金",
+            "归集理财",
+        }
         # 真正动过仓/理财才值得记（不含空泛的「换产品/加仓」字样）
         real_keys = (
             "随保证金加仓",
@@ -1327,6 +1342,7 @@ class OpsService:
             "迁仓",
             "转回",
             "转入统一",
+            "闲置保证金转现货",
         )
         has_real = False
         for s in steps:

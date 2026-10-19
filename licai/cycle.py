@@ -234,11 +234,13 @@ class HedgeCycle:
         return steps
 
     def switch_earn(self) -> list[StepResult]:
-        """只换理财：赎回较低年化（含山寨活期兑 USDT），申购当前最高，再划回统一账户。"""
+        """只换理财：先抽闲置保证金，再赎回较低年化，申购当前最高，再划回统一账户。"""
         legs = self.futures.legs(self.symbol)
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
+        steps: list[StepResult] = []
+        steps.extend(self.pipeline.pull_idle_margin_to_earn())
         # full=True：有仓仍守 uniMMR，但放宽单批/批次数，能一次换完就一次换完
-        steps = list(self.pipeline.switch_to_best(full=True, has_hedge=has_pos))
+        steps.extend(self.pipeline.switch_to_best(full=True, has_hedge=has_pos))
         if any(not s.ok for s in steps):
             return steps
         paused = any(s.name == "暂停换产品" for s in steps)
@@ -264,11 +266,41 @@ class HedgeCycle:
             )
         return steps
 
-    def _bootstrap_funds(self) -> list[StepResult]:
-        # 先把其它活期（如 USDT 活期）赎成当前最高年化产品，再扫现货申购并入金
+    def recycle_idle_to_earn(self) -> list[StepResult]:
+        """把统一账户可转出的闲置 U + 现货闲置，全部申购当前最高年化并尽量划回保证金。"""
         legs = self.futures.legs(self.symbol)
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
-        steps = list(self.pipeline.switch_to_best(full=not has_pos, has_hedge=has_pos))
+        steps: list[StepResult] = []
+        # 1) 先抽可转出的闲置保证金去买最高收益
+        pull = self.pipeline.pull_idle_margin_to_earn()
+        steps.extend(pull)
+        # 2) 再把低年化活期换成最高（有仓守 uniMMR）
+        try:
+            steps.extend(self.pipeline.switch_to_best(full=not has_pos, has_hedge=has_pos))
+        except Exception as exc:
+            steps.append(StepResult("换年化异常", False, str(exc)))
+        # 3) 扫残留现货
+        sweep = self.pipeline.sweep_spot_to_earn()
+        steps.extend(sweep)
+        bought = _subscribed(steps)
+        if bought and not self.settings.dry_run:
+            time.sleep(max(int(self.settings.settle_seconds or 0), 3))
+        if bought or self.pipeline.spot_needs_move():
+            steps.extend(
+                self._fund_after_earn(steps, check_idle_ldusdt=True, allow_redeem_fallback=False)
+            )
+        return steps
+
+    def _bootstrap_funds(self) -> list[StepResult]:
+        # 闲置保证金 → 最高年化；其它活期换高；扫现货；再入金
+        legs = self.futures.legs(self.symbol)
+        has_pos = legs.long_qty > 0 or legs.short_qty > 0
+        steps: list[StepResult] = []
+        steps.extend(self.pipeline.pull_idle_margin_to_earn())
+        try:
+            steps.extend(self.pipeline.switch_to_best(full=not has_pos, has_hedge=has_pos))
+        except Exception as exc:
+            steps.append(StepResult("换年化异常", True, str(exc)))
         # 换年化失败不拦住扫现货，否则闲置 U 会一直卡着（例如 RWUSD 地址验证 -9000）
         sweep = self.pipeline.sweep_spot_to_earn()
         steps.extend(sweep)

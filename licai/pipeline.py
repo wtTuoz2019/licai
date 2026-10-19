@@ -659,6 +659,85 @@ class Pipeline:
                 return free
             time.sleep(0.2)
 
+    def pull_idle_margin_to_earn(self) -> list[StepResult]:
+        """统一账户里可安全转出的结算币 → 现货 → 申购当前最高年化。
+
+        有对冲时按 uniMMR 安全线估额度，绝不抽干保证金；无仓则尽量转满。
+        """
+        steps: list[StepResult] = []
+        settle = settle_asset_of(self.settings.hedge_symbol) or self.settings.source_asset
+        asset = (settle or self.settings.source_asset or "USDT").upper()
+        try:
+            collect = self._mutate(
+                f"归集统一账户 {asset}",
+                lambda: self.futures.collect_to_margin(asset),
+            )
+            steps.append(collect)
+        except Exception as exc:
+            steps.append(StepResult(f"归集统一账户 {asset}", False, str(exc)))
+        try:
+            transferable = self.futures.max_withdraw(asset)
+        except BinanceAPIError as exc:
+            steps.append(StepResult(f"查询 {asset} 可转出", False, str(exc)))
+            return steps
+        transferable = max(transferable, Decimal("0"))
+        if transferable < SPOT_MIN:
+            steps.append(
+                StepResult(
+                    "闲置保证金",
+                    True,
+                    f"统一账户 {asset} 可转出 {fmt_amount(transferable, 4)}，不足 1，跳过",
+                )
+            )
+            return steps
+
+        has_hedge = False
+        try:
+            legs = self.futures.legs(self.settings.hedge_symbol)
+            has_hedge = legs.long_qty > 0 or legs.short_qty > 0
+        except Exception:
+            has_hedge = True  # 读仓失败偏保守
+        mmr = Decimal("0")
+        equity = Decimal("0")
+        try:
+            risk = self.futures.account_risk()
+            mmr = d(risk.get("uni_mmr") or 0)
+            equity = d(risk.get("equity") or 0)
+        except Exception:
+            pass
+        if has_hedge:
+            amount = self._switch_batch_amount(
+                transferable, mmr, equity, full=True, hedge_open=True
+            )
+        else:
+            amount = transferable
+        amount = amount.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+        if amount < SPOT_MIN:
+            steps.append(
+                StepResult(
+                    "闲置保证金",
+                    True,
+                    f"可转 {fmt_amount(transferable)} {asset}，但 uniMMR 安全线内可抽 "
+                    f"{fmt_amount(amount, 4)}，先留着保仓",
+                )
+            )
+            return steps
+
+        moved = self._mutate(
+            f"闲置保证金转现货 {fmt_amount(amount)} {asset}"
+            f"（可转 {fmt_amount(transferable)}，有仓守 uniMMR≥"
+            f"{fmt_amount(self.settings.switch_safe_uni_mmr, 2)}）",
+            lambda qty=amount: self.futures.unified_to_spot(asset, qty),
+        )
+        steps.append(moved)
+        if not moved.ok:
+            return steps
+        if not moved.dry_run:
+            self.earn.invalidate()
+            time.sleep(max(int(self.settings.settle_seconds or 0), 2))
+        steps.extend(self.sweep_spot_to_earn())
+        return steps
+
     def sweep_spot_to_earn(self, product: FlexibleProduct | None = None) -> list[StepResult]:
         steps: list[StepResult] = []
         # USDC 本位收利后现货是 USDC：先换成 USDT，再走原来的理财申购
