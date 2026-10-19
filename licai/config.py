@@ -150,6 +150,8 @@ class Settings:
     auto_switch_earn: bool = True
     auto_sweep_spot: bool = True
     auto_scale: bool = True
+    # 账户挂起的「两边各加」数量；>0 时 scale 按此额度加一次（仍受 uniMMR 上限）
+    pending_scale_qty: Decimal = Decimal("0")
     webshare_api_token: str = ""
     webshare_mode: str = "direct"
     webshare_country: str = ""
@@ -298,6 +300,7 @@ def settings_for_account(
     leverage_unlock_at: str | None = None,
     take_profit_usdt: float | None = None,
     take_profit_custom: bool = False,
+    pending_scale_qty: float | Decimal | None = None,
 ) -> Settings:
     symbol = normalize_hedge_symbol(hedge_symbol or base.hedge_symbol, base.hedge_symbols)
     target = int(hedge_leverage or base.hedge_leverage_target or base.hedge_leverage)
@@ -315,6 +318,9 @@ def settings_for_account(
     custom_tp = Decimal("0")
     if take_profit_custom and take_profit_usdt:
         custom_tp = d(take_profit_usdt)
+    pending = d(pending_scale_qty or 0)
+    if pending < 0:
+        pending = Decimal("0")
     return replace(
         base,
         api_key=api_key,
@@ -328,6 +334,7 @@ def settings_for_account(
         leverage_unlock_at=leverage_unlock_at,
         take_profit_usdt=custom_tp if custom_tp > 0 else Decimal("0"),
         take_profit_custom=bool(take_profit_custom and custom_tp > 0),
+        pending_scale_qty=pending,
     )
 
 

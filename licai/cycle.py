@@ -918,7 +918,9 @@ class HedgeCycle:
         steps.extend(self._quote_until_balanced(qty, reduce_only=False))
         return steps
 
-    def scale_once(self, force: bool = False) -> list[StepResult]:
+    def scale_once(
+        self, force: bool = False, *, pending_qty: Decimal | None = None
+    ) -> list[StepResult]:
         legs = self.futures.legs(self.symbol)
         if legs.missing_side is not None or legs.long_qty <= 0 or legs.short_qty <= 0:
             return [StepResult("加仓跳过", False, f"对冲不齐，先入场补仓：{self._legs_text(legs)}")]
@@ -935,7 +937,7 @@ class HedgeCycle:
                         "价格不稳。要加仓请选「强行加仓」",
                     )
                 ]
-        return self._scale_to_collateral()
+        return self._scale_to_collateral(pending_qty=pending_qty)
 
     def _watch_loop(self, steps: list[StepResult]) -> list[StepResult]:
         print("进入盯盘，Ctrl+C 结束")
@@ -2860,7 +2862,7 @@ class HedgeCycle:
             return legs.short_qty
         return self._collateral_qty()
 
-    def _scale_to_collateral(self) -> list[StepResult]:
+    def _scale_to_collateral(self, pending_qty: Decimal | None = None) -> list[StepResult]:
         if self.settings.hedge_qty > 0:
             return []
         if self.settings.dry_run:
@@ -2903,10 +2905,35 @@ class HedgeCycle:
             available=available,
         )
         target = d(plan["target_qty"])
-        add = self.futures.round_qty(target - current, step)
+        room = self.futures.round_qty(target - current, step)
         min_add = max(step, current * self.settings.scale_min_add_pct)
+        mmr_text = plan.get("uni_mmr") or fmt_amount(mmr)
+        want = d(pending_qty or 0)
+        if want > 0:
+            want = self.futures.round_qty(want, step)
+            add = min(want, room) if room > 0 else Decimal("0")
+            if add < step or (room < min_add and add < min_add):
+                return prep + [
+                    StepResult(
+                        "暂不加仓",
+                        True,
+                        f"挂起两边各加 {fmt_amount(want)}，当前可加空间 {fmt_amount(room)} "
+                        f"（目标 {fmt_amount(target)} / 现在 {fmt_amount(current)}，uniMMR={mmr_text}），继续等",
+                    )
+                ]
+            steps = [
+                StepResult(
+                    "挂起加仓",
+                    True,
+                    f"两边各加 {fmt_amount(add)}"
+                    + (f"（挂起 {fmt_amount(want)}，受安全上限截断）" if add + step < want else f"（挂起 {fmt_amount(want)}）")
+                    + f"，uniMMR={mmr_text}，目标上限 {fmt_amount(target)}",
+                )
+            ]
+            steps.extend(self._add_both(add))
+            return prep + steps
+        add = room
         if add < min_add:
-            mmr_text = plan.get("uni_mmr") or fmt_amount(mmr)
             return prep + [
                 StepResult(
                     "仓位已满",
@@ -2914,7 +2941,6 @@ class HedgeCycle:
                     f"当前 {fmt_amount(current)}，目标 {fmt_amount(target)}，uniMMR={mmr_text}，已按安全上限开满",
                 )
             ]
-        mmr_text = plan.get("uni_mmr") or fmt_amount(mmr)
         steps = [
             StepResult(
                 "随保证金加仓",

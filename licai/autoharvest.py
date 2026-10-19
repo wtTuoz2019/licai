@@ -80,8 +80,7 @@ class AutoHarvestWorker:
             extras.append("每日换低收益理财")
         if bool(getattr(self.ops.base, "auto_sweep_spot", True)):
             extras.append("闲置保证金/现货自动申购最高年化")
-        if bool(getattr(self.ops.base, "auto_scale", True)):
-            extras.append("金叉/死叉自动加仓")
+        extras.append("账户挂起自动加仓（金叉/死叉+平稳加一次）")
         extra = "；".join(extras) if extras else "无额外理财自动化"
         _print(f"自动收利后台已启动（{note}；{extra}）")
 
@@ -126,12 +125,17 @@ class AutoHarvestWorker:
                 self._maybe_armed_migrate(account)
             except Exception:
                 log.exception("账号 %s 挂起迁仓检查失败", account.id)
-            if not account.auto_harvest:
+            pending_scale = (
+                bool(getattr(account, "auto_scale", False))
+                and account.scale_add_qty is not None
+                and float(account.scale_add_qty) > 0
+            )
+            if not account.auto_harvest and not pending_scale:
                 continue
             try:
                 self._maybe_act(account)
             except Exception:
-                log.exception("账号 %s 自动开仓/收利失败", account.id)
+                log.exception("账号 %s 自动开仓/收利/加仓失败", account.id)
 
     def _maybe_auto_arm_migrate(self, account) -> bool:
         """自动收利开启时：发现旧套保仓就挂起迁仓，等交叉+平稳后执行。"""
@@ -509,11 +513,11 @@ class AutoHarvestWorker:
                     return
             flat = _qty(legs, "long_qty") <= 0 and _qty(legs, "short_qty") <= 0
             if flat:
-                if self._maybe_enter(account, live):
+                if account.auto_harvest and self._maybe_enter(account, live):
                     did_trade = True
             else:
-                # 有仓且已齐：优先收利；否则在好时机自动加仓
-                if self._maybe_harvest(account, live):
+                # 有仓且已齐：优先收利；否则在好时机处理账户挂起加仓
+                if account.auto_harvest and self._maybe_harvest(account, live):
                     did_trade = True
                 elif self._maybe_scale(account, live):
                     did_trade = True
@@ -571,8 +575,15 @@ class AutoHarvestWorker:
         return True
 
     def _maybe_scale(self, account, live: dict) -> bool:
-        """有对冲且还能加：金叉/死叉与入场级平稳同时满足才加仓。"""
-        if not bool(getattr(self.ops.base, "auto_scale", True)):
+        """账户挂起了一次加仓：金叉/死叉与入场级平稳同时满足才加这一次。"""
+        if not bool(getattr(account, "auto_scale", False)):
+            return False
+        raw_qty = getattr(account, "scale_add_qty", None)
+        try:
+            pending = d(raw_qty) if raw_qty not in (None, "") else d("0")
+        except Exception:
+            pending = d("0")
+        if pending <= 0:
             return False
         if self.ops.migrate_arm(account.id):
             return False
@@ -594,8 +605,8 @@ class AutoHarvestWorker:
             if cross is None:
                 return False
         _print(
-            f"自动加仓触发 account={account.id} add={enter.get('add_qty')} "
-            f"target={enter.get('target_qty')} · {macd_note}"
+            f"挂起自动加仓触发 account={account.id} pending={pending} "
+            f"room={enter.get('add_qty')} target={enter.get('target_qty')} · {macd_note}"
         )
         result = self.ops.run_action(
             account,
@@ -613,15 +624,13 @@ class AutoHarvestWorker:
             fails = [s for s in steps if not s.get("ok")]
             pick = fails or steps[-4:]
             detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
-        if ok and bool(getattr(self.ops.base, "macd_auto_harvest", True)):
-            # 已满仓/暂不加 不算真正加仓，不能吃掉这根交叉
-            soft = any(
-                (s.get("name") or "") in {"仓位已满", "暂不加仓", "加仓跳过"}
-                for s in steps
-            )
-            if not soft:
-                self._remember_cross(account.id)
-        _print(f"自动加仓结束 account={account.id} ok={ok} {detail[:500]}")
+        soft = any(
+            (s.get("name") or "") in {"仓位已满", "暂不加仓", "加仓跳过"}
+            for s in steps
+        )
+        if ok and not soft and bool(getattr(self.ops.base, "macd_auto_harvest", True)):
+            self._remember_cross(account.id)
+        _print(f"挂起自动加仓结束 account={account.id} ok={ok} soft={soft} {detail[:500]}")
         return True
 
     def _maybe_repair_hedge(self, account, live: dict) -> bool:

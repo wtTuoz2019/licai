@@ -51,6 +51,8 @@ class AccountPatch(BaseModel):
     take_profit_usdt: float | None = None
     take_profit_custom: bool | None = None
     auto_harvest: bool | None = None
+    scale_add_qty: float | None = None
+    auto_scale: bool | None = None
     hedge_leverage: int | None = Field(default=None, ge=1, le=125)
     hidden: bool | None = None
 
@@ -201,6 +203,9 @@ def create_app() -> FastAPI:
                 take_profit_usdt=body.take_profit_usdt,
                 take_profit_custom=body.take_profit_custom,
                 auto_harvest=body.auto_harvest,
+                scale_add_qty=body.scale_add_qty,
+                scale_add_qty_set="scale_add_qty" in body.model_fields_set,
+                auto_scale=body.auto_scale,
                 hedge_leverage=body.hedge_leverage,
                 hedge_leverage_set="hedge_leverage" in body.model_fields_set,
                 hidden=body.hidden if "hidden" in body.model_fields_set else None,

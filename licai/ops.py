@@ -307,6 +307,7 @@ def pipeline_for(
         leverage_unlock_at=account.leverage_unlock_at,
         take_profit_usdt=account.take_profit_usdt,
         take_profit_custom=account.take_profit_custom,
+        pending_scale_qty=account.scale_add_qty,
     )
     pipe = Pipeline(settings)
     if ops is not None:
@@ -1213,7 +1214,29 @@ class OpsService:
                 auto=auto,
             )
         elif action == "scale":
-            run = lambda: cycle.scale_once(force=force or mode == "force")
+            # 自动挂起加仓：按账户填写的两边各加数量；手动加仓仍按保证金目标加满
+            pending_qty = None
+            if auto:
+                raw = getattr(account, "scale_add_qty", None)
+                try:
+                    pending_qty = d(raw) if raw not in (None, "") else None
+                except Exception:
+                    pending_qty = None
+                if (
+                    not getattr(account, "auto_scale", False)
+                    or pending_qty is None
+                    or pending_qty <= 0
+                ):
+                    return {
+                        "ok": True,
+                        "blocked": True,
+                        "reason": "未挂起自动加仓",
+                        "steps": [],
+                    }
+            run = lambda: cycle.scale_once(
+                force=force or mode == "force",
+                pending_qty=pending_qty,
+            )
         elif action == "switch":
             run = lambda: cycle.switch_earn()
         elif action == "leverage":
@@ -1280,6 +1303,25 @@ class OpsService:
                 fails = [f"{s.name}: {_detail(s.detail)}" for s in steps if not s.ok]
             if fails:
                 print(f"动作失败 account={account.id} action={action} " + " | ".join(fails)[:800])
+        # 挂起自动加仓：真正加到仓后清空数量并关闭开关；软跳过（满仓/暂不加）保留挂起
+        if ok and auto and action == "scale" and getattr(account, "auto_scale", False):
+            soft = any(
+                s.name in {"仓位已满", "暂不加仓", "加仓跳过"} for s in steps
+            )
+            # 「挂起加仓」只是计划步骤；须有实际成交步骤才清
+            traded = any(
+                s.ok and s.name in {"加仓完成", "加仓已拉齐", "加仓已削平"} for s in steps
+            )
+            if traded and not soft:
+                try:
+                    account = self.store.update(
+                        account.id,
+                        scale_add_qty=None,
+                        scale_add_qty_set=True,
+                        auto_scale=False,
+                    )
+                except Exception:
+                    print(f"清空挂起加仓失败 account={account.id}")
         # 默认在本动作全部步骤完成后再等落账拉快照；串联子动作可 with_snapshot=False，由外层统一刷
         if with_snapshot:
             snap = self.refresh_account_snapshot(account)
@@ -1292,6 +1334,7 @@ class OpsService:
             "live": True,
             "steps": steps_payload(steps),
             "snapshot": snap,
+            "account": account.public_dict() if hasattr(account, "public_dict") else None,
         }
 
     @staticmethod

@@ -592,6 +592,14 @@
             </label>
           </div>
           <div class="harvest-set" id="scale-box" hidden>
+            <label>每次加仓</label>
+            <input id="scale-edit" type="number" min="0" step="0.001" placeholder="数量" />
+            <span class="muted">两边各加</span>
+            <button type="button" id="btn-save-scale">保存</button>
+            <label class="auto-toggle" title="保存数量并勾选后，等金叉/死叉与入场级平稳同时满足加这一次；成功后自动关掉并清空数量。手动「加仓」仍按保证金尽量加满">
+              <input type="checkbox" id="auto-scale" />
+              自动加仓
+            </label>
             <span class="muted" id="scale-why"></span>
           </div>
         </div>
@@ -1530,24 +1538,44 @@
       const scaleBox = $("scale-box");
       const scaleEl = $("scale-why");
       const scaleBtn = $("btn-scale");
-      if (en.scale_ok) {
-        if (scaleBox) scaleBox.hidden = false;
-        if (scaleEl) {
-          scaleEl.textContent =
+      const scaleEdit = $("scale-edit");
+      const autoScaleBox = $("auto-scale");
+      const hasHedge =
+        toNum(legs.long_qty) > 0 && toNum(legs.short_qty) > 0 && !legs.missing;
+      if (scaleBox) scaleBox.hidden = !hasHedge;
+      if (autoScaleBox && document.activeElement !== autoScaleBox) {
+        autoScaleBox.checked = !!accLive.auto_scale;
+      }
+      if (scaleEdit && document.activeElement !== scaleEdit) {
+        scaleEdit.value =
+          accLive.scale_add_qty != null && Number(accLive.scale_add_qty) > 0
+            ? accLive.scale_add_qty
+            : "";
+      }
+      if (scaleEl) {
+        const parts = [];
+        if (accLive.auto_scale && accLive.scale_add_qty && Number(accLive.scale_add_qty) > 0) {
+          parts.push(
+            `已挂起两边各加 ${accLive.scale_add_qty}，等金叉/死叉与平稳后自动加一次；成功后自动关闭`
+          );
+        } else if (accLive.scale_add_qty && Number(accLive.scale_add_qty) > 0) {
+          parts.push(`已保存两边各加 ${accLive.scale_add_qty}（勾选自动加仓后才会挂起）`);
+        }
+        if (en.scale_ok) {
+          parts.push(
             `可加仓：目标 ${en.target_qty}，现在 ${en.current_qty}，两边各加 ${en.add_qty}` +
-            (en.uni_mmr ? `，uniMMR ${en.uni_mmr}` : "");
+              (en.uni_mmr ? `，uniMMR ${en.uni_mmr}` : "")
+          );
+        } else if (hasHedge && en.reason) {
+          parts.push(en.reason);
         }
-        if (scaleBtn) {
-          scaleBtn.disabled = false;
-          scaleBtn.title = en.reason || "两边一起加仓";
-        }
-      } else {
-        if (scaleBox) scaleBox.hidden = true;
-        if (scaleEl) scaleEl.textContent = "";
-        if (scaleBtn) {
-          scaleBtn.disabled = true;
-          scaleBtn.title = en.reason || "当前不能加仓";
-        }
+        scaleEl.textContent = parts.join(" · ");
+      }
+      if (scaleBtn) {
+        scaleBtn.disabled = !en.scale_ok;
+        scaleBtn.title = en.scale_ok
+          ? (en.reason || "两边一起加仓（按保证金尽量加满）")
+          : (en.reason || "当前不能加仓");
       }
       const st = s.stability || {};
       const pill = $("stable-pill");
@@ -2291,6 +2319,73 @@
         await pollLive();
       } catch (err) {
         $("auto-harvest").checked = !on;
+        setActionMsg(err.message);
+      } finally {
+        busy = false;
+      }
+    };
+    $("btn-save-scale").onclick = async () => {
+      if (!selected || busy) return;
+      const raw = ($("scale-edit").value || "").trim();
+      const value = raw === "" ? 0 : Number(raw);
+      if (!Number.isFinite(value) || value < 0) {
+        setActionMsg("请输入有效的加仓数量（两边各加）");
+        return;
+      }
+      busy = true;
+      try {
+        const body = value > 0
+          ? { scale_add_qty: value }
+          : { scale_add_qty: 0, auto_scale: false };
+        const acc = await api(`/api/accounts/${selected}`, {
+          method: "PATCH",
+          body: JSON.stringify(body),
+        });
+        if (snapHit(selected) && snapHit(selected).data) {
+          snapHit(selected).data.account = Object.assign(snapHit(selected).data.account || {}, acc);
+          persistFunds();
+        }
+        await pollLive();
+        setActionMsg(
+          value > 0
+            ? `已保存两边各加 ${value}（勾选自动加仓后挂起一次）`
+            : "已清空挂起加仓数量"
+        );
+      } catch (err) {
+        setActionMsg(err.message);
+      } finally {
+        busy = false;
+      }
+    };
+    $("auto-scale").onchange = async () => {
+      if (!selected || busy) return;
+      const on = !!$("auto-scale").checked;
+      const raw = ($("scale-edit").value || "").trim();
+      const qty = raw === "" ? 0 : Number(raw);
+      if (on && (!Number.isFinite(qty) || qty <= 0)) {
+        $("auto-scale").checked = false;
+        setActionMsg("请先填写并保存每次加仓数量");
+        return;
+      }
+      busy = true;
+      try {
+        const body = on
+          ? { auto_scale: true, scale_add_qty: qty }
+          : { auto_scale: false };
+        const acc = await api(`/api/accounts/${selected}`, {
+          method: "PATCH",
+          body: JSON.stringify(body),
+        });
+        if (snapHit(selected) && snapHit(selected).data) {
+          snapHit(selected).data.account = Object.assign(snapHit(selected).data.account || {}, acc);
+          persistFunds();
+        }
+        setActionMsg(on
+          ? `已挂起两边各加 ${acc.scale_add_qty || qty}，等金叉/死叉与平稳后自动加一次`
+          : "已关闭自动加仓（数量仍保留）");
+        await pollLive();
+      } catch (err) {
+        $("auto-scale").checked = !on;
         setActionMsg(err.message);
       } finally {
         busy = false;

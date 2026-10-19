@@ -28,6 +28,8 @@ class Account:
     take_profit_usdt: float | None = None
     take_profit_custom: bool = False
     auto_harvest: bool = False
+    scale_add_qty: float | None = None
+    auto_scale: bool = False
     hidden: bool = False
 
     def public_dict(self) -> dict:
@@ -45,6 +47,8 @@ class Account:
             "take_profit_usdt": self.take_profit_usdt if self.take_profit_usdt else None,
             "take_profit_custom": bool(self.take_profit_custom),
             "auto_harvest": bool(self.auto_harvest),
+            "scale_add_qty": self.scale_add_qty if self.scale_add_qty else None,
+            "auto_scale": bool(self.auto_scale),
             "hidden": bool(self.hidden),
         }
 
@@ -120,6 +124,10 @@ class AccountStore:
                 conn.execute("ALTER TABLE accounts ADD COLUMN take_profit_custom INTEGER NOT NULL DEFAULT 0")
             if "auto_harvest" not in cols:
                 conn.execute("ALTER TABLE accounts ADD COLUMN auto_harvest INTEGER NOT NULL DEFAULT 0")
+            if "scale_add_qty" not in cols:
+                conn.execute("ALTER TABLE accounts ADD COLUMN scale_add_qty TEXT")
+            if "auto_scale" not in cols:
+                conn.execute("ALTER TABLE accounts ADD COLUMN auto_scale INTEGER NOT NULL DEFAULT 0")
             if "hedge_leverage" not in cols:
                 conn.execute("ALTER TABLE accounts ADD COLUMN hedge_leverage INTEGER")
             if "hidden" not in cols:
@@ -168,6 +176,9 @@ class AccountStore:
         take_profit_usdt: float | None = None,
         take_profit_custom: bool | None = None,
         auto_harvest: bool | None = None,
+        scale_add_qty: float | None = None,
+        scale_add_qty_set: bool = False,
+        auto_scale: bool | None = None,
         hedge_leverage: int | None = None,
         hedge_leverage_set: bool = False,
         hidden: bool | None = None,
@@ -196,13 +207,25 @@ class AccountStore:
         elif take_profit_custom is True and account.take_profit_usdt:
             next_custom = True
         next_auto = account.auto_harvest if auto_harvest is None else bool(auto_harvest)
+        next_scale_qty = account.scale_add_qty
+        if scale_add_qty_set:
+            if scale_add_qty is None or float(scale_add_qty) <= 0:
+                next_scale_qty = None
+            else:
+                next_scale_qty = float(scale_add_qty)
+        next_auto_scale = account.auto_scale if auto_scale is None else bool(auto_scale)
+        # 打开自动加仓但没数量：不允许；关掉自动加仓可保留数量供下次
+        if next_auto_scale and not (next_scale_qty and next_scale_qty > 0):
+            next_auto_scale = False
         next_lev = account.hedge_leverage
         if hedge_leverage_set:
             next_lev = int(hedge_leverage) if hedge_leverage and int(hedge_leverage) > 0 else None
         next_hidden = account.hidden if hidden is None else bool(hidden)
         with self._connect() as conn:
             conn.execute(
-                "UPDATE accounts SET name = ?, api_key = ?, api_secret = ?, proxy = ?, hedge_symbol = ?, take_profit_usdt = ?, take_profit_custom = ?, auto_harvest = ?, hedge_leverage = ?, hidden = ? WHERE id = ?",
+                "UPDATE accounts SET name = ?, api_key = ?, api_secret = ?, proxy = ?, hedge_symbol = ?, "
+                "take_profit_usdt = ?, take_profit_custom = ?, auto_harvest = ?, "
+                "scale_add_qty = ?, auto_scale = ?, hedge_leverage = ?, hidden = ? WHERE id = ?",
                 (
                     next_name,
                     next_key,
@@ -212,6 +235,8 @@ class AccountStore:
                     str(next_tp) if next_tp else None,
                     1 if next_custom else 0,
                     1 if next_auto else 0,
+                    str(next_scale_qty) if next_scale_qty else None,
+                    1 if next_auto_scale else 0,
                     next_lev,
                     1 if next_hidden else 0,
                     account_id,
@@ -313,6 +338,16 @@ class AccountStore:
         if not custom and tp is not None:
             custom = True
         raw_auto = row["auto_harvest"] if "auto_harvest" in keys else None
+        raw_scale_qty = row["scale_add_qty"] if "scale_add_qty" in keys else None
+        scale_qty = None
+        if raw_scale_qty not in (None, ""):
+            try:
+                scale_qty = float(raw_scale_qty)
+            except (TypeError, ValueError):
+                scale_qty = None
+            if scale_qty is not None and scale_qty <= 0:
+                scale_qty = None
+        raw_auto_scale = row["auto_scale"] if "auto_scale" in keys else None
         raw_lev = row["hedge_leverage"] if "hedge_leverage" in keys else None
         lev = int(raw_lev) if raw_lev else None
         return Account(
@@ -329,5 +364,7 @@ class AccountStore:
             take_profit_usdt=tp,
             take_profit_custom=custom,
             auto_harvest=bool(int(raw_auto or 0)),
+            scale_add_qty=scale_qty,
+            auto_scale=bool(int(raw_auto_scale or 0)),
             hidden=bool(int(row["hidden"] or 0)) if "hidden" in keys else False,
         )
