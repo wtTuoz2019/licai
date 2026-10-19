@@ -706,7 +706,7 @@ class Pipeline:
         except Exception:
             pass
         if has_hedge:
-            amount = self._switch_batch_amount(
+            amount = self._next_switch_batch(
                 transferable, mmr, equity, full=True, hedge_open=True
             )
         else:
