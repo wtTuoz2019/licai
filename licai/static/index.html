@@ -276,6 +276,7 @@
       margin-top: 8px;
       flex-wrap: wrap;
     }
+    .harvest-set[hidden] { display: none !important; }
     .harvest-set label { margin: 0; }
     .harvest-set input[type="number"] {
       width: 88px;
@@ -1540,8 +1541,10 @@
       const scaleBtn = $("btn-scale");
       const scaleEdit = $("scale-edit");
       const autoScaleBox = $("auto-scale");
-      // 没有可加空间时不展示加仓设置/数字，避免误以为还能设
-      const canScale = !!en.scale_ok;
+      // 没开仓、或已到安全上限加不了：整行不显示（含输入和可加仓数字）
+      const hasHedge =
+        toNum(legs.long_qty) > 0 && toNum(legs.short_qty) > 0 && !legs.missing;
+      const canScale = hasHedge && !!en.scale_ok;
       if (scaleBox) scaleBox.hidden = !canScale;
       if (canScale) {
         if (autoScaleBox && document.activeElement !== autoScaleBox) {
