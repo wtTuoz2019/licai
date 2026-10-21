@@ -210,6 +210,17 @@ def format_uni_mmr(mmr: Decimal, has_pos: bool) -> str:
     return fmt_amount(mmr, 4)
 
 
+def relative_earn_apy(income: Decimal, principal: Decimal) -> str:
+    """相对年化：实际理财收入（日）× 365 / 账户权益。
+
+    理财当保证金、用合约放大后，分母是权益本金而不是理财面额，所以会高于产品挂牌利率。
+    """
+    if income <= 0 or principal <= 0:
+        return ""
+    pct = income * Decimal(365) / principal * Decimal(100)
+    return f"{pct:.2f}%"
+
+
 def _sizing_collateral(risk: dict, fallback: Decimal = Decimal("0")) -> Decimal:
     """开仓/加仓预估本金：与 cycle._scale_to_collateral 一致，优先 PM equity。
 
@@ -966,7 +977,7 @@ class OpsService:
             "usdt_flexible": wallet.get("usdt_flexible") or "0",
             "usdt_flexible_label": wallet.get("usdt_flexible_label") or "USDT 活期",
             "bfusd": wallet.get("bfusd") or "0",
-            "earn_apy": wallet.get("earn_apy") or "",
+            "earn_apy": relative_earn_apy(d(wallet.get("earn_yesterday") or 0), equity),
             "earn_yesterday": wallet.get("earn_yesterday") or "0",
             "earn_yesterday_source": wallet.get("earn_yesterday_source") or "none",
             "earn_yesterday_day": wallet.get("earn_yesterday_day") or "",

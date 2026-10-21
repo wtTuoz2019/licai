@@ -955,8 +955,6 @@ class Pipeline:
         other = Decimal("0")
         flex_label = "USDT 活期"
         holdings = []
-        apy_num = Decimal("0")
-        apy_den = Decimal("0")
         for product, amount in holdings_raw:
             if product.kind == "bfusd":
                 bfusd += amount
@@ -972,9 +970,6 @@ class Pipeline:
                 other += amount
                 label = product.margin_token or product.asset
             apr_pct = position_apr_percent(product, amount)
-            if amount > 0 and apr_pct > 0:
-                apy_num += amount * apr_pct
-                apy_den += amount
             holdings.append(
                 {
                     "label": label,
@@ -985,7 +980,6 @@ class Pipeline:
                     "product_id": product.product_id,
                 }
             )
-        earn_apy = f"{(apy_num / apy_den):.2f}%" if apy_den > 0 else ""
         next_buy = None
         if spot >= SPOT_MIN:
             try:
@@ -1016,7 +1010,6 @@ class Pipeline:
             "usdt_flexible_label": flex_label,
             "bfusd": fmt_amount(bfusd, 4),
             "earn_total": fmt_amount(usdt_flex + bfusd + other, 4),
-            "earn_apy": earn_apy,
             "earn_yesterday": fmt_amount(yday_amt, 4) if yday_amt > 0 else "0",
             "earn_yesterday_source": str(yday.get("source") or "none"),
             "earn_yesterday_day": str(yday.get("day") or ""),
