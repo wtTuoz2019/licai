@@ -550,7 +550,7 @@
             <span>仓位浮盈</span><b id="pos-upnl">-</b>
           </div>
           <div class="kpi"><span>昨日收益</span><b id="earn-yesterday">-</b></div>
-          <div class="kpi" title="昨日实际理财收入 × 365 ÷ 当前账户权益。理财被合约放大后，这个年化高于产品本身利率；收入或权益变化都会跟着变">
+          <div class="kpi" title="昨日实际理财收入 × 365 ÷ 理财本金。只算 RWUSD、BFUSD、USDT 活期等理财持仓；账户权益、浮盈、BNB 和其他不生息现货不计入。理财增减后会跟着变">
             <span>相对年化</span><b id="earn-apy">-</b>
           </div>
           <div class="kpi"><span>uniMMR</span><b id="mmr">-</b></div>
@@ -1653,7 +1653,7 @@
     function blendedApyText(s) {
       if (s && s.earn_apy) return s.earn_apy;
       const income = toNum(s && s.earn_yesterday);
-      const principal = toNum(s && (s.account_total || s.pm_equity));
+      const principal = toNum(s && s.earn_total);
       if (!(income > 0) || !(principal > 0)) return "-";
       return (income * 365 / principal * 100).toFixed(2) + "%";
     }
