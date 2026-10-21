@@ -1015,7 +1015,7 @@ class OpsService:
             "next_buy": wallet.get("next_buy"),
             "uni_mmr": mmr_text,
             "pm_equity": margin.get("equity") or "0",
-            "account_total": margin.get("equity") or fmt_amount(earn_collateral, 4),
+            "account_total": fmt_amount(earn_principal, 4),
             "margin": margin,
             "legs": self._legs_payload(legs),
             "other_positions": others,
