@@ -42,6 +42,20 @@ def apr_ratio(apr: Decimal) -> Decimal:
     return apr / Decimal("100") if apr > 1 else apr
 
 
+def position_apr_percent(product: FlexibleProduct, amount: Decimal) -> Decimal:
+    """单笔持仓的有效年化（百分数）。BFUSD 按 800 分档，加仓过档后年化会降。"""
+    raw = product.raw or {}
+    if product.kind == "bfusd" and amount > 0:
+        base = apr_percent(d(raw.get("base_apr") or product.apr))
+        small = apr_percent(d(raw.get("small_balance_apr") or 0))
+        if small > base:
+            hi = min(amount, _BFUSD_TIER_USDT)
+            lo = amount - hi
+            return (hi * small + lo * base) / amount
+        return base
+    return apr_percent(product.apr)
+
+
 def earns_as_um_margin(product: FlexibleProduct, rates: dict[str, Decimal]) -> bool:
     """申购之后实际拿在手里的代币，必须能当统一账户保证金去开 USDT 或 USDC 合约。
 
@@ -941,6 +955,8 @@ class Pipeline:
         other = Decimal("0")
         flex_label = "USDT 活期"
         holdings = []
+        apy_num = Decimal("0")
+        apy_den = Decimal("0")
         for product, amount in holdings_raw:
             if product.kind == "bfusd":
                 bfusd += amount
@@ -955,16 +971,21 @@ class Pipeline:
             else:
                 other += amount
                 label = product.margin_token or product.asset
+            apr_pct = position_apr_percent(product, amount)
+            if amount > 0 and apr_pct > 0:
+                apy_num += amount * apr_pct
+                apy_den += amount
             holdings.append(
                 {
                     "label": label,
                     "asset": product.asset,
                     "kind": product.kind,
                     "amount": fmt_amount(amount, 4),
-                    "apr": str(apr_percent(product.apr)),
+                    "apr": str(apr_pct),
                     "product_id": product.product_id,
                 }
             )
+        earn_apy = f"{(apy_num / apy_den):.2f}%" if apy_den > 0 else ""
         next_buy = None
         if spot >= SPOT_MIN:
             try:
@@ -995,6 +1016,7 @@ class Pipeline:
             "usdt_flexible_label": flex_label,
             "bfusd": fmt_amount(bfusd, 4),
             "earn_total": fmt_amount(usdt_flex + bfusd + other, 4),
+            "earn_apy": earn_apy,
             "earn_yesterday": fmt_amount(yday_amt, 4) if yday_amt > 0 else "0",
             "earn_yesterday_source": str(yday.get("source") or "none"),
             "earn_yesterday_day": str(yday.get("day") or ""),

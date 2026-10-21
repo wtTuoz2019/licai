@@ -550,6 +550,9 @@
             <span>仓位浮盈</span><b id="pos-upnl">-</b>
           </div>
           <div class="kpi"><span>昨日收益</span><b id="earn-yesterday">-</b></div>
+          <div class="kpi" title="按当前理财持仓金额加权。加仓、赎回或换产品后，年化会跟着变">
+            <span>年化APY</span><b id="earn-apy">-</b>
+          </div>
           <div class="kpi"><span>uniMMR</span><b id="mmr">-</b></div>
         </div>
         <div class="funds" id="wallet-funds">
@@ -850,6 +853,7 @@
       $("equity").textContent = "-";
       setPosUpnl({});
       $("earn-yesterday").textContent = "-";
+      if ($("earn-apy")) $("earn-apy").textContent = "-";
       setMmr("-");
       $("spot").textContent = "-";
       renderEarnKpis([]);
@@ -1646,6 +1650,20 @@
       }
     }
 
+    function blendedApyText(s) {
+      if (s && s.earn_apy) return s.earn_apy;
+      const rows = ((s && s.holdings) || []).filter((h) => toNum(h.amount) > 0 && toNum(h.apr) > 0);
+      let num = 0;
+      let den = 0;
+      rows.forEach((h) => {
+        const amt = toNum(h.amount);
+        num += amt * toNum(h.apr);
+        den += amt;
+      });
+      if (den <= 0) return "-";
+      return (num / den).toFixed(2) + "%";
+    }
+
     function renderEarnKpis(holdings) {
       const box = $("wallet-funds");
       if (!box) return;
@@ -1686,6 +1704,7 @@
       renderEarnKpis(s.holdings || []);
       $("equity").textContent = s.account_total || s.pm_equity || "-";
       $("earn-yesterday").textContent = s.earn_yesterday || "0";
+      if ($("earn-apy")) $("earn-apy").textContent = blendedApyText(s);
       $("mid-price").textContent = s.price || (s.stability && s.stability.mid) || "-";
       setMmr(s.uni_mmr || "-");
       setAcctLabel(s.account);

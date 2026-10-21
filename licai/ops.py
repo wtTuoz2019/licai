@@ -966,6 +966,7 @@ class OpsService:
             "usdt_flexible": wallet.get("usdt_flexible") or "0",
             "usdt_flexible_label": wallet.get("usdt_flexible_label") or "USDT 活期",
             "bfusd": wallet.get("bfusd") or "0",
+            "earn_apy": wallet.get("earn_apy") or "",
             "earn_yesterday": wallet.get("earn_yesterday") or "0",
             "earn_yesterday_source": wallet.get("earn_yesterday_source") or "none",
             "earn_yesterday_day": wallet.get("earn_yesterday_day") or "",
