@@ -211,14 +211,37 @@ def format_uni_mmr(mmr: Decimal, has_pos: bool) -> str:
 
 
 def relative_earn_apy(income: Decimal, principal: Decimal) -> str:
-    """相对年化：昨日实际理财收入 × 365 / 参与理财的本金。
-
-    本金只算理财持仓（RWUSD、BFUSD、USDT 活期等）。账户权益、浮盈浮亏、BNB 和其他不生息现货不计入。
-    """
+    """相对年化：昨日实际理财收入 × 365 / 实际本金。"""
     if income <= 0 or principal <= 0:
         return ""
     pct = income * Decimal(365) / principal * Decimal(100)
     return f"{pct:.2f}%"
+
+
+def strategy_principal(futures, wallet: dict) -> Decimal:
+    """实际本金 = 理财持仓 + 保证金里的稳定币 + 合约未实现盈亏。
+
+    理财面额里有一块是浮亏套出来的，要加回未实现盈亏（浮亏为负）才是自己的本金。
+    BNB 和其他不生息现货不进这个数，也不用账户权益。
+    """
+    earn = d(wallet.get("earn_total") or 0)
+    cash = d(wallet.get("spot_usdt") or 0)
+    upnl = Decimal("0")
+    try:
+        rows = futures.client.signed("GET", "/papi/v1/balance", papi=True)
+    except Exception:
+        rows = []
+    if not isinstance(rows, list):
+        rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        asset = str(row.get("asset") or "").upper()
+        if asset in {"USDT", "USDC"}:
+            cash += d(row.get("totalWalletBalance") or 0)
+        upnl += d(row.get("umUnrealizedPNL") or 0) + d(row.get("cmUnrealizedPNL") or 0)
+    principal = earn + cash + upnl
+    return principal if principal > 0 else Decimal("0")
 
 
 def _sizing_collateral(risk: dict, fallback: Decimal = Decimal("0")) -> Decimal:
@@ -962,6 +985,7 @@ class OpsService:
         lev, lev_tgt = _display_leverage(legs, settings)
         others, others_err = self._other_positions(futures, settings.hedge_symbol, legs)
         armed = self.migrate_arm(account.id)
+        earn_principal = strategy_principal(futures, wallet)
         return {
             **base,
             "ok": True,
@@ -977,9 +1001,10 @@ class OpsService:
             "usdt_flexible": wallet.get("usdt_flexible") or "0",
             "usdt_flexible_label": wallet.get("usdt_flexible_label") or "USDT 活期",
             "bfusd": wallet.get("bfusd") or "0",
+            "earn_principal": fmt_amount(earn_principal, 4),
             "earn_apy": relative_earn_apy(
                 d(wallet.get("earn_yesterday") or 0),
-                d(wallet.get("earn_total") or 0),
+                earn_principal,
             ),
             "earn_yesterday": wallet.get("earn_yesterday") or "0",
             "earn_yesterday_source": wallet.get("earn_yesterday_source") or "none",
