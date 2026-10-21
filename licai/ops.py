@@ -395,6 +395,10 @@ class OpsService:
         self._earn_region_block: dict[int, set[str]] = {}
         self._region_block_path = ROOT / "data" / "earn_region_block.json"
         self._load_earn_region_block()
+        self._daily_apy_path = ROOT / "data" / "earn_apy_daily.json"
+        self._daily_apy: dict[int, dict] = {}
+        self._daily_apy_lock = threading.Lock()
+        self._load_daily_apy()
 
     def _load_earn_region_block(self) -> None:
         path = getattr(self, "_region_block_path", ROOT / "data" / "earn_region_block.json")
@@ -414,6 +418,63 @@ class OpsService:
                 elif isinstance(assets, str) and assets:
                     out[aid] = {assets.upper()}
         self._earn_region_block = out
+
+    def _load_daily_apy(self) -> None:
+        path = getattr(self, "_daily_apy_path", ROOT / "data" / "earn_apy_daily.json")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            raw = {}
+        out: dict[int, dict] = {}
+        if isinstance(raw, dict):
+            for key, row in raw.items():
+                try:
+                    aid = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(row, dict) and row.get("apy") and row.get("day"):
+                    out[aid] = {
+                        "day": str(row.get("day") or ""),
+                        "apy": str(row.get("apy") or ""),
+                        "income": str(row.get("income") or ""),
+                        "principal": str(row.get("principal") or ""),
+                    }
+        self._daily_apy = out
+
+    def _save_daily_apy(self) -> None:
+        path = getattr(self, "_daily_apy_path", ROOT / "data" / "earn_apy_daily.json")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {str(aid): row for aid, row in sorted(self._daily_apy.items())}
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _daily_apy_for(
+        self,
+        account_id: int,
+        day: str,
+        income: Decimal,
+        principal: Decimal,
+    ) -> str:
+        """同一收益日只算一次相对年化，之后页面加载直接用记下的结果。"""
+        with self._daily_apy_lock:
+            row = self._daily_apy.get(account_id) or {}
+            if day and row.get("day") == day and row.get("apy"):
+                return str(row["apy"])
+            apy = relative_earn_apy(income, principal)
+            if not apy:
+                return str(row.get("apy") or "")
+            if not day:
+                return apy
+            self._daily_apy[account_id] = {
+                "day": day,
+                "apy": apy,
+                "income": fmt_amount(income, 4),
+                "principal": fmt_amount(principal, 4),
+            }
+            self._save_daily_apy()
+            return apy
 
     def save_earn_region_block(self) -> None:
         path = getattr(self, "_region_block_path", ROOT / "data" / "earn_region_block.json")
@@ -1002,7 +1063,9 @@ class OpsService:
             "usdt_flexible_label": wallet.get("usdt_flexible_label") or "USDT 活期",
             "bfusd": wallet.get("bfusd") or "0",
             "earn_principal": fmt_amount(earn_principal, 4),
-            "earn_apy": relative_earn_apy(
+            "earn_apy": self._daily_apy_for(
+                account.id,
+                str(wallet.get("earn_yesterday_day") or ""),
                 d(wallet.get("earn_yesterday") or 0),
                 earn_principal,
             ),
