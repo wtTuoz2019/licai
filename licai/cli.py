@@ -62,7 +62,8 @@ def _cmd_web(host: str, port: int) -> int:
 
     print(f"操作台: http://{host}:{port}")
     print("先输入访问密码才能看数据和操作。默认不自动下单，页面确认后才是实盘。")
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    # 关掉 access log：monitor 轮询会刷爆磁盘，业务日志仍走 print/logging
+    uvicorn.run(app, host=host, port=port, log_level="info", access_log=False)
     return 0
 
 

@@ -380,7 +380,7 @@ class OpsService:
         self._risk_ttl = 60.0
         # 多标签连刷 monitor 时复用短缓存，少打币安
         self._monitor_cache: dict[int, tuple[float, dict]] = {}
-        self._monitor_ttl = 10.0
+        self._monitor_ttl = 15.0
         self._action_locks: dict[int, threading.Lock] = {}
         self._action_guard = threading.Lock()
         self._busy: set[int] = set()

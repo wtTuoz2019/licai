@@ -47,6 +47,14 @@ class AutoHarvestWorker:
         self._last_cross_key: dict[int, str] = {}
         # account_id -> UTC 日期：利息到账并完成换年化检查后才记完成（落盘）
         self._earn_day_done: dict[int, str] = self._load_earn_day_done()
+        # 等利息期间每账号最多半小时强刷一次快照，避免每分钟打爆币安
+        self._earn_probe_at: dict[int, float] = {}
+        self._earn_probe_gap = 1800.0
+        # 本轮 tick 共用一根 MACD，避免 6 个账号各自 force 打 c7.pro
+        self._tick_cross = None
+        # 闲置可转出探测节流
+        self._withdraw_probe_at: dict[int, float] = {}
+        self._withdraw_probe_gap = 600.0
 
     @staticmethod
     def _load_earn_day_done() -> dict[int, str]:
@@ -108,6 +116,12 @@ class AutoHarvestWorker:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     def _tick(self) -> None:
+        url = getattr(self.ops.base, "macd_indicator_url", None) or ""
+        # 整轮只强刷一次；失败退避由 macd 模块处理
+        try:
+            self._tick_cross = fetch_macd_cross(url, force=True)
+        except Exception:
+            self._tick_cross = None
         for account in self.ops.store.list_accounts():
             if self._stop.is_set():
                 return
@@ -350,11 +364,24 @@ class AutoHarvestWorker:
         day = self._utc_day()
         if self._earn_day_done.get(account.id) == day:
             return
+        # 未开自动收利 / 关了自动换：直接记完成，不打币安
+        if not account.auto_harvest:
+            self._mark_earn_day_done(account.id, day)
+            return
+        if not bool(getattr(self.ops.base, "auto_switch_earn", True)):
+            self._mark_earn_day_done(account.id, day)
+            return
+        now = time.monotonic()
+        last = float(self._earn_probe_at.get(account.id) or 0)
+        if now - last < self._earn_probe_gap:
+            return
         if not self.ops.try_begin_action(account.id):
             return
         try:
-            # 清奖励缓存，强制走接口记录（不是年化粗算）
-            earn_mod._YDAY_REWARD_CACHE.clear()
+            self._earn_probe_at[account.id] = now
+            # 只清本账号奖励缓存，避免全站缓存被每分钟打掉
+            cache_key = (account.api_key or "")[:12]
+            earn_mod._YDAY_REWARD_CACHE.pop(cache_key, None)
             self.ops.invalidate_snapshot(account.id)
             live = self.ops.snapshot(account, force=True)
             if not live.get("ok"):
@@ -367,20 +394,11 @@ class AutoHarvestWorker:
                 f"每日理财收益 account={account.id} 昨日={yday} day={reward_day} source={src}"
             )
 
-            if not account.auto_harvest:
-                _print(f"每日换年化跳过 account={account.id}：未开自动收利，只在手动点「换年化」时换")
-                self._mark_earn_day_done(account.id, day)
-                return
-
-            if not bool(getattr(self.ops.base, "auto_switch_earn", True)):
-                self._mark_earn_day_done(account.id, day)
-                return
-
             earn_total = d(live.get("earn_total") or "0")
             if earn_total > 0 and not self._interest_arrived(live):
                 _print(
                     f"每日换年化等待利息到账 account={account.id} "
-                    f"昨日={yday} day={reward_day} source={src}"
+                    f"昨日={yday} day={reward_day} source={src}（半小时后再查）"
                 )
                 return
 
@@ -463,8 +481,10 @@ class AutoHarvestWorker:
         base = self.ops.base
         if not bool(getattr(base, "macd_auto_harvest", True)):
             return None, "MACD 过滤已关闭"
-        url = getattr(base, "macd_indicator_url", None) or ""
-        cross = fetch_macd_cross(url, force=True)
+        cross = self._tick_cross
+        if cross is None:
+            # 本轮已 force 过；再用缓存确认一次（不额外打网）
+            cross = fetch_macd_cross(getattr(base, "macd_indicator_url", None), force=False)
         if cross is None:
             return None, "当前不是金叉/死叉那一根"
         key = f"{cross.kind}:{cross.time}"
@@ -473,7 +493,9 @@ class AutoHarvestWorker:
         return cross.harvest_side, f"{cross.label}@{cross.time} → 收{cross.harvest_side}"
 
     def _remember_cross(self, account_id: int) -> None:
-        cross = fetch_macd_cross(getattr(self.ops.base, "macd_indicator_url", None))
+        cross = self._tick_cross or fetch_macd_cross(
+            getattr(self.ops.base, "macd_indicator_url", None), force=False
+        )
         if cross:
             self._last_cross_key[account_id] = f"{cross.kind}:{cross.time}"
 
@@ -539,7 +561,12 @@ class AutoHarvestWorker:
             spot = self.ops._idle_spot(account)
         withdrawable = d(live.get("withdrawable_usdt") or "0")
         if spot < 1 and withdrawable < 1:
-            # 实时探一下可转出，避免闲置 U 一直压在统一账户
+            # 每 10 分钟最多探一次可转出，避免无闲置时每轮打 maxWithdraw
+            now = time.monotonic()
+            last = float(self._withdraw_probe_at.get(account.id) or 0)
+            if now - last < self._withdraw_probe_gap:
+                return False
+            self._withdraw_probe_at[account.id] = now
             try:
                 pipe = pipeline_for(account, self.ops.base, dry_run=True, ops=self.ops)
                 settle = str(getattr(pipe.settings, "hedge_symbol", "") or "")
@@ -601,7 +628,9 @@ class AutoHarvestWorker:
             # 动手前再确认交叉与平稳仍同时成立
             if not (live.get("stability") or {}).get("stable") and not enter.get("stable_ok"):
                 return False
-            cross = fetch_macd_cross(getattr(self.ops.base, "macd_indicator_url", None), force=True)
+            cross = self._tick_cross or fetch_macd_cross(
+                getattr(self.ops.base, "macd_indicator_url", None), force=False
+            )
             if cross is None:
                 return False
         _print(
@@ -673,7 +702,9 @@ class AutoHarvestWorker:
             side, macd_note = self._macd_side(account.id)
             if not side:
                 return False
-            cross = fetch_macd_cross(getattr(self.ops.base, "macd_indicator_url", None), force=True)
+            cross = self._tick_cross or fetch_macd_cross(
+                getattr(self.ops.base, "macd_indicator_url", None), force=False
+            )
             if cross is None or not stability.get("stable"):
                 return False
         _print(f"自动开仓触发 account={account.id} 严平稳 · {macd_note}，双边挂单入场")

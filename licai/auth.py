@@ -24,23 +24,32 @@ OPEN_PATHS = {
 }
 
 _login_fails: dict[str, list[float]] = defaultdict(list)
+_env_loaded = False
+_dashboard_password = ""
+_super_password = ""
 
 
 ROLES = ("admin", "super")
 
 
 def _load_env() -> None:
+    global _env_loaded, _dashboard_password, _super_password
+    if _env_loaded:
+        return
     load_dotenv(ROOT / ".env")
+    _dashboard_password = os.getenv("LICAI_DASHBOARD_PASSWORD", "").strip()
+    _super_password = os.getenv("LICAI_SUPER_PASSWORD", "").strip()
+    _env_loaded = True
 
 
 def dashboard_password() -> str:
     _load_env()
-    return os.getenv("LICAI_DASHBOARD_PASSWORD", "").strip()
+    return _dashboard_password
 
 
 def super_password() -> str:
     _load_env()
-    return os.getenv("LICAI_SUPER_PASSWORD", "").strip()
+    return _super_password
 
 
 def require_dashboard_password() -> str:
