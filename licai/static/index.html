@@ -499,8 +499,7 @@
         <input name="api_key" required autocomplete="off" />
         <label>API Secret</label>
         <input name="api_secret" required type="password" autocomplete="off" />
-        <label>代理（可留空，已配 Webshare 时自动分配）</label>
-        <input name="proxy" placeholder="http://user:pass@ip:port" />
+        <input type="hidden" name="proxy" value="" />
         <label>① 结算币（默认 USDT）</label>
         <select id="add-settle">
           <option value="USDT" selected>USDT（默认）</option>
@@ -614,14 +613,13 @@
               <button type="button" id="btn-save-hidden" class="primary">保存</button>
             </div>
           </div>
-          <p class="muted">出口 IP <b id="ip">-</b> · <span id="proxy-mode"></span> · 代理 <b id="proxy-now">默认</b> · <span id="snap-age"></span></p>
+          <p class="muted">出口 IP <b id="ip">-</b> · <span id="snap-age"></span></p>
           <p class="muted">杠杆 目标 <b id="lev-target">-</b> · 实际 <b id="lev-actual">-</b>（顶栏只显示实际；子账户常被锁 5x）</p>
           <div class="row">
             <button type="button" id="btn-set-leverage">设置杠杆</button>
             <input id="lev-edit" type="number" min="1" max="125" step="1" placeholder="100" title="目标杠杆：尝试提到这个倍数；算仓用实际倍数" />
             <button type="button" id="btn-edit-account">编辑账号</button>
             <button type="button" id="btn-edit-symbol">切换套保</button>
-            <button type="button" id="btn-edit-proxy">修改代理</button>
             <button type="button" id="btn-delete">解绑</button>
           </div>
           <div id="edit-account-box" class="edit-box" hidden>
@@ -631,8 +629,7 @@
             <input id="edit-key" autocomplete="off" />
             <label>API Secret</label>
             <input id="edit-secret" autocomplete="off" />
-            <label>代理</label>
-            <input id="edit-proxy" autocomplete="off" placeholder="留空表示走服务器出口 IP" />
+            <input type="hidden" id="edit-proxy" value="" />
             <label>① 结算币</label>
             <select id="edit-settle">
               <option value="USDT">USDT（默认）</option>
@@ -662,14 +659,11 @@
             </div>
           </div>
           <div id="edit-proxy-box" class="edit-box" hidden>
-            <label>代理</label>
-            <input id="proxy-edit" placeholder="http://user:pass@ip:port 或留空后点 Webshare" />
+            <input type="hidden" id="proxy-edit" value="" />
             <p class="muted" id="webshare-hint" hidden></p>
-            <div class="row">
-              <button type="button" id="btn-cancel-proxy">取消</button>
-              <button type="button" id="btn-webshare-proxy">Webshare 分配</button>
-              <button type="button" id="btn-proxy" class="primary">保存</button>
-            </div>
+            <button type="button" id="btn-cancel-proxy" hidden>取消</button>
+            <button type="button" id="btn-webshare-proxy" hidden>Webshare 分配</button>
+            <button type="button" id="btn-proxy" hidden>保存</button>
           </div>
           <h2 class="events-head">
             最近操作
@@ -745,7 +739,29 @@
     let liveAt = 0;
     let fundsRefreshTimer = null;
     const lastSeenByAccount = Object.create(null);
+    const TAB_ID = Math.random().toString(36).slice(2);
+    const TAB_LEADER_KEY = "licai_poll_leader_v1";
     const $ = (id) => document.getElementById(id);
+
+    function claimPollLeader() {
+      try {
+        const now = Date.now();
+        const raw = localStorage.getItem(TAB_LEADER_KEY);
+        const row = raw ? JSON.parse(raw) : null;
+        if (!row || !row.id || now - Number(row.ts || 0) > 20000 || row.id === TAB_ID) {
+          localStorage.setItem(TAB_LEADER_KEY, JSON.stringify({ id: TAB_ID, ts: now }));
+          return true;
+        }
+        return false;
+      } catch (_) {
+        return true;
+      }
+    }
+
+    function canPollLive() {
+      if (document.hidden) return false;
+      return claimPollLeader();
+    }
 
     function scheduleFundsRefresh(accId, msg) {
       // 等后台一整串操作结束（busy 解除）后再刷，避免中途余额半更新
@@ -887,8 +903,8 @@
       if (account) {
         lastSymbol = account.hedge_symbol || lastSymbol;
         syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, lastSymbol);
-        $("proxy-edit").value = account.proxy || "";
-        $("proxy-now").textContent = account.proxy || "默认";
+        if ($("proxy-edit")) $("proxy-edit").value = account.proxy || "";
+        if ($("proxy-now")) $("proxy-now").textContent = account.proxy || "默认";
       }
     }
 
@@ -909,7 +925,9 @@
       }
       $("error").textContent = msg;
       $("ip").textContent = (s && s.exit_ip) || "-";
-      $("proxy-mode").textContent = (s && s.proxy_mode) || (acc.proxy ? "账号代理" : "默认出口 IP");
+      if ($("proxy-mode")) {
+        $("proxy-mode").textContent = (s && s.proxy_mode) || (acc.proxy ? "账号代理" : "默认出口 IP");
+      }
       $("harvest-why").textContent = "账号未就绪，仓位不会与其他账号共用";
     }
     const ACTIONS = {
@@ -1621,7 +1639,8 @@
     }
 
     async function pollLive() {
-      if (!selected) return;
+      if (!selected || busy) return;
+      if (!canPollLive()) return;
       const id = selected;
       const gen = loadGen;
       try {
@@ -1636,11 +1655,8 @@
         }
         liveAt = Date.now();
         applyLive(s);
-        // 开了自动收利时加快轮询，便于收利后尽快刷资金
-        const autoOn = !!(s.account && s.account.auto_harvest);
-        const nextMs = autoOn
-          ? Math.max(60000, Math.min(pollMs, Number(s.auto_harvest_seconds || 60) * 1000))
-          : pollMs;
+        // 自动收利也按资金轮询间隔，避免多标签把 monitor 打爆
+        const nextMs = Math.max(pollMs, 60000);
         if (timer && gen === loadGen) {
           clearInterval(timer);
           timer = setInterval(() => { if (!busy) pollLive(); }, nextMs);
@@ -1649,6 +1665,10 @@
         if (gen === loadGen && sameAccount(id)) showSnapAge();
       }
     }
+
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && selected && !busy) pollLive();
+    });
 
     function blendedApyText(s) {
       return (s && s.earn_apy) || "-";
@@ -1689,7 +1709,7 @@
       $("error").hidden = !s.error;
       $("error").textContent = s.error || "";
       $("ip").textContent = s.exit_ip || "-";
-      $("proxy-mode").textContent = s.proxy_mode || "";
+      if ($("proxy-mode")) $("proxy-mode").textContent = s.proxy_mode || "";
       $("spot").textContent = s.spot_usdt || "-";
       renderEarnKpis(s.holdings || []);
       $("equity").textContent = s.account_total || s.pm_equity || "-";
@@ -1718,7 +1738,7 @@
         levInput.placeholder = s.leverage_target ? String(s.leverage_target) : "100";
       }
       const proxyVal = (s.account && s.account.proxy) || "";
-      $("proxy-now").textContent = proxyVal || "默认";
+      if ($("proxy-now")) $("proxy-now").textContent = proxyVal || "默认";
       hideEditBoxes();
       const mg = s.margin || {};
       const box = $("collateral");
@@ -2187,51 +2207,24 @@
       syncHedgePickers($("settle-edit"), $("base-edit"), $("symbol-preview"), null, lastSymbol);
       $("edit-symbol-box").hidden = true;
     };
-    $("btn-edit-proxy").onclick = () => {
-      if (!selected || busy) return;
-      $("edit-account-box").hidden = true;
-      $("edit-symbol-box").hidden = true;
-      $("edit-proxy-box").hidden = false;
-      api("/api/webshare").then((st) => {
-        const el = $("webshare-hint");
-        if (!el) return;
-        if (!st.configured) {
-          el.hidden = false;
-          el.textContent = "未配置 WEBSHARE_API_TOKEN，请在服务器 .env 填写后重启";
-        } else if (st.error) {
-          el.hidden = false;
-          el.textContent = "Webshare: " + st.error;
-        } else {
-          el.hidden = false;
-          el.textContent = `Webshare 已就绪 · ${st.proxy_count} 条` + (st.country ? ` · ${st.country}` : "");
-        }
-      }).catch(() => {});
-    };
-    $("btn-cancel-proxy").onclick = () => {
-      $("edit-proxy-box").hidden = true;
-    };
-    $("btn-webshare-proxy").onclick = async () => {
-      if (!selected || busy) return;
-      const ok = await confirmAction({
-        title: "Webshare 分配代理",
-        body: "从 Webshare 拉取一条未占用的代理，写入本账号并探测连通。",
-        okText: "分配",
-      });
-      if (!ok) return;
-      showLoading("分配中", "正在从 Webshare 获取并探测…");
-      try {
-        const acc = await api(`/api/accounts/${selected}/proxy/webshare`, { method: "POST" });
-        $("proxy-edit").value = acc.proxy || "";
+    if ($("btn-edit-proxy")) {
+      $("btn-edit-proxy").onclick = () => {
+        if (!selected || busy) return;
+        $("edit-account-box").hidden = true;
+        $("edit-symbol-box").hidden = true;
+        $("edit-proxy-box").hidden = false;
+      };
+    }
+    if ($("btn-cancel-proxy")) {
+      $("btn-cancel-proxy").onclick = () => {
         $("edit-proxy-box").hidden = true;
-        await loadAccounts();
-        await refresh({ force: true });
-        setActionMsg("已分配 Webshare 代理：" + (acc.proxy || ""));
-      } catch (err) {
-        setActionMsg(err.message);
-      } finally {
-        hideModal();
-      }
-    };
+      };
+    }
+    if ($("btn-webshare-proxy")) {
+      $("btn-webshare-proxy").onclick = async () => {
+        setActionMsg("当前未启用代理分配");
+      };
+    }
     $("btn-save-symbol").onclick = async () => {
       if (!selected || busy) return;
       const symbol = currentEditSymbol();
@@ -2447,24 +2440,9 @@
     $("btn-scale").onclick = () => act("scale");
     $("btn-harvest").onclick = () => act("harvest");
     $("btn-switch").onclick = () => act("switch");
-    $("btn-proxy").onclick = async () => {
-      if (!selected || busy) return;
-      showLoading("保存中", "请稍候");
-      try {
-        await api(`/api/accounts/${selected}`, {
-          method: "PATCH",
-          body: JSON.stringify({ proxy: $("proxy-edit").value }),
-        });
-        $("edit-proxy-box").hidden = true;
-        await loadAccounts();
-        await refresh({ force: true });
-        setActionMsg("代理已保存", "ok");
-      } catch (err) {
-        setActionMsg(err.message, "bad");
-      } finally {
-        hideModal();
-      }
-    };
+    if ($("btn-proxy")) {
+      $("btn-proxy").onclick = () => setActionMsg("当前未启用代理");
+    }
     $("btn-delete").onclick = async () => {
       if (!selected || busy) return;
       const acc = currentAccount();

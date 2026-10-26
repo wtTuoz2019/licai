@@ -155,7 +155,7 @@ class Settings:
     webshare_api_token: str = ""
     webshare_mode: str = "direct"
     webshare_country: str = ""
-    webshare_auto_assign: bool = True
+    webshare_auto_assign: bool = False
 
     @property
     def target_margin_assets(self) -> list[str]:
@@ -281,7 +281,7 @@ def load_settings(config_path: str | Path | None = None, dry_run_override: bool 
         webshare_auto_assign=bool(
             raw.get(
                 "webshare_auto_assign",
-                os.getenv("WEBSHARE_AUTO_ASSIGN", "true").strip().lower() in {"1", "true", "yes", "on"},
+                os.getenv("WEBSHARE_AUTO_ASSIGN", "false").strip().lower() in {"1", "true", "yes", "on"},
             )
         ),
     )

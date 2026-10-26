@@ -1249,24 +1249,36 @@ class Pipeline:
                 )
             ]
         unsupported = False
-        try:
-            cap = self.futures.earn_to_pm_balance(asset)
-        except BinanceAPIError as exc:
-            if self._earn_transfer_unsupported(exc):
-                # 接口根本不认该资产：不必再 POST 划转（还会再吃一次 -1100 FAIL）
-                unsupported = True
-                cap = Decimal("0")
-                steps.append(
-                    StepResult(
-                        f"查询 {asset} 可转入",
-                        True,
-                        f"理财划转接口不支持 {asset}（{exc}），改暂留计息",
-                    )
+        # BFUSD 的 earn-asset-transfer 固定 -1100，不再每次空探询
+        if asset.upper() == "BFUSD":
+            unsupported = True
+            cap = Decimal("0")
+            steps.append(
+                StepResult(
+                    f"查询 {asset} 可转入",
+                    True,
+                    f"理财划转接口不支持 {asset}，改暂留计息",
                 )
-            else:
-                # 其它查询异常仍按持仓量尝试转入，避免误走赎回
-                cap = amount
-                steps.append(StepResult(f"查询 {asset} 可转入", True, str(exc)))
+            )
+        else:
+            try:
+                cap = self.futures.earn_to_pm_balance(asset)
+            except BinanceAPIError as exc:
+                if self._earn_transfer_unsupported(exc):
+                    # 接口根本不认该资产：不必再 POST 划转（还会再吃一次 -1100 FAIL）
+                    unsupported = True
+                    cap = Decimal("0")
+                    steps.append(
+                        StepResult(
+                            f"查询 {asset} 可转入",
+                            True,
+                            f"理财划转接口不支持 {asset}（{exc}），改暂留计息",
+                        )
+                    )
+                else:
+                    # 其它查询异常仍按持仓量尝试转入，避免误走赎回
+                    cap = amount
+                    steps.append(StepResult(f"查询 {asset} 可转入", True, str(exc)))
         if unsupported:
             if not allow_redeem_fallback:
                 steps.append(

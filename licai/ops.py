@@ -378,6 +378,9 @@ class OpsService:
         self._snap_ttl = 86400.0
         self._risk_cache: dict[int, tuple[float, dict]] = {}
         self._risk_ttl = 60.0
+        # 多标签连刷 monitor 时复用短缓存，少打币安
+        self._monitor_cache: dict[int, tuple[float, dict]] = {}
+        self._monitor_ttl = 10.0
         self._action_locks: dict[int, threading.Lock] = {}
         self._action_guard = threading.Lock()
         self._busy: set[int] = set()
@@ -646,6 +649,7 @@ class OpsService:
     def invalidate_snapshot(self, account_id: int) -> None:
         self._snap_cache.pop(account_id, None)
         self._risk_cache.pop(account_id, None)
+        self._monitor_cache.pop(account_id, None)
 
     def _remember_risk(self, account_id: int, risk: dict) -> dict:
         stored = {
@@ -871,6 +875,14 @@ class OpsService:
         return out
 
     def monitor(self, account: Account) -> dict:
+        now = time.monotonic()
+        hit = self._monitor_cache.get(account.id)
+        if hit and now - hit[0] < self._monitor_ttl:
+            cached = dict(hit[1])
+            cached["monitor_cached"] = True
+            cached["action_busy"] = account.id in self._busy
+            cached["migrate_armed"] = bool(self.migrate_arm(account.id))
+            return cached
         try:
             pipe = pipeline_for(account, self.base, dry_run=True, ops=self)
         except Exception as exc:
@@ -929,7 +941,7 @@ class OpsService:
             pass
         others, others_err = self._other_positions(futures, settings.hedge_symbol, legs)
         armed = self.migrate_arm(account.id)
-        return {
+        out = {
             "ok": True,
             "account": account.public_dict(),
             "symbol": settings.hedge_symbol,
@@ -955,7 +967,10 @@ class OpsService:
                 auto_harvest=bool(account.auto_harvest),
             ),
             "events": _events_payload(account.id, self.store.recent_events(account.id, 30)),
+            "monitor_cached": False,
         }
+        self._monitor_cache[account.id] = (now, out)
+        return out
 
     def _build_snapshot(self, account: Account) -> dict:
         base = {

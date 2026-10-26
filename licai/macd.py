@@ -15,8 +15,11 @@ log = logging.getLogger("licai.macd")
 
 DEFAULT_URL = "https://c7.pro/capi/indicator"
 _CACHE_TTL = 55.0
+# 失败后即使 force=True 也先退避，避免每个自动轮询都卡 4 秒超时
+_FAIL_BACKOFF = 180.0
 # endpoint -> (mono_ts, state|None, err)
 _cache: dict[str, tuple[float, "MacdState | None", str]] = {}
+_last_fail_log: dict[str, float] = {}
 
 
 @dataclass(frozen=True)
@@ -128,10 +131,15 @@ def _detect_cross(rows: list[dict]) -> MacdState | None:
 def _load_state(url: str | None, *, timeout: float = 4.0, force: bool = False) -> MacdState | None:
     endpoint = (url or DEFAULT_URL).strip() or DEFAULT_URL
     now = time.monotonic()
-    if not force:
-        hit = _cache.get(endpoint)
-        if hit and now - hit[0] < _CACHE_TTL:
-            return hit[1]
+    hit = _cache.get(endpoint)
+    if hit:
+        ts, state, err = hit
+        age = now - ts
+        # 失败退避优先于 force：多账号自动轮询不要连环打挂掉的 c7.pro
+        if err and age < _FAIL_BACKOFF:
+            return state
+        if not force and age < _CACHE_TTL:
+            return state
     try:
         resp = requests.get(endpoint, timeout=timeout, proxies={"http": None, "https": None})
         resp.raise_for_status()
@@ -139,7 +147,10 @@ def _load_state(url: str | None, *, timeout: float = 4.0, force: bool = False) -
         _cache[endpoint] = (now, state, "")
         return state
     except Exception as exc:
-        log.warning("MACD 指标拉取失败: %s", exc)
+        last = _last_fail_log.get(endpoint, 0.0)
+        if now - last >= _FAIL_BACKOFF:
+            log.warning("MACD 指标拉取失败（%ss 内不再重试）: %s", int(_FAIL_BACKOFF), exc)
+            _last_fail_log[endpoint] = now
         _cache[endpoint] = (now, None, str(exc))
         return None
 
