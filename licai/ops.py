@@ -392,7 +392,8 @@ class OpsService:
         self._pipe_cache: dict[int, tuple[float, Pipeline, str]] = {}
         self._pipe_ttl = 180.0
         self._spot_probe_at: dict[int, float] = {}
-        self._spot_probe_gap = 300.0
+        # monitor 现货只作展示/开仓提示；真资金以 snapshot 为准，平时几乎不靠它
+        self._spot_probe_gap = 3600.0
         self._action_locks: dict[int, threading.Lock] = {}
         self._action_guard = threading.Lock()
         self._busy: set[int] = set()
