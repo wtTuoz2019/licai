@@ -303,27 +303,34 @@ class FuturesAPI:
     def round_qty(self, qty: Decimal, step: Decimal) -> Decimal:
         return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
 
-    def legs(self, symbol: str) -> HedgeLegs:
-        symbol = symbol.upper()
-        rows = self._um_signed("GET", "/fapi/v2/positionRisk", "/papi/v1/um/positionRisk", {"symbol": symbol})
-        if isinstance(rows, dict):
-            rows = [rows]
-        # 带 symbol 偶发空回包时，再拉全量按币对过滤（线上常见）
-        if not rows:
-            try:
-                all_rows = self._um_signed("GET", "/fapi/v2/positionRisk", "/papi/v1/um/positionRisk")
-                if isinstance(all_rows, dict):
-                    all_rows = [all_rows]
-                rows = [r for r in (all_rows or []) if str(r.get("symbol") or "").upper() == symbol]
-            except BinanceAPIError:
-                rows = []
-        return self._legs_from_rows(symbol, rows or [])
-
-    def open_um_symbols(self) -> list[dict]:
-        """当前有仓的 U 本位合约（用于发现套保币对设错）。读失败抛错，避免当成空仓。"""
+    def all_um_position_rows(self) -> list[dict]:
+        """一次拉全量 U 本位仓位，供套保腿 + 其他币对共用。"""
         rows = self._um_signed("GET", "/fapi/v2/positionRisk", "/papi/v1/um/positionRisk")
         if isinstance(rows, dict):
             rows = [rows]
+        return [r for r in (rows or []) if isinstance(r, dict)]
+
+    def legs(self, symbol: str, rows: list[dict] | None = None) -> HedgeLegs:
+        symbol = symbol.upper()
+        if rows is not None:
+            filtered = [r for r in rows if str(r.get("symbol") or "").upper() == symbol]
+            return self._legs_from_rows(symbol, filtered)
+        got = self._um_signed("GET", "/fapi/v2/positionRisk", "/papi/v1/um/positionRisk", {"symbol": symbol})
+        if isinstance(got, dict):
+            got = [got]
+        # 带 symbol 偶发空回包时，再拉全量按币对过滤（线上常见）
+        if not got:
+            try:
+                all_rows = self.all_um_position_rows()
+                got = [r for r in all_rows if str(r.get("symbol") or "").upper() == symbol]
+            except BinanceAPIError:
+                got = []
+        return self._legs_from_rows(symbol, got or [])
+
+    def open_um_symbols(self, rows: list[dict] | None = None) -> list[dict]:
+        """当前有仓的 U 本位合约（用于发现套保币对设错）。读失败抛错，避免当成空仓。"""
+        if rows is None:
+            rows = self.all_um_position_rows()
         out: list[dict] = []
         seen: set[str] = set()
         for row in rows or []:

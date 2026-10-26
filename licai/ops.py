@@ -355,6 +355,11 @@ def pipeline_for(
         take_profit_custom=account.take_profit_custom,
         pending_scale_qty=account.scale_add_qty,
     )
+    # 只读轮询复用 Pipeline（HTTP session），真下单仍新建以免串状态
+    if ops is not None and dry_run:
+        hit = ops._reuse_pipeline(account, settings)
+        if hit is not None:
+            return hit
     pipe = Pipeline(settings)
     if ops is not None:
         blocked = ops._earn_region_block.setdefault(account.id, set())
@@ -367,6 +372,8 @@ def pipeline_for(
                 return ops.rotate_dead_proxy(account_id, bad, exc)
 
             pipe.client.bind_proxy_rotator(_rotate)
+        if dry_run:
+            ops._remember_pipeline(account, pipe)
     return pipe
 
 
@@ -381,6 +388,11 @@ class OpsService:
         # 多标签连刷 monitor 时复用短缓存，少打币安
         self._monitor_cache: dict[int, tuple[float, dict]] = {}
         self._monitor_ttl = 15.0
+        # 只读 Pipeline 复用（按账号）
+        self._pipe_cache: dict[int, tuple[float, Pipeline, str]] = {}
+        self._pipe_ttl = 180.0
+        self._spot_probe_at: dict[int, float] = {}
+        self._spot_probe_gap = 300.0
         self._action_locks: dict[int, threading.Lock] = {}
         self._action_guard = threading.Lock()
         self._busy: set[int] = set()
@@ -650,6 +662,42 @@ class OpsService:
         self._snap_cache.pop(account_id, None)
         self._risk_cache.pop(account_id, None)
         self._monitor_cache.pop(account_id, None)
+        self._pipe_cache.pop(account_id, None)
+
+    def _pipe_fingerprint(self, account: Account, settings: Settings) -> str:
+        return "|".join(
+            [
+                str(account.id),
+                (account.api_key or "")[:16],
+                (account.proxy or "").strip(),
+                str(settings.hedge_symbol or ""),
+                str(int(settings.hedge_leverage or 0)),
+                str(settings.take_profit_usdt or 0),
+                "1" if settings.take_profit_custom else "0",
+                str(settings.pending_scale_qty or 0),
+            ]
+        )
+
+    def _reuse_pipeline(self, account: Account, settings: Settings) -> Pipeline | None:
+        hit = self._pipe_cache.get(account.id)
+        if not hit:
+            return None
+        ts, pipe, fingerprint = hit
+        if time.monotonic() - ts > self._pipe_ttl:
+            self._pipe_cache.pop(account.id, None)
+            return None
+        if fingerprint != self._pipe_fingerprint(account, settings):
+            self._pipe_cache.pop(account.id, None)
+            return None
+        pipe.settings = settings
+        return pipe
+
+    def _remember_pipeline(self, account: Account, pipe: Pipeline) -> None:
+        self._pipe_cache[account.id] = (
+            time.monotonic(),
+            pipe,
+            self._pipe_fingerprint(account, pipe.settings),
+        )
 
     def _remember_risk(self, account_id: int, risk: dict) -> dict:
         stored = {
@@ -694,26 +742,33 @@ class OpsService:
             "missing": legs.missing_side,
         }
 
-    def _other_positions(self, futures, symbol: str, legs=None) -> tuple[list[dict], str | None]:
-        """当前套保以外的仓。返回 (列表, 错误)。读失败时错误非空，列表不可当作「已空」。"""
+    def _other_positions(
+        self, futures, symbol: str, legs=None, *, rows: list | None = None
+    ) -> tuple[list[dict], str | None]:
+        """当前套保以外的仓。返回 (列表, 错误)。读失败时错误非空，列表不可当作「已空」。
+
+        传入 rows（全量 positionRisk）时不再二次请求。
+        """
         try:
-            rows = futures.open_um_symbols()
+            if rows is None:
+                rows = futures.all_um_position_rows()
         except Exception as exc:
             return [], str(exc)
         cur = (symbol or "").upper()
-        out: list[dict] = []
-        seen: set[str] = set()
-        errors: list[str] = []
+        by_sym: dict[str, list] = {}
         for row in rows or []:
+            if not isinstance(row, dict):
+                continue
             sym = str(row.get("symbol") or "").upper()
-            if not sym or sym == cur or sym in seen:
+            if not sym or sym == cur:
                 continue
-            seen.add(sym)
-            try:
-                ol = futures.legs(sym)
-            except Exception as exc:
-                errors.append(f"{sym} 读仓失败：{exc}")
+            amt = abs(d(row.get("positionAmt")))
+            if amt <= 0:
                 continue
+            by_sym.setdefault(sym, []).append(row)
+        out: list[dict] = []
+        for sym, sym_rows in by_sym.items():
+            ol = futures.legs(sym, rows=sym_rows)
             if ol.long_qty <= 0 and ol.short_qty <= 0:
                 continue
             if ol.long_qty > 0 and ol.short_qty > 0:
@@ -735,7 +790,7 @@ class OpsService:
                     "short_entry": fmt_amount(ol.short_entry) if ol.short_entry > 0 else "",
                 }
             )
-        return out, ("；".join(errors) if errors else None)
+        return out, None
 
     @staticmethod
     def _apply_migrate_harvest_advice(
@@ -786,7 +841,8 @@ class OpsService:
             pipe = pipeline_for(account, self.base, dry_run=True, ops=self)
             settings = pipe.settings
             futures = pipe.futures
-            legs = futures.legs(settings.hedge_symbol)
+            pos_rows = futures.all_um_position_rows()
+            legs = futures.legs(settings.hedge_symbol, rows=pos_rows)
             risk = self._risk_for(account, futures, refresh=False)
             mmr = risk.get("uni_mmr") or Decimal("0")
             try:
@@ -798,10 +854,20 @@ class OpsService:
                 stability = Stability(
                     settings.hedge_symbol, mid, Decimal("1"), Decimal("1"), Decimal("1"), False, "价格未刷新"
                 )
+            has_pos = legs.long_qty > 0 or legs.short_qty > 0
             fallback = d(data.get("collateral_usdt") or data.get("bfusd") or "0")
             coll = _sizing_collateral(risk, fallback)
-            fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
-            last_harvest = self.store.last_ok_action_at(account.id, "harvest")
+            if has_pos:
+                fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
+                last_harvest = self.store.last_ok_action_at(account.id, "harvest")
+                try:
+                    harvest_stab = price_stability(futures, settings, purpose="harvest")
+                except Exception:
+                    harvest_stab = stability
+            else:
+                fee = Decimal("0")
+                last_harvest = None
+                harvest_stab = stability
             sized = _sizing_settings(settings, legs)
             plan = position_plan(
                 sized,
@@ -812,10 +878,6 @@ class OpsService:
                 lambda q: futures.round_qty(q, Decimal("0.001")),
                 available=risk.get("available"),
             )
-            try:
-                harvest_stab = price_stability(futures, settings, purpose="harvest")
-            except Exception:
-                harvest_stab = stability
             advice = harvest_advice(
                 legs,
                 harvest_stab,
@@ -827,7 +889,6 @@ class OpsService:
                     legs, stability.mid, plan, collateral=coll, settings=sized
                 ),
             )
-            has_pos = legs.long_qty > 0 or legs.short_qty > 0
             lev, lev_tgt = _display_leverage(legs, settings)
             data["symbol"] = settings.hedge_symbol
             data["settle_asset"] = settle_asset_of(settings.hedge_symbol)
@@ -836,7 +897,9 @@ class OpsService:
             data["uni_mmr"] = format_uni_mmr(mmr, has_pos)
             data["price"] = stability.as_dict().get("mid") or data.get("price") or "0"
             data["legs"] = self._legs_payload(legs)
-            others, others_err = self._other_positions(futures, settings.hedge_symbol, legs)
+            others, others_err = self._other_positions(
+                futures, settings.hedge_symbol, legs, rows=pos_rows
+            )
             data["other_positions"] = others
             data["other_positions_error"] = others_err or ""
             data["stability"] = stability.as_dict()
@@ -849,7 +912,7 @@ class OpsService:
                 auto_harvest=bool(account.auto_harvest),
             )
             data["account"] = account.public_dict()
-            data["events"] = _events_payload(account.id, self.store.recent_events(account.id, 30))
+            # events 仅在整包 _build_snapshot 写入，缓存刷新不查库
         except Exception as exc:
             data["legs_refresh_error"] = str(exc)
         return data
@@ -890,7 +953,8 @@ class OpsService:
         settings = pipe.settings
         futures = pipe.futures
         try:
-            legs = futures.legs(settings.hedge_symbol)
+            pos_rows = futures.all_um_position_rows()
+            legs = futures.legs(settings.hedge_symbol, rows=pos_rows)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         risk = self._risk_for(account, futures, refresh=False)
@@ -899,13 +963,23 @@ class OpsService:
             stability = price_stability(futures, settings)
         except Exception as exc:
             return {"ok": False, "error": f"价格监控失败: {exc}"}
-        last_harvest = self.store.last_ok_action_at(account.id, "harvest")
+        has_pos = legs.long_qty > 0 or legs.short_qty > 0
+        last_harvest = self.store.last_ok_action_at(account.id, "harvest") if has_pos else None
         fallback = Decimal("0")
-        hit = self._snap_cache.get(account.id)
-        if hit:
-            fallback = d(hit[1].get("collateral_usdt") or hit[1].get("bfusd") or "0")
+        snap_hit = self._snap_cache.get(account.id)
+        if snap_hit:
+            fallback = d(snap_hit[1].get("collateral_usdt") or snap_hit[1].get("bfusd") or "0")
         coll = _sizing_collateral(risk, fallback)
-        fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
+        # 无仓：不查成交手续费、不再打一遍收利平稳
+        if has_pos:
+            fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
+            try:
+                harvest_stab = price_stability(futures, settings, purpose="harvest")
+            except Exception:
+                harvest_stab = stability
+        else:
+            fee = Decimal("0")
+            harvest_stab = stability
         sized = _sizing_settings(settings, legs)
         plan = position_plan(
             sized,
@@ -916,10 +990,6 @@ class OpsService:
             lambda q: futures.round_qty(q, Decimal("0.001")),
             available=risk.get("available"),
         )
-        try:
-            harvest_stab = price_stability(futures, settings, purpose="harvest")
-        except Exception:
-            harvest_stab = stability
         advice = harvest_advice(
             legs,
             harvest_stab,
@@ -931,15 +1001,22 @@ class OpsService:
                 legs, stability.mid, plan, collateral=coll, settings=sized
             ),
         )
-        mmr_text = format_uni_mmr(mmr, legs.long_qty > 0 or legs.short_qty > 0)
+        mmr_text = format_uni_mmr(mmr, has_pos)
         lev, lev_tgt = _display_leverage(legs, settings)
-        # 自动归集现货读的是 monitor.spot_usdt；不能只靠快照缓存（常为空）
+        # 现货余额：优先快照；最多每 5 分钟实拉一次
         spot_usdt = self._idle_spot(account)
-        try:
-            spot_usdt = pipe.spot_cash("USDT")
-        except Exception:
-            pass
-        others, others_err = self._other_positions(futures, settings.hedge_symbol, legs)
+        need_spot = account.id not in self._spot_probe_at or (
+            now - float(self._spot_probe_at.get(account.id) or 0) >= self._spot_probe_gap
+        )
+        if need_spot:
+            try:
+                spot_usdt = pipe.spot_cash("USDT")
+                self._spot_probe_at[account.id] = now
+            except Exception:
+                pass
+        others, others_err = self._other_positions(
+            futures, settings.hedge_symbol, legs, rows=pos_rows
+        )
         armed = self.migrate_arm(account.id)
         out = {
             "ok": True,
@@ -966,7 +1043,7 @@ class OpsService:
                 armed=bool(armed),
                 auto_harvest=bool(account.auto_harvest),
             ),
-            "events": _events_payload(account.id, self.store.recent_events(account.id, 30)),
+            # 事件留给 snapshot / 动作后刷新，monitor 高频路径不再查库
             "monitor_cached": False,
         }
         self._monitor_cache[account.id] = (now, out)
@@ -989,7 +1066,7 @@ class OpsService:
         fetched, errs = _gather(
             {
                 "wallet": pipe.wallet_view,
-                "legs": lambda: futures.legs(settings.hedge_symbol),
+                "pos_rows": futures.all_um_position_rows,
                 "risk": lambda: self._risk_for(account, futures, refresh=True),
                 "stability": lambda: price_stability(futures, settings),
                 "filters": lambda: futures.filters(settings.hedge_symbol),
@@ -1009,11 +1086,12 @@ class OpsService:
                 "next_buy": None,
                 "status": earn_error,
             }
-        if "legs" in errs:
-            return {**base, "ok": False, "error": str(errs["legs"])}
+        if "pos_rows" in errs:
+            return {**base, "ok": False, "error": str(errs["pos_rows"])}
         if "stability" in errs:
             return {**base, "ok": False, "error": f"价格监控失败: {errs['stability']}"}
-        legs = fetched["legs"]
+        pos_rows = fetched.get("pos_rows") or []
+        legs = futures.legs(settings.hedge_symbol, rows=pos_rows)
         risk = fetched.get("risk") or {"uni_mmr": Decimal("0"), "equity": Decimal("0"), "available": Decimal("0")}
         stability = fetched["stability"]
         spot_usdt = d(wallet.get("spot_usdt") or "0")
@@ -1022,8 +1100,18 @@ class OpsService:
         mmr = risk.get("uni_mmr") or Decimal("0")
         equity = risk.get("equity") or Decimal("0")
         sizing_coll = _sizing_collateral(risk, earn_collateral)
-        last_harvest = self.store.last_ok_action_at(account.id, "harvest")
-        fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
+        has_pos = legs.long_qty > 0 or legs.short_qty > 0
+        if has_pos:
+            last_harvest = self.store.last_ok_action_at(account.id, "harvest")
+            fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
+            try:
+                harvest_stab = price_stability(futures, settings, purpose="harvest")
+            except Exception:
+                harvest_stab = stability
+        else:
+            last_harvest = None
+            fee = Decimal("0")
+            harvest_stab = stability
         filters = fetched.get("filters")
         step = filters[1] if isinstance(filters, tuple) and len(filters) > 1 else Decimal("0.001")
         sized = _sizing_settings(settings, legs)
@@ -1038,7 +1126,7 @@ class OpsService:
         )
         advice = harvest_advice(
             legs,
-            price_stability(futures, settings, purpose="harvest"),
+            harvest_stab,
             sized,
             last_harvest,
             principal=sizing_coll,
@@ -1056,10 +1144,11 @@ class OpsService:
             margin = pipe.margin_status(equity=equity)
         except Exception as exc:
             margin = {"equity": "0", "need_move": False, "can_click": False, "summary": str(exc), "rows": []}
-        has_pos = legs.long_qty > 0 or legs.short_qty > 0
         mmr_text = format_uni_mmr(mmr, has_pos)
         lev, lev_tgt = _display_leverage(legs, settings)
-        others, others_err = self._other_positions(futures, settings.hedge_symbol, legs)
+        others, others_err = self._other_positions(
+            futures, settings.hedge_symbol, legs, rows=pos_rows
+        )
         armed = self.migrate_arm(account.id)
         earn_principal = strategy_principal(futures, wallet)
         return {
