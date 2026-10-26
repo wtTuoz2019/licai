@@ -22,9 +22,9 @@ from .monitor import (
     enter_advice,
     exit_ip,
     harvest_advice,
+    harvest_fee_estimate,
     position_notional,
     price_stability,
-    resolve_harvest_fee,
     schedule_hint,
 )
 from .pipeline import Pipeline, StepResult
@@ -387,7 +387,8 @@ class OpsService:
         self._risk_ttl = 60.0
         # 多标签连刷 monitor 时复用短缓存，少打币安
         self._monitor_cache: dict[int, tuple[float, dict]] = {}
-        self._monitor_ttl = 15.0
+        # UI 轮询≥60s；自动收利空闲会拉长；15s 过短只会让后台白打
+        self._monitor_ttl = 30.0
         # 只读 Pipeline 复用（按账号）
         self._pipe_cache: dict[int, tuple[float, Pipeline, str]] = {}
         self._pipe_ttl = 180.0
@@ -715,12 +716,15 @@ class OpsService:
             return None
         return hit[1]
 
-    def _risk_for(self, account: Account, futures, *, refresh: bool) -> dict:
+    def _risk_for(
+        self, account: Account, futures, *, refresh: bool, max_age: float | None = None
+    ) -> dict:
         empty = {"uni_mmr": Decimal("0"), "equity": Decimal("0"), "available": Decimal("0")}
         now = time.monotonic()
         hit = self._risk_cache.get(account.id)
+        ttl = float(max_age) if max_age is not None else self._risk_ttl
         if not refresh:
-            if hit and now - hit[0] < self._risk_ttl:
+            if hit and now - hit[0] < ttl:
                 return hit[1]
             # 缓存缺失或过期：轮询也要拉一次，否则有仓位时 uniMMR 会一直显示 —
             refresh = True
@@ -837,83 +841,33 @@ class OpsService:
         return out
 
     def _refresh_cached_legs(self, account: Account, data: dict) -> dict:
-        """资金可沿用缓存，仓位/浮盈必须现拉，避免线上一直显示无仓。"""
+        """资金沿用快照；仓位/平稳/建议复用 monitor（含 30s 缓存），避免切账号双倍打币安。"""
         try:
-            pipe = pipeline_for(account, self.base, dry_run=True, ops=self)
-            settings = pipe.settings
-            futures = pipe.futures
-            pos_rows = futures.all_um_position_rows()
-            legs = futures.legs(settings.hedge_symbol, rows=pos_rows)
-            risk = self._risk_for(account, futures, refresh=False)
-            mmr = risk.get("uni_mmr") or Decimal("0")
-            try:
-                stability = price_stability(futures, settings)
-            except Exception:
-                from .monitor import Stability
-
-                mid = d(data.get("price") or "0")
-                stability = Stability(
-                    settings.hedge_symbol, mid, Decimal("1"), Decimal("1"), Decimal("1"), False, "价格未刷新"
-                )
-            has_pos = legs.long_qty > 0 or legs.short_qty > 0
-            fallback = d(data.get("collateral_usdt") or data.get("bfusd") or "0")
-            coll = _sizing_collateral(risk, fallback)
-            if has_pos:
-                fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
-                last_harvest = self.store.last_ok_action_at(account.id, "harvest")
-                try:
-                    harvest_stab = price_stability(futures, settings, purpose="harvest")
-                except Exception:
-                    harvest_stab = stability
-            else:
-                fee = Decimal("0")
-                last_harvest = None
-                harvest_stab = stability
-            sized = _sizing_settings(settings, legs)
-            plan = position_plan(
-                sized,
-                stability.mid,
-                coll,
-                legs,
-                mmr,
-                lambda q: futures.round_qty(q, Decimal("0.001")),
-                available=risk.get("available"),
-            )
-            advice = harvest_advice(
-                legs,
-                harvest_stab,
-                sized,
-                last_harvest,
-                principal=coll,
-                fee=fee,
-                notional=_harvest_notional(
-                    legs, stability.mid, plan, collateral=coll, settings=sized
-                ),
-            )
-            lev, lev_tgt = _display_leverage(legs, settings)
-            data["symbol"] = settings.hedge_symbol
-            data["settle_asset"] = settle_asset_of(settings.hedge_symbol)
-            data["leverage"] = lev
-            data["leverage_target"] = lev_tgt
-            data["uni_mmr"] = format_uni_mmr(mmr, has_pos)
-            data["price"] = stability.as_dict().get("mid") or data.get("price") or "0"
-            data["legs"] = self._legs_payload(legs)
-            others, others_err = self._other_positions(
-                futures, settings.hedge_symbol, legs, rows=pos_rows
-            )
-            data["other_positions"] = others
-            data["other_positions_error"] = others_err or ""
-            data["stability"] = stability.as_dict()
-            data["enter"] = enter_advice(legs, stability, d(data.get("spot_usdt") or "0"), plan)
-            data["harvest"] = self._apply_migrate_harvest_advice(
-                advice.as_dict(),
-                others,
-                settings.hedge_symbol,
-                armed=bool(self.migrate_arm(account.id)),
-                auto_harvest=bool(account.auto_harvest),
-            )
+            live = self.monitor(account)
+            if not live.get("ok"):
+                data["legs_refresh_error"] = str(live.get("error") or "监控失败")
+                return data
+            for key in (
+                "symbol",
+                "leverage",
+                "leverage_target",
+                "uni_mmr",
+                "price",
+                "legs",
+                "other_positions",
+                "other_positions_error",
+                "stability",
+                "enter",
+                "harvest",
+                "spot_usdt",
+                "migrate_armed",
+            ):
+                if key in live:
+                    data[key] = live[key]
+            sym = str(live.get("symbol") or data.get("symbol") or "")
+            if sym:
+                data["settle_asset"] = settle_asset_of(sym)
             data["account"] = account.public_dict()
-            # events 仅在整包 _build_snapshot 写入，缓存刷新不查库
         except Exception as exc:
             data["legs_refresh_error"] = str(exc)
         return data
@@ -958,22 +912,25 @@ class OpsService:
             legs = futures.legs(settings.hedge_symbol, rows=pos_rows)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
-        risk = self._risk_for(account, futures, refresh=False)
+        has_pos = legs.long_qty > 0 or legs.short_qty > 0
+        # 无仓 uniMMR 不急，账户风险可缓存到 5 分钟
+        risk = self._risk_for(
+            account, futures, refresh=False, max_age=300.0 if not has_pos else None
+        )
         mmr = risk.get("uni_mmr") or Decimal("0")
         try:
             stability = price_stability(futures, settings)
         except Exception as exc:
             return {"ok": False, "error": f"价格监控失败: {exc}"}
-        has_pos = legs.long_qty > 0 or legs.short_qty > 0
         last_harvest = self.store.last_ok_action_at(account.id, "harvest") if has_pos else None
         fallback = Decimal("0")
         snap_hit = self._snap_cache.get(account.id)
         if snap_hit:
             fallback = d(snap_hit[1].get("collateral_usdt") or snap_hit[1].get("bfusd") or "0")
         coll = _sizing_collateral(risk, fallback)
-        # 无仓：不查成交手续费、不再打一遍收利平稳
+        # 展示用配置费率估算；真下单路径仍走 resolve_harvest_fee
         if has_pos:
-            fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
+            fee = harvest_fee_estimate(legs, stability.mid, settings)
             try:
                 harvest_stab = price_stability(futures, settings, purpose="harvest")
             except Exception:
@@ -1004,7 +961,7 @@ class OpsService:
         )
         mmr_text = format_uni_mmr(mmr, has_pos)
         lev, lev_tgt = _display_leverage(legs, settings)
-        # 现货余额：优先快照；最多每 5 分钟实拉一次
+        # 现货余额：优先快照；最多每小时实拉一次
         spot_usdt = self._idle_spot(account)
         need_spot = account.id not in self._spot_probe_at or (
             now - float(self._spot_probe_at.get(account.id) or 0) >= self._spot_probe_gap
@@ -1104,7 +1061,7 @@ class OpsService:
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
         if has_pos:
             last_harvest = self.store.last_ok_action_at(account.id, "harvest")
-            fee = resolve_harvest_fee(futures, settings.hedge_symbol, legs, stability.mid, settings)
+            fee = harvest_fee_estimate(legs, stability.mid, settings)
             try:
                 harvest_stab = price_stability(futures, settings, purpose="harvest")
             except Exception:

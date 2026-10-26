@@ -10,8 +10,9 @@ from .config import d
 
 FAPI = "https://fapi.binance.com"
 SPOT = "https://api.binance.com"
-BOOK_TTL = 0.2
-KLINE_TTL = 20.0
+# 展示/监控用；下单路径请 book(force=True) 或先 invalidate_book
+BOOK_TTL = 3.0
+KLINE_TTL = 45.0
 FILTER_TTL = 6 * 3600.0
 RATE_TTL = 10 * 60.0
 

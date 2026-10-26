@@ -55,6 +55,9 @@ class AutoHarvestWorker:
         # 闲置可转出探测节流
         self._withdraw_probe_at: dict[int, float] = {}
         self._withdraw_probe_gap = 600.0
+        # 账号下次完整检查时间；空闲（无仓/无迁仓/无挂起加仓）拉长，有交叉立刻查
+        self._due_at: dict[int, float] = {}
+        self._idle_gap = 180.0
 
     @staticmethod
     def _load_earn_day_done() -> dict[int, str]:
@@ -105,6 +108,35 @@ class AutoHarvestWorker:
             sec = int(getattr(self.ops.base, "watch_seconds", 60) or 60)
         return max(60.0, float(sec))
 
+    def _mark_due(self, account_id: int, gap: float) -> None:
+        # 错开账号，避免整点一起打币安
+        stagger = float((int(account_id) * 11) % 17)
+        self._due_at[account_id] = time.monotonic() + max(30.0, float(gap)) + stagger
+
+    def _is_due(self, account_id: int) -> bool:
+        return time.monotonic() >= float(self._due_at.get(account_id) or 0)
+
+    def _likely_has_pos(self, account) -> bool:
+        hit = self.ops._monitor_cache.get(account.id)
+        if not hit:
+            return True
+        legs = (hit[1] or {}).get("legs") or {}
+        return _qty(legs, "long_qty") > 0 or _qty(legs, "short_qty") > 0
+
+    def _is_idle(self, account, *, pending_scale: bool) -> bool:
+        if pending_scale or self.ops.migrate_arm(account.id):
+            return False
+        hit = self.ops._monitor_cache.get(account.id)
+        if not hit:
+            return False
+        live = hit[1] or {}
+        legs = live.get("legs") or {}
+        if (legs.get("missing") or "") in {"LONG", "SHORT", "IMBALANCE"}:
+            return False
+        if live.get("other_positions"):
+            return False
+        return _qty(legs, "long_qty") <= 0 and _qty(legs, "short_qty") <= 0
+
     def _loop(self) -> None:
         while not self._stop.wait(self._interval()):
             try:
@@ -122,6 +154,7 @@ class AutoHarvestWorker:
             self._tick_cross = fetch_macd_cross(url, force=True)
         except Exception:
             self._tick_cross = None
+        cross_now = self._tick_cross is not None
         for account in self.ops.store.list_accounts():
             if self._stop.is_set():
                 return
@@ -129,16 +162,13 @@ class AutoHarvestWorker:
                 self._maybe_daily_earn(account)
             except Exception:
                 log.exception("账号 %s 每日理财检查失败", account.id)
-            # 开了自动收利且有旧套保仓：自动挂起迁仓，不必再点按钮
-            try:
-                self._maybe_auto_arm_migrate(account)
-            except Exception:
-                log.exception("账号 %s 自动挂起迁仓失败", account.id)
-            # 换币迁仓挂起：与是否开自动收利无关，后台等到时机再执行
-            try:
-                self._maybe_armed_migrate(account)
-            except Exception:
-                log.exception("账号 %s 挂起迁仓检查失败", account.id)
+            armed = bool(self.ops.migrate_arm(account.id))
+            # 已挂起迁仓：每轮都查，别错过交叉+平稳窗口
+            if armed:
+                try:
+                    self._maybe_armed_migrate(account)
+                except Exception:
+                    log.exception("账号 %s 挂起迁仓检查失败", account.id)
             pending_scale = (
                 bool(getattr(account, "auto_scale", False))
                 and account.scale_add_qty is not None
@@ -146,10 +176,27 @@ class AutoHarvestWorker:
             )
             if not account.auto_harvest and not pending_scale:
                 continue
+            # 有交叉 / 有仓 / 挂起加仓 / 迁仓：按正常间隔；纯空仓空闲拉到 ~3 分钟
+            urgent = (
+                cross_now
+                or armed
+                or pending_scale
+                or self._likely_has_pos(account)
+            )
+            if not urgent and not self._is_due(account.id):
+                continue
+            if account.auto_harvest and not armed:
+                try:
+                    self._maybe_auto_arm_migrate(account)
+                except Exception:
+                    log.exception("账号 %s 自动挂起迁仓失败", account.id)
             try:
                 self._maybe_act(account)
             except Exception:
                 log.exception("账号 %s 自动开仓/收利/加仓失败", account.id)
+            idle = self._is_idle(account, pending_scale=pending_scale)
+            gap = self._interval() if (urgent or not idle) else self._idle_gap
+            self._mark_due(account.id, gap)
 
     def _maybe_auto_arm_migrate(self, account) -> bool:
         """自动收利开启时：发现旧套保仓就挂起迁仓，等交叉+平稳后执行。"""
