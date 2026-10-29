@@ -12,7 +12,18 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 
-DEFAULT_HEDGE_SYMBOLS = ["ETHUSDT", "BTCUSDT", "ETHUSDC", "BTCUSDC", "SOLUSDT", "BNBUSDT"]
+DEFAULT_HEDGE_SYMBOLS = [
+    "ETHUSDT",
+    "BTCUSDT",
+    "ETHUSDC",
+    "BTCUSDC",
+    "SOLUSDT",
+    "BNBUSDT",
+    "SNDKUSDT",
+    "SPCXUSDT",
+    "SNDKUSDC",
+    "SPCXUSDC",
+]
 
 
 def normalize_hedge_symbol(value: str, allowed: list[str] | None = None) -> str:
