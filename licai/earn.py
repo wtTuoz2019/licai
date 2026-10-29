@@ -584,6 +584,225 @@ class EarnAPI:
             return Decimal("0")
         return amt * px
 
+    def _pull_reward_pages(
+        self,
+        path: str,
+        base: dict[str, object],
+        tag: str,
+        errors: list[str],
+        *,
+        max_pages: int = 8,
+    ) -> list:
+        out_rows: list = []
+        for page in range(1, max_pages + 1):
+            params = {**base, "current": page, "size": 100}
+            try:
+                data = self.client.signed("GET", path, params)
+            except BinanceAPIError as exc:
+                errors.append(f"{tag}: {exc}")
+                break
+            rows = data.get("rows") if isinstance(data, dict) else []
+            if not isinstance(rows, list) or not rows:
+                break
+            out_rows.extend(rows)
+            if len(rows) < 100:
+                break
+        return out_rows
+
+    def _collect_reward_rows(
+        self, start_ms: int, end_ms: int, errors: list[str], *, with_dividend: bool = True
+    ) -> dict[str, list]:
+        """拉取某时间窗内全部理财奖励原始行（flexible/locked/BFUSD/RWUSD/分红）。"""
+        flex_rows: list = []
+        seen: set[tuple] = set()
+        for typ in ("ALL", "BONUS", "REALTIME", "REWARDS"):
+            chunk = self._pull_reward_pages(
+                "/sapi/v1/simple-earn/flexible/history/rewardsRecord",
+                {"type": typ, "startTime": start_ms, "endTime": end_ms},
+                f"flex/{typ}",
+                errors,
+            )
+            for row in chunk:
+                if not isinstance(row, dict):
+                    continue
+                sig = (
+                    row.get("time") or row.get("timestamp"),
+                    row.get("asset") or row.get("rewardAsset"),
+                    row.get("rewards") or row.get("amount") or row.get("rewardsAmount"),
+                    row.get("type") or typ,
+                    row.get("productId") or row.get("projectId"),
+                )
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                flex_rows.append(row)
+            if typ == "ALL" and chunk:
+                break
+
+        locked_rows = self._pull_reward_pages(
+            "/sapi/v1/simple-earn/locked/history/rewardsRecord",
+            {"startTime": start_ms, "endTime": end_ms},
+            "locked",
+            errors,
+        )
+        bfusd_rows = self._pull_reward_pages(
+            "/sapi/v1/bfusd/history/rewardsHistory",
+            {"startTime": start_ms, "endTime": end_ms},
+            "bfusd",
+            errors,
+        )
+        rwusd_rows = self._pull_reward_pages(
+            "/sapi/v1/rwusd/history/rewardsHistory",
+            {"startTime": start_ms, "endTime": end_ms},
+            "rwusd",
+            errors,
+        )
+
+        dividend_rows: list = []
+        if with_dividend:
+            div_assets = {"USDT", "USDC", "BFUSD", "RWUSD"}
+            try:
+                for row in self.positions():
+                    asset = str(row.get("asset") or "").upper()
+                    if asset:
+                        div_assets.add(asset)
+            except BinanceAPIError as exc:
+                errors.append(f"positions: {exc}")
+            for asset in sorted(div_assets):
+                try:
+                    data = self.client.signed(
+                        "GET",
+                        "/sapi/v1/asset/assetDividend",
+                        {
+                            "asset": asset,
+                            "startTime": start_ms,
+                            "endTime": end_ms,
+                            "limit": 50,
+                        },
+                    )
+                    rows = data.get("rows") if isinstance(data, dict) else []
+                    if isinstance(rows, list):
+                        for row in rows:
+                            if isinstance(row, dict) and not row.get("asset"):
+                                row = {**row, "asset": asset}
+                            dividend_rows.append(row)
+                except BinanceAPIError as exc:
+                    errors.append(f"dividend/{asset}: {exc}")
+
+        return {
+            "flex": flex_rows,
+            "locked": locked_rows,
+            "bfusd": bfusd_rows,
+            "rwusd": rwusd_rows,
+            "dividend": dividend_rows,
+        }
+
+    def _aggregate_rewards_usdt(self, bags: dict[str, list]) -> dict[str, dict[str, Decimal]]:
+        """原始奖励行 → 按 UTC 日折 USDT：day -> {total,flex,bfusd,rwusd,other}。"""
+        by_day: dict[str, dict[str, Decimal]] = {}
+
+        def _add(kind: str, day: str, usdt: Decimal) -> None:
+            if usdt <= 0 or day == "unknown":
+                return
+            slot = by_day.get(day)
+            if slot is None:
+                slot = {
+                    "total": Decimal("0"),
+                    "flex": Decimal("0"),
+                    "bfusd": Decimal("0"),
+                    "rwusd": Decimal("0"),
+                    "other": Decimal("0"),
+                }
+                by_day[day] = slot
+            slot[kind] = slot.get(kind, Decimal("0")) + usdt
+            slot["total"] = slot.get("total", Decimal("0")) + usdt
+
+        for row in bags.get("flex") or []:
+            if not isinstance(row, dict):
+                continue
+            day = _row_reward_day(row)
+            usdt = self._reward_row_usdt(row)
+            asset = _row_reward_asset(row)
+            if asset == "BFUSD":
+                _add("bfusd", day, usdt)
+            elif asset == "RWUSD":
+                _add("rwusd", day, usdt)
+            elif asset in _STABLE_REWARD or asset in {"", "USDT", "USDC"}:
+                _add("flex", day, usdt)
+            else:
+                _add("other", day, usdt)
+
+        for row in bags.get("locked") or []:
+            if isinstance(row, dict):
+                _add("other", _row_reward_day(row), self._reward_row_usdt(row))
+
+        for row in bags.get("bfusd") or []:
+            if isinstance(row, dict):
+                _add(
+                    "bfusd",
+                    _row_reward_day(row),
+                    self._reward_row_usdt(row, default_asset="BFUSD"),
+                )
+
+        for row in bags.get("rwusd") or []:
+            if isinstance(row, dict):
+                _add(
+                    "rwusd",
+                    _row_reward_day(row),
+                    self._reward_row_usdt(row, default_asset="RWUSD"),
+                )
+
+        for row in bags.get("dividend") or []:
+            if not isinstance(row, dict):
+                continue
+            day = _row_reward_day(row)
+            usdt = self._reward_row_usdt(row)
+            asset = _row_reward_asset(row)
+            if asset == "BFUSD":
+                _add("bfusd", day, usdt)
+            elif asset == "RWUSD":
+                _add("rwusd", day, usdt)
+            elif asset in _STABLE_REWARD:
+                _add("flex", day, usdt)
+            else:
+                _add("other", day, usdt)
+
+        return by_day
+
+    def rewards_usdt_by_day(
+        self,
+        start_ms: int,
+        end_ms: int,
+        *,
+        chunk_days: int = 30,
+        with_dividend: bool = True,
+    ) -> dict[str, object]:
+        """真实奖励入账按日汇总（折 USDT）。按 ≤30 天切片，避开币安时间窗限制。"""
+        if end_ms <= start_ms:
+            return {"by_day": {}, "errors": [], "source": "none"}
+        errors: list[str] = []
+        merged: dict[str, dict[str, Decimal]] = {}
+        chunk_ms = max(1, int(chunk_days)) * 86400 * 1000
+        cursor = int(start_ms)
+        end_ms = int(end_ms)
+        while cursor < end_ms:
+            chunk_end = min(cursor + chunk_ms - 1, end_ms)
+            bags = self._collect_reward_rows(
+                cursor, chunk_end, errors, with_dividend=with_dividend
+            )
+            part = self._aggregate_rewards_usdt(bags)
+            for day, slot in part.items():
+                hit = merged.get(day)
+                if hit is None:
+                    merged[day] = dict(slot)
+                else:
+                    for key in ("total", "flex", "bfusd", "rwusd", "other"):
+                        hit[key] = hit.get(key, Decimal("0")) + slot.get(key, Decimal("0"))
+            cursor = chunk_end + 1
+
+        source = "records" if merged else ("error" if errors else "none")
+        return {"by_day": merged, "errors": errors[:12], "source": source}
+
     def yesterday_earn_reward(self) -> dict[str, object]:
         """理财昨日收益：汇总账户全部理财产品的奖励记录（折 USDT），不做年化粗算。"""
         key = (self.client.api_key or "")[:12]
@@ -594,193 +813,30 @@ class EarnAPI:
         start_ms, end_ms = _reward_query_window_ms(self.client.timestamp())
         # 再扩一档：最近 30 天，避免刚申购后窗口太窄 / 发放日对不齐
         start30 = end_ms - 30 * 86400 * 1000
-        errors: list[str] = []
-
-        def _pull_paged(path: str, base: dict[str, object], tag: str) -> list:
-            out_rows: list = []
-            for page in range(1, 6):
-                params = {**base, "current": page, "size": 100}
-                try:
-                    data = self.client.signed("GET", path, params)
-                except BinanceAPIError as exc:
-                    errors.append(f"{tag}: {exc}")
-                    break
-                rows = data.get("rows") if isinstance(data, dict) else []
-                if not isinstance(rows, list) or not rows:
-                    break
-                out_rows.extend(rows)
-                if len(rows) < 100:
-                    break
-            return out_rows
-
-        def _pull_flex(start: int, end: int) -> list:
-            # 不限制 asset：LDUSDT / LDUSDC / 山寨活期等奖励都要
-            out_rows: list = []
-            seen: set[tuple] = set()
-            for typ in ("ALL", "BONUS", "REALTIME", "REWARDS"):
-                chunk = _pull_paged(
-                    "/sapi/v1/simple-earn/flexible/history/rewardsRecord",
-                    {"type": typ, "startTime": start, "endTime": end},
-                    f"flex/{typ}",
-                )
-                for row in chunk:
-                    if not isinstance(row, dict):
-                        continue
-                    sig = (
-                        row.get("time") or row.get("timestamp"),
-                        row.get("asset") or row.get("rewardAsset"),
-                        row.get("rewards") or row.get("amount") or row.get("rewardsAmount"),
-                        row.get("type") or typ,
-                        row.get("productId") or row.get("projectId"),
-                    )
-                    if sig in seen:
-                        continue
-                    seen.add(sig)
-                    out_rows.append(row)
-                # ALL 成功就够用；失败再试细分 type
-                if typ == "ALL" and chunk:
-                    break
-            return out_rows
-
-        def _pull_locked(start: int, end: int) -> list:
-            return _pull_paged(
-                "/sapi/v1/simple-earn/locked/history/rewardsRecord",
-                {"startTime": start, "endTime": end},
-                "locked",
-            )
-
-        def _pull_bfusd(start: int, end: int) -> list:
-            return _pull_paged(
-                "/sapi/v1/bfusd/history/rewardsHistory",
-                {"startTime": start, "endTime": end},
-                "bfusd",
-            )
-
-        def _pull_rwusd(start: int, end: int) -> list:
-            return _pull_paged(
-                "/sapi/v1/rwusd/history/rewardsHistory",
-                {"startTime": start, "endTime": end},
-                "rwusd",
-            )
-
-        flex_rows = _pull_flex(start_ms, end_ms)
-        locked_rows = _pull_locked(start_ms, end_ms)
-        bfusd_rows = _pull_bfusd(start_ms, end_ms)
-        rwusd_rows = _pull_rwusd(start_ms, end_ms)
-        if not flex_rows and not locked_rows and not bfusd_rows and not rwusd_rows:
-            flex_rows = _pull_flex(start30, end_ms)
-            locked_rows = _pull_locked(start30, end_ms)
-            bfusd_rows = _pull_bfusd(start30, end_ms)
-            rwusd_rows = _pull_rwusd(start30, end_ms)
-
-        # 资金分红兜底（按持仓资产 + 稳定币）
-        dividend_rows: list = []
-        div_assets = {"USDT", "USDC", "BFUSD", "RWUSD"}
-        try:
-            for row in self.positions():
-                asset = str(row.get("asset") or "").upper()
-                if asset:
-                    div_assets.add(asset)
-        except BinanceAPIError as exc:
-            errors.append(f"positions: {exc}")
-        for asset in sorted(div_assets):
-            try:
-                data = self.client.signed(
-                    "GET",
-                    "/sapi/v1/asset/assetDividend",
-                    {"asset": asset, "startTime": start30, "endTime": end_ms, "limit": 50},
-                )
-                rows = data.get("rows") if isinstance(data, dict) else []
-                if isinstance(rows, list):
-                    for row in rows:
-                        if isinstance(row, dict) and not row.get("asset"):
-                            row = {**row, "asset": asset}
-                        dividend_rows.append(row)
-            except BinanceAPIError as exc:
-                errors.append(f"dividend/{asset}: {exc}")
-
-        # 全部记录折 USDT，按发放日汇总；取最近有入账的一天
-        by_day: dict[str, Decimal] = {}
-        by_day_flex: dict[str, Decimal] = {}
-        by_day_bfusd: dict[str, Decimal] = {}
-        by_day_rwusd: dict[str, Decimal] = {}
-        by_day_other: dict[str, Decimal] = {}
-
-        def _add(bucket: dict[str, Decimal], day: str, usdt: Decimal) -> None:
-            if usdt <= 0 or day == "unknown":
-                return
-            bucket[day] = bucket.get(day, Decimal("0")) + usdt
-            by_day[day] = by_day.get(day, Decimal("0")) + usdt
-
-        for row in flex_rows:
-            if not isinstance(row, dict):
-                continue
-            day = _row_reward_day(row)
-            usdt = self._reward_row_usdt(row)
-            asset = _row_reward_asset(row)
-            if asset in {"BFUSD"}:
-                _add(by_day_bfusd, day, usdt)
-            elif asset in {"RWUSD"}:
-                _add(by_day_rwusd, day, usdt)
-            elif asset in _STABLE_REWARD or asset in {"", "USDT", "USDC"}:
-                _add(by_day_flex, day, usdt)
-            else:
-                _add(by_day_other, day, usdt)
-
-        for row in locked_rows:
-            if not isinstance(row, dict):
-                continue
-            _add(by_day_other, _row_reward_day(row), self._reward_row_usdt(row))
-
-        for row in bfusd_rows:
-            if not isinstance(row, dict):
-                continue
-            _add(by_day_bfusd, _row_reward_day(row), self._reward_row_usdt(row, default_asset="BFUSD"))
-
-        for row in rwusd_rows:
-            if not isinstance(row, dict):
-                continue
-            _add(by_day_rwusd, _row_reward_day(row), self._reward_row_usdt(row, default_asset="RWUSD"))
-
-        for row in dividend_rows:
-            if not isinstance(row, dict):
-                continue
-            day = _row_reward_day(row)
-            usdt = self._reward_row_usdt(row)
-            asset = _row_reward_asset(row)
-            if asset == "BFUSD":
-                _add(by_day_bfusd, day, usdt)
-            elif asset == "RWUSD":
-                _add(by_day_rwusd, day, usdt)
-            elif asset in _STABLE_REWARD:
-                _add(by_day_flex, day, usdt)
-            else:
-                _add(by_day_other, day, usdt)
+        packed = self.rewards_usdt_by_day(start_ms, end_ms, chunk_days=30)
+        by_day = packed.get("by_day") or {}
+        errors = list(packed.get("errors") or [])
+        if not by_day:
+            packed = self.rewards_usdt_by_day(start30, end_ms, chunk_days=30)
+            by_day = packed.get("by_day") or {}
+            errors = list(packed.get("errors") or []) or errors
 
         if not by_day:
-            # 兼容旧字段：空结果
             flex = bfusd = rwusd = other = total = Decimal("0")
             latest = ""
         else:
             latest = max(by_day)
-            flex = by_day_flex.get(latest, Decimal("0"))
-            bfusd = by_day_bfusd.get(latest, Decimal("0"))
-            rwusd = by_day_rwusd.get(latest, Decimal("0"))
-            other = by_day_other.get(latest, Decimal("0"))
-            total = by_day[latest]
+            slot = by_day[latest]
+            flex = d(slot.get("flex"))
+            bfusd = d(slot.get("bfusd"))
+            rwusd = d(slot.get("rwusd"))
+            other = d(slot.get("other"))
+            total = d(slot.get("total"))
 
         source = (
             "records"
             if total > 0
-            else (
-                "error"
-                if errors
-                and not flex_rows
-                and not locked_rows
-                and not bfusd_rows
-                and not rwusd_rows
-                else "none"
-            )
+            else ("error" if errors and not by_day else "none")
         )
         out = {
             "amount": total,

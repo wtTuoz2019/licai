@@ -549,6 +549,9 @@
             <span>仓位浮盈</span><b id="pos-upnl">-</b>
           </div>
           <div class="kpi"><span>昨日收益</span><b id="earn-yesterday">-</b></div>
+          <div class="kpi" id="earn-income-box" title="按币安理财奖励入账真实累计（活期/BFUSD/RWUSD 等折 USDT），不是年化估算。">
+            <span>累计理财收益</span><b id="earn-income-total">-</b>
+          </div>
           <div class="kpi" id="earn-apy-box" title="按当天实际理财收入算一次相对年化，同一收益日不再重算。">
             <span>相对年化</span><b id="earn-apy">-</b>
           </div>
@@ -869,6 +872,7 @@
       $("equity").textContent = "-";
       setPosUpnl({});
       $("earn-yesterday").textContent = "-";
+      if ($("earn-income-total")) $("earn-income-total").textContent = "-";
       if ($("earn-apy")) $("earn-apy").textContent = "-";
       setMmr("-");
       $("spot").textContent = "-";
@@ -1714,6 +1718,19 @@
       renderEarnKpis(s.holdings || []);
       $("equity").textContent = s.account_total || s.pm_equity || "-";
       $("earn-yesterday").textContent = s.earn_yesterday || "0";
+      if ($("earn-income-total")) {
+        $("earn-income-total").textContent = s.earn_income_total || "0";
+      }
+      const incomeBox = $("earn-income-box");
+      if (incomeBox) {
+        const from = s.earn_income_from || "";
+        const to = s.earn_income_to || "";
+        const days = s.earn_income_days || 0;
+        const err = s.earn_income_error || "";
+        incomeBox.title = err
+          ? `累计理财收益读取异常：${err}`
+          : `真实奖励入账累计 ${from || "?"} ~ ${to || "?"}，共 ${days} 个有收益日（活期/BFUSD/RWUSD 等折 USDT）。`;
+      }
       if ($("earn-apy")) $("earn-apy").textContent = blendedApyText(s);
       const apyBox = $("earn-apy-box");
       if (apyBox && s.earn_principal) {
