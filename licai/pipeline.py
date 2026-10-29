@@ -1004,6 +1004,10 @@ class Pipeline:
             yday = {"amount": Decimal("0"), "text": "0", "source": "error", "errors": [str(exc)]}
         yday_amt = yday.get("amount") or Decimal("0")
         yday_errs = yday.get("errors") or []
+        yday_flex = d(yday.get("flex"))
+        yday_bfusd = d(yday.get("bfusd"))
+        yday_rwusd = d(yday.get("rwusd"))
+        yday_other = d(yday.get("other"))
         return {
             "spot_usdt": fmt_amount(spot, 4),
             "usdt_flexible": fmt_amount(usdt_flex, 4),
@@ -1011,6 +1015,10 @@ class Pipeline:
             "bfusd": fmt_amount(bfusd, 4),
             "earn_total": fmt_amount(usdt_flex + bfusd + other, 4),
             "earn_yesterday": fmt_amount(yday_amt, 4) if yday_amt > 0 else "0",
+            "earn_yesterday_flex": fmt_amount(yday_flex, 4) if yday_flex > 0 else "0",
+            "earn_yesterday_bfusd": fmt_amount(yday_bfusd, 4) if yday_bfusd > 0 else "0",
+            "earn_yesterday_rwusd": fmt_amount(yday_rwusd, 4) if yday_rwusd > 0 else "0",
+            "earn_yesterday_other": fmt_amount(yday_other, 4) if yday_other > 0 else "0",
             "earn_yesterday_source": str(yday.get("source") or "none"),
             "earn_yesterday_day": str(yday.get("day") or ""),
             "earn_yesterday_error": "; ".join(str(x) for x in yday_errs[:3]) if yday_errs else "",

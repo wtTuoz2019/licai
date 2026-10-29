@@ -549,7 +549,7 @@
             <span>仓位浮盈</span><b id="pos-upnl">-</b>
           </div>
           <div class="kpi"><span>昨日收益</span><b id="earn-yesterday">-</b></div>
-          <div class="kpi" id="earn-income-box" title="按币安理财奖励入账真实累计（活期/BFUSD/RWUSD 等折 USDT），不是年化估算。">
+          <div class="kpi" id="earn-income-box" title="自首次入场日起，按币安真实奖励入账累计，记在数据库；每天收益到账只加一次。">
             <span>累计理财收益</span><b id="earn-income-total">-</b>
           </div>
           <div class="kpi" id="earn-apy-box" title="按当天实际理财收入算一次相对年化，同一收益日不再重算。">
@@ -1729,7 +1729,7 @@
         const err = s.earn_income_error || "";
         incomeBox.title = err
           ? `累计理财收益读取异常：${err}`
-          : `真实奖励入账累计 ${from || "?"} ~ ${to || "?"}，共 ${days} 个有收益日（活期/BFUSD/RWUSD 等折 USDT）。`;
+          : `自入场日 ${from || "?"} 起累计到 ${to || "?"}，共 ${days} 个收益日（数据库记账，每日到账加一次）。`;
       }
       if ($("earn-apy")) $("earn-apy").textContent = blendedApyText(s);
       const apyBox = $("earn-apy-box");

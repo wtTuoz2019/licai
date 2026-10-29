@@ -417,14 +417,8 @@ class OpsService:
         self._daily_apy: dict[int, dict] = {}
         self._daily_apy_lock = threading.Lock()
         self._load_daily_apy()
-        # 真实理财累计收益（奖励入账折 USDT），按日账本落盘
-        self._income_total_path = ROOT / "data" / "earn_income_total.json"
-        self._income_total: dict[int, dict] = {}
+        # 累计理财收益：按首次入场日起算，SQLite 记账，每日到账加一次
         self._income_total_lock = threading.Lock()
-        self._income_total_ttl = 6 * 3600.0
-        self._income_lookback_days = 730
-        self._income_backfill_running: set[int] = set()
-        self._load_income_total()
 
     def _load_earn_region_block(self) -> None:
         path = getattr(self, "_region_block_path", ROOT / "data" / "earn_region_block.json")
@@ -476,51 +470,70 @@ class OpsService:
         except Exception:
             pass
 
-    def _load_income_total(self) -> None:
-        path = getattr(self, "_income_total_path", ROOT / "data" / "earn_income_total.json")
+    @staticmethod
+    def _iso_to_utc_day(value: str | None) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+            return text[:10]
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = text.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
         except Exception:
-            raw = {}
-        out: dict[int, dict] = {}
-        if isinstance(raw, dict):
-            for key, row in raw.items():
-                try:
-                    aid = int(key)
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(row, dict) and row.get("by_day") is not None:
-                    out[aid] = row
-        self._income_total = out
+            return ""
 
-    def _save_income_total(self) -> None:
-        path = getattr(self, "_income_total_path", ROOT / "data" / "earn_income_total.json")
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {str(aid): row for aid, row in sorted(self._income_total.items())}
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        except Exception:
-            pass
+    def _entry_day(self, account: Account) -> str:
+        """累计起点：首次成功入场日；没有入场记录则用账号创建日。"""
+        first = self.store.first_ok_action_at(account.id, "enter")
+        day = self._iso_to_utc_day(first) or self._iso_to_utc_day(account.created_at)
+        return day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     @staticmethod
-    def _income_payload_from_row(row: dict) -> dict:
+    def _day_start_ms(day: str) -> int:
+        dt = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+
+    @staticmethod
+    def _income_payload_from_db(row: dict | None, *, error: str = "") -> dict:
+        row = row or {}
+        total = str(row.get("total") or "0")
+        since = str(row.get("since_day") or "")
+        last = str(row.get("last_day") or "")
         return {
-            "earn_income_total": str(row.get("total") or "0"),
+            "earn_income_total": total,
             "earn_income_flex": str(row.get("flex") or "0"),
             "earn_income_bfusd": str(row.get("bfusd") or "0"),
             "earn_income_rwusd": str(row.get("rwusd") or "0"),
             "earn_income_other": str(row.get("other") or "0"),
             "earn_income_days": int(row.get("days") or 0),
-            "earn_income_from": str(row.get("from_day") or ""),
-            "earn_income_to": str(row.get("to_day") or ""),
-            "earn_income_source": str(row.get("source") or "none"),
-            "earn_income_error": str(row.get("error") or ""),
+            "earn_income_from": since,
+            "earn_income_to": last,
+            "earn_income_source": "records" if d(total) > 0 else ("error" if error else "none"),
+            "earn_income_error": error,
             "earn_income_cached": True,
         }
 
-    def _summarize_income_days(self, by_day: dict) -> dict:
+    def _seed_earn_income_from_entry(self, account: Account, pipe: Pipeline, since_day: str) -> dict:
+        """首次建账：从入场日拉真实奖励汇总一次，写入数据库。"""
+        try:
+            end_ms = int(pipe.client.timestamp())
+        except Exception:
+            end_ms = int(time.time() * 1000)
+        start_ms = self._day_start_ms(since_day)
+        packed = pipe.earn.rewards_usdt_by_day(start_ms, end_ms, chunk_days=30)
+        by_day = packed.get("by_day") or {}
+        errors = list(packed.get("errors") or [])
+        if str(packed.get("source") or "") == "error" and not by_day:
+            raise RuntimeError("; ".join(errors[:3]) or "拉取理财奖励失败")
+
         total = flex = bfusd = rwusd = other = Decimal("0")
-        days = sorted(str(k) for k in (by_day or {}) if k and k != "unknown")
+        days = sorted(
+            str(k) for k in by_day if k and k != "unknown" and str(k) >= since_day
+        )
         for day in days:
             slot = by_day.get(day) or {}
             if not isinstance(slot, dict):
@@ -530,198 +543,103 @@ class OpsService:
             bfusd += d(slot.get("bfusd"))
             rwusd += d(slot.get("rwusd"))
             other += d(slot.get("other"))
-        return {
-            "total": fmt_amount(total, 4) if total > 0 else "0",
-            "flex": fmt_amount(flex, 4) if flex > 0 else "0",
-            "bfusd": fmt_amount(bfusd, 4) if bfusd > 0 else "0",
-            "rwusd": fmt_amount(rwusd, 4) if rwusd > 0 else "0",
-            "other": fmt_amount(other, 4) if other > 0 else "0",
-            "days": len(days),
-            "from_day": days[0] if days else "",
-            "to_day": days[-1] if days else "",
-            "source": "records" if total > 0 else "none",
-            "error": "",
-            "by_day": by_day,
-        }
+        return self.store.upsert_earn_income(
+            account.id,
+            since_day=since_day,
+            total=fmt_amount(total, 4) if total > 0 else "0",
+            flex=fmt_amount(flex, 4) if flex > 0 else "0",
+            bfusd=fmt_amount(bfusd, 4) if bfusd > 0 else "0",
+            rwusd=fmt_amount(rwusd, 4) if rwusd > 0 else "0",
+            other=fmt_amount(other, 4) if other > 0 else "0",
+            last_day=days[-1] if days else "",
+            days=len(days),
+        )
 
-    def _merge_income_days(
-        self, by_day: dict[str, dict], fresh: dict, start_ms: int, end_ms: int
-    ) -> dict[str, dict]:
-        start_day = datetime.fromtimestamp(start_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
-        end_day = datetime.fromtimestamp(end_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
-        for day in list(by_day):
-            if start_day <= day <= end_day:
-                by_day.pop(day, None)
-        for day, slot in (fresh or {}).items():
-            if not isinstance(slot, dict):
-                continue
-            by_day[str(day)] = {
-                "total": fmt_amount(d(slot.get("total")), 8),
-                "flex": fmt_amount(d(slot.get("flex")), 8),
-                "bfusd": fmt_amount(d(slot.get("bfusd")), 8),
-                "rwusd": fmt_amount(d(slot.get("rwusd")), 8),
-                "other": fmt_amount(d(slot.get("other")), 8),
-            }
-        return by_day
-
-    def _kick_income_backfill(self, account: Account) -> None:
-        """后台把账本补到 lookback（两年），不堵快照。"""
-        aid = account.id
+    def _earn_income_total_for(
+        self,
+        account: Account,
+        pipe: Pipeline,
+        *,
+        force: bool = False,
+        yday_day: str = "",
+        yday_amt: Decimal | None = None,
+        yday_flex: Decimal | None = None,
+        yday_bfusd: Decimal | None = None,
+        yday_rwusd: Decimal | None = None,
+        yday_other: Decimal | None = None,
+    ) -> dict:
+        """累计理财收益：入场日起算写入 SQLite；之后每日收益到账只加一次。"""
+        since_day = self._entry_day(account)
+        yday_day = str(yday_day or "").strip()
+        yday_amt = d(yday_amt)
         with self._income_total_lock:
-            if aid in self._income_backfill_running:
-                return
-            row = self._income_total.get(aid) or {}
-            synced_from = int(row.get("synced_from_ms") or 0)
-            synced_until = int(row.get("synced_until_ms") or 0)
-            target_from = max(0, synced_until - int(self._income_lookback_days) * 86400 * 1000)
-            if synced_from > 0 and synced_from <= target_from + 86400 * 1000:
-                return
-            self._income_backfill_running.add(aid)
-
-        def _run() -> None:
-            try:
-                pipe = pipeline_for(account, self.base, dry_run=True, ops=self)
+            row = self.store.get_earn_income(account.id)
+            # 只在无账本、或建账失败（总额与末日都空）时从入场日拉一次；不按两年回补
+            need_seed = row is None or (
+                d(row.get("total")) <= 0 and not str(row.get("last_day") or "")
+            )
+            if need_seed:
                 try:
-                    end_ms = int(pipe.client.timestamp())
-                except Exception:
-                    end_ms = int(time.time() * 1000)
-                with self._income_total_lock:
-                    cached = dict(self._income_total.get(aid) or {})
-                by_day_raw = cached.get("by_day") if isinstance(cached.get("by_day"), dict) else {}
-                by_day = {
-                    str(day): {
-                        "total": str(slot.get("total") or "0"),
-                        "flex": str(slot.get("flex") or "0"),
-                        "bfusd": str(slot.get("bfusd") or "0"),
-                        "rwusd": str(slot.get("rwusd") or "0"),
-                        "other": str(slot.get("other") or "0"),
-                    }
-                    for day, slot in by_day_raw.items()
-                    if isinstance(slot, dict)
-                }
-                target_from = end_ms - int(self._income_lookback_days) * 86400 * 1000
-                cursor_end = int(cached.get("synced_from_ms") or end_ms)
-                # 一段段往回补，每段 60 天
-                while cursor_end > target_from:
-                    chunk_start = max(target_from, cursor_end - 60 * 86400 * 1000)
-                    packed = pipe.earn.rewards_usdt_by_day(
-                        chunk_start, max(chunk_start, cursor_end - 1), chunk_days=30
+                    row = self._seed_earn_income_from_entry(account, pipe, since_day)
+                except Exception as exc:
+                    if row:
+                        return self._income_payload_from_db(row, error=str(exc))
+                    return self._income_payload_from_db(
+                        {
+                            "since_day": since_day,
+                            "total": "0",
+                            "last_day": "",
+                            "days": 0,
+                        },
+                        error=str(exc),
                     )
-                    if str(packed.get("source") or "") == "error" and not packed.get("by_day"):
-                        break
-                    by_day = self._merge_income_days(
-                        by_day, packed.get("by_day") or {}, chunk_start, cursor_end - 1
-                    )
-                    summary = self._summarize_income_days(by_day)
-                    row = {
-                        **summary,
-                        "by_day": by_day,
-                        "synced_until_ms": int(cached.get("synced_until_ms") or end_ms),
-                        "synced_from_ms": chunk_start,
-                        "fetched_at": time.time(),
-                    }
-                    with self._income_total_lock:
-                        self._income_total[aid] = row
-                        self._save_income_total()
-                    cached = row
-                    cursor_end = chunk_start
-            except Exception:
-                pass
-            finally:
-                with self._income_total_lock:
-                    self._income_backfill_running.discard(aid)
 
-        threading.Thread(target=_run, name=f"earn-income-{aid}", daemon=True).start()
-
-    def _earn_income_total_for(self, account: Account, pipe: Pipeline, *, force: bool = False) -> dict:
-        """累计真实理财奖励（折 USDT）。账本落盘；常态 6h 增量；首刷只拉近窗，历史后台补。"""
-        now = time.time()
-        with self._income_total_lock:
-            cached = dict(self._income_total.get(account.id) or {})
-        if (
-            not force
-            and cached.get("by_day") is not None
-            and cached.get("total") is not None
-            and now - float(cached.get("fetched_at") or 0) < self._income_total_ttl
-        ):
-            self._kick_income_backfill(account)
-            return self._income_payload_from_row(cached)
-
-        try:
-            end_ms = int(pipe.client.timestamp())
-        except Exception:
-            end_ms = int(time.time() * 1000)
-
-        by_day_raw = cached.get("by_day") if isinstance(cached.get("by_day"), dict) else {}
-        by_day: dict[str, dict] = {}
-        for day, slot in by_day_raw.items():
-            if not isinstance(slot, dict):
-                continue
-            by_day[str(day)] = {
-                "total": str(slot.get("total") or "0"),
-                "flex": str(slot.get("flex") or "0"),
-                "bfusd": str(slot.get("bfusd") or "0"),
-                "rwusd": str(slot.get("rwusd") or "0"),
-                "other": str(slot.get("other") or "0"),
-            }
-
-        synced_until = int(cached.get("synced_until_ms") or 0)
-        if by_day and synced_until > 0:
-            # 增量：重叠 2~7 天重算
-            overlap = 7 if force else 2
-            start_ms = max(0, synced_until - overlap * 86400 * 1000)
-        else:
-            # 首刷只要近 40 天，完整历史交给后台回填
-            start_ms = end_ms - 40 * 86400 * 1000
-
-        errors: list[str] = []
-        try:
-            packed = pipe.earn.rewards_usdt_by_day(start_ms, end_ms, chunk_days=30)
-            fresh = packed.get("by_day") or {}
-            errors = list(packed.get("errors") or [])
-            fetch_ok = str(packed.get("source") or "") != "error" or bool(fresh)
-        except Exception as exc:
-            fresh = {}
-            errors = [str(exc)]
-            fetch_ok = False
-
-        if fetch_ok:
-            by_day = self._merge_income_days(by_day, fresh, start_ms, end_ms)
-
-        summary = self._summarize_income_days(by_day)
-        if errors and d(summary.get("total")) <= 0 and not by_day:
-            summary["source"] = "error"
-            summary["error"] = "; ".join(errors[:3])
-        elif errors:
-            summary["error"] = "; ".join(errors[:3])
-
-        if not fetch_ok and by_day:
-            with self._income_total_lock:
-                old = dict(self._income_total.get(account.id) or cached)
-                old["error"] = summary.get("error") or "; ".join(errors[:3])
-                self._income_total[account.id] = old
-                self._save_income_total()
-            out = self._income_payload_from_row(old)
-            out["earn_income_error"] = old.get("error") or ""
-            return out
-
-        row = {
-            **summary,
-            "synced_until_ms": end_ms if fetch_ok else int(cached.get("synced_until_ms") or 0),
-            "synced_from_ms": int(
-                min(
-                    int(cached.get("synced_from_ms") or start_ms or end_ms),
-                    start_ms if fetch_ok else int(cached.get("synced_from_ms") or start_ms),
+            last_day = str(row.get("last_day") or "")
+            # 新的收益日到账：只累加一次
+            if (
+                yday_day
+                and yday_amt > 0
+                and yday_day >= since_day
+                and (not last_day or yday_day > last_day)
+            ):
+                total = d(row.get("total")) + yday_amt
+                flex = d(row.get("flex")) + d(yday_flex)
+                bfusd = d(row.get("bfusd")) + d(yday_bfusd)
+                rwusd = d(row.get("rwusd")) + d(yday_rwusd)
+                other = d(row.get("other")) + d(yday_other)
+                # 若没拆分明细，整笔记入 other 以外的 total 已含；拆分为 0 时不重复加 other
+                if d(yday_flex) + d(yday_bfusd) + d(yday_rwusd) + d(yday_other) <= 0:
+                    # 仅有总额：保持分项不动，只更新 total
+                    flex = d(row.get("flex"))
+                    bfusd = d(row.get("bfusd"))
+                    rwusd = d(row.get("rwusd"))
+                    other = d(row.get("other"))
+                days = int(row.get("days") or 0) + 1
+                row = self.store.upsert_earn_income(
+                    account.id,
+                    since_day=since_day,
+                    total=fmt_amount(total, 4),
+                    flex=fmt_amount(flex, 4) if flex > 0 else "0",
+                    bfusd=fmt_amount(bfusd, 4) if bfusd > 0 else "0",
+                    rwusd=fmt_amount(rwusd, 4) if rwusd > 0 else "0",
+                    other=fmt_amount(other, 4) if other > 0 else "0",
+                    last_day=yday_day,
+                    days=days,
                 )
-            ),
-            "fetched_at": now if fetch_ok else float(cached.get("fetched_at") or 0),
-            "by_day": by_day,
-        }
-        with self._income_total_lock:
-            self._income_total[account.id] = row
-            self._save_income_total()
-        self._kick_income_backfill(account)
-        return self._income_payload_from_row(row)
+            elif str(row.get("since_day") or "") != since_day:
+                # 入场日变了（极少）：改 since 标记，不重算历史以免翻倍
+                row = self.store.upsert_earn_income(
+                    account.id,
+                    since_day=since_day,
+                    total=str(row.get("total") or "0"),
+                    flex=str(row.get("flex") or "0"),
+                    bfusd=str(row.get("bfusd") or "0"),
+                    rwusd=str(row.get("rwusd") or "0"),
+                    other=str(row.get("other") or "0"),
+                    last_day=str(row.get("last_day") or ""),
+                    days=int(row.get("days") or 0),
+                )
+            return self._income_payload_from_db(row)
 
     def _daily_apy_for(
         self,
@@ -1135,11 +1053,10 @@ class OpsService:
             if hit and now - hit[0] < self._snap_ttl:
                 data = dict(hit[1])
                 data = self._refresh_cached_legs(account, data)
-                # 累计收益走独立账本，缓存快照时也带上最新汇总（不打币安）
-                with self._income_total_lock:
-                    income_row = self._income_total.get(account.id)
+                # 累计收益走 SQLite，缓存快照时带上库里最新值
+                income_row = self.store.get_earn_income(account.id)
                 if income_row:
-                    data.update(self._income_payload_from_row(income_row))
+                    data.update(self._income_payload_from_db(income_row))
                 data["from_cache"] = True
                 data["cache_age"] = int(now - hit[0])
                 return data
@@ -1371,7 +1288,17 @@ class OpsService:
         armed = self.migrate_arm(account.id)
         earn_principal = strategy_principal(futures, wallet)
         try:
-            income_total = self._earn_income_total_for(account, pipe, force=force_income)
+            income_total = self._earn_income_total_for(
+                account,
+                pipe,
+                force=force_income,
+                yday_day=str(wallet.get("earn_yesterday_day") or ""),
+                yday_amt=d(wallet.get("earn_yesterday") or 0),
+                yday_flex=d(wallet.get("earn_yesterday_flex") or 0),
+                yday_bfusd=d(wallet.get("earn_yesterday_bfusd") or 0),
+                yday_rwusd=d(wallet.get("earn_yesterday_rwusd") or 0),
+                yday_other=d(wallet.get("earn_yesterday_other") or 0),
+            )
         except Exception as exc:
             income_total = {
                 "earn_income_total": "0",

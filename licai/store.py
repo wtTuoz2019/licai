@@ -111,6 +111,22 @@ class AccountStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS earn_income (
+                    account_id INTEGER PRIMARY KEY,
+                    since_day TEXT NOT NULL,
+                    total TEXT NOT NULL DEFAULT '0',
+                    flex TEXT NOT NULL DEFAULT '0',
+                    bfusd TEXT NOT NULL DEFAULT '0',
+                    rwusd TEXT NOT NULL DEFAULT '0',
+                    other TEXT NOT NULL DEFAULT '0',
+                    last_day TEXT NOT NULL DEFAULT '',
+                    days INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             cols = {row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()}
             if "hedge_symbol" not in cols:
                 conn.execute("ALTER TABLE accounts ADD COLUMN hedge_symbol TEXT NOT NULL DEFAULT 'ETHUSDT'")
@@ -257,6 +273,7 @@ class AccountStore:
         self.get(account_id)
         with self._connect() as conn:
             conn.execute("DELETE FROM events WHERE account_id = ?", (account_id,))
+            conn.execute("DELETE FROM earn_income WHERE account_id = ?", (account_id,))
             conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
 
     def add_event(self, account_id: int, action: str, ok: bool, detail: str) -> Event:
@@ -318,6 +335,80 @@ class AccountStore:
                 (account_id, action),
             ).fetchone()
         return None if row is None else str(row["created_at"])
+
+    def first_ok_action_at(self, account_id: int, action: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT created_at FROM events WHERE account_id = ? AND action = ? AND ok = 1 ORDER BY id ASC LIMIT 1",
+                (account_id, action),
+            ).fetchone()
+        return None if row is None else str(row["created_at"])
+
+    def get_earn_income(self, account_id: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM earn_income WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {k: row[k] for k in row.keys()}
+
+    def upsert_earn_income(
+        self,
+        account_id: int,
+        *,
+        since_day: str,
+        total: str,
+        flex: str = "0",
+        bfusd: str = "0",
+        rwusd: str = "0",
+        other: str = "0",
+        last_day: str = "",
+        days: int = 0,
+    ) -> dict:
+        updated = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO earn_income (
+                    account_id, since_day, total, flex, bfusd, rwusd, other, last_day, days, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    since_day = excluded.since_day,
+                    total = excluded.total,
+                    flex = excluded.flex,
+                    bfusd = excluded.bfusd,
+                    rwusd = excluded.rwusd,
+                    other = excluded.other,
+                    last_day = excluded.last_day,
+                    days = excluded.days,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account_id,
+                    since_day,
+                    total,
+                    flex,
+                    bfusd,
+                    rwusd,
+                    other,
+                    last_day or "",
+                    int(days or 0),
+                    updated,
+                ),
+            )
+        return self.get_earn_income(account_id) or {
+            "account_id": account_id,
+            "since_day": since_day,
+            "total": total,
+            "flex": flex,
+            "bfusd": bfusd,
+            "rwusd": rwusd,
+            "other": other,
+            "last_day": last_day or "",
+            "days": int(days or 0),
+            "updated_at": updated,
+        }
 
     @staticmethod
     def _account(row: sqlite3.Row) -> Account:
