@@ -105,6 +105,8 @@ class Pipeline:
         # 本进程内：地区/合规不可用的产品（如 RWUSD -9000），避免反复赎回后申购失败把 U 卡在现货
         self._runtime_denylist: set[str] = set()
         self._on_denylist_change: Callable[[], None] | None = None
+        # RWUSD 是否能走 earn-asset-transfer；None=未探测
+        self._rwusd_pm_transferable: bool | None = None
 
     def spot_cash(self, asset: str | None = None) -> Decimal:
         return self.earn.spot_free((asset or self.settings.source_asset).upper())
@@ -219,11 +221,15 @@ class Pipeline:
             return product.kind
         return f"flex:{product.product_id or product.asset}"
 
-    def _yield_slices(self) -> list[tuple[FlexibleProduct, Decimal, Decimal | None]]:
+    def _yield_slices(
+        self, *, require_pm_transfer: bool = False
+    ) -> list[tuple[FlexibleProduct, Decimal, Decimal | None]]:
         """每个产品按自己的额度切档：(产品, 年化百分比, 该档额度)。额度 None 表示剩余资金。"""
         slices: list[tuple[FlexibleProduct, Decimal, Decimal | None]] = []
         for product in self.list_products():
             if not self._eligible(product, self.margin_assets()):
+                continue
+            if require_pm_transfer and not self.pm_earn_transferable(product):
                 continue
             if product.kind == "bfusd":
                 raw = product.raw or {}
@@ -299,10 +305,11 @@ class Pipeline:
         holdings: list[tuple[FlexibleProduct, Decimal]] | None = None,
         *,
         stable_only: bool = False,
+        require_pm_transfer: bool = False,
     ) -> list[tuple[FlexibleProduct, Decimal, FlexibleProduct, str]]:
         """按各产品额度从高年化往低填，只挪超出额度、且年化差得过最小差距的部分。"""
         holdings = holdings if holdings is not None else self.earn_holdings()
-        slices = self._yield_slices()
+        slices = self._yield_slices(require_pm_transfer=require_pm_transfer)
         if not slices:
             return []
         gap = self._apr_gap()
@@ -420,10 +427,48 @@ class Pipeline:
         self._product_list_at = now
         return filtered
 
-    def pick(self, products: list[FlexibleProduct] | None = None, margin_assets: set[str] | None = None) -> FlexibleProduct:
+    def pm_earn_transferable(self, product: FlexibleProduct) -> bool:
+        """申购后能否走 earn-asset-transfer 划进统一账户当保证金。
+
+        币安该接口正式支持 LDUSDT；BFUSD 固定 -1100；RWUSD 探测一次并缓存。
+        """
+        kind = (product.kind or "").lower()
+        if kind == "bfusd":
+            return False
+        token = (product.margin_token or "").upper()
+        if not token and kind not in {"bfusd", "rwusd"}:
+            token = f"LD{(product.asset or '').upper()}"
+        if token.startswith("LD"):
+            return True
+        if kind == "rwusd" or (product.asset or "").upper() == "RWUSD":
+            if self._rwusd_pm_transferable is not None:
+                return self._rwusd_pm_transferable
+            try:
+                self.futures.earn_to_pm_balance("RWUSD")
+                self._rwusd_pm_transferable = True
+            except BinanceAPIError as exc:
+                self._rwusd_pm_transferable = not self._earn_transfer_unsupported(exc)
+            except Exception:
+                self._rwusd_pm_transferable = False
+            return bool(self._rwusd_pm_transferable)
+        return False
+
+    def pick(
+        self,
+        products: list[FlexibleProduct] | None = None,
+        margin_assets: set[str] | None = None,
+        *,
+        require_pm_transfer: bool = False,
+    ) -> FlexibleProduct:
         products = products if products is not None else self.list_products()
         margin_assets = margin_assets if margin_assets is not None else self.margin_assets()
         candidates = [p for p in products if self._eligible(p, margin_assets)]
+        if require_pm_transfer:
+            transferable = [p for p in candidates if self.pm_earn_transferable(p)]
+            if transferable:
+                candidates = transferable
+            else:
+                raise RuntimeError("没有可划入统一账户的理财产品（earn-asset-transfer，如 USDT 活期/LDUSDT）")
         if self._wallet_transfer_blocked:
             # 现货划不进统一账户时，只留申购后能用理财代币转入的产品（LDUSDT 这类）
             via_earn = [p for p in candidates if (p.margin_token or "").upper().startswith("LD")]
@@ -642,9 +687,9 @@ class Pipeline:
         return (product.margin_token or f"LD{product.asset}").upper()
 
     def plan_earn_target(self) -> tuple[FlexibleProduct | None, StepResult]:
-        """收利平仓前预选：查好要兑/申购哪个理财，避免平完再查。"""
+        """收利平仓前预选：只选能划进统一账户的理财，避免平完 BFUSD 回不了保证金。"""
         try:
-            product = self.pick()
+            product = self.pick(require_pm_transfer=True)
         except Exception as exc:
             return None, StepResult("预选理财", False, str(exc))
         settle = settle_asset_of(self.settings.hedge_symbol).upper()
@@ -659,7 +704,7 @@ class Pipeline:
                 path.append(f"{source}->{product.asset}")
             path.append(f"申购 {product.asset} 活期")
         token = self.margin_token_of(product)
-        path.append(f"保证金 {token}")
+        path.append(f"保证金 {token}（可划入统一账户）")
         return product, StepResult(
             "预选理财",
             True,
@@ -680,10 +725,11 @@ class Pipeline:
                 return free
             time.sleep(0.2)
 
-    def pull_idle_margin_to_earn(self) -> list[StepResult]:
+    def pull_idle_margin_to_earn(self, *, require_pm_transfer: bool = False) -> list[StepResult]:
         """统一账户里可安全转出的结算币 → 现货 → 申购当前最高年化。
 
         有对冲时按 uniMMR 安全线估额度，绝不抽干保证金；无仓则尽量转满。
+        require_pm_transfer：入场/收利时只买能划回统一账户的产品。
         """
         steps: list[StepResult] = []
         settle = settle_asset_of(self.settings.hedge_symbol) or self.settings.source_asset
@@ -756,10 +802,15 @@ class Pipeline:
         if not moved.dry_run:
             self.earn.invalidate()
             time.sleep(max(int(self.settings.settle_seconds or 0), 2))
-        steps.extend(self.sweep_spot_to_earn())
+        steps.extend(self.sweep_spot_to_earn(require_pm_transfer=require_pm_transfer))
         return steps
 
-    def sweep_spot_to_earn(self, product: FlexibleProduct | None = None) -> list[StepResult]:
+    def sweep_spot_to_earn(
+        self,
+        product: FlexibleProduct | None = None,
+        *,
+        require_pm_transfer: bool = False,
+    ) -> list[StepResult]:
         steps: list[StepResult] = []
         # USDC 本位收利后现货是 USDC：先换成 USDT，再走原来的理财申购
         settle = settle_asset_of(self.settings.hedge_symbol)
@@ -796,6 +847,10 @@ class Pipeline:
                 return steps
             return [StepResult("归集理财", True, "现货没有可申购余额，跳过申购")]
         fixed_product = product
+        if require_pm_transfer and product is not None and not self.pm_earn_transferable(product):
+            # 调用方预选了不可划转产品时改选可划转，避免收利补仓卡死
+            product = None
+            fixed_product = None
         bought_any = False
         for _round in range(4):
             if free < SPOT_MIN:
@@ -803,7 +858,7 @@ class Pipeline:
             if product is None or _round > 0:
                 self._product_list = None
                 try:
-                    product = self.pick()
+                    product = self.pick(require_pm_transfer=require_pm_transfer)
                 except Exception as exc:
                     return steps + [StepResult("归集理财", False, str(exc))]
             amount = self.plan_amount(product, sweep_all=True)
@@ -1786,14 +1841,21 @@ class Pipeline:
             return "没有可比较的产品"
         return "、".join(f"{p.asset} {apr_choice_text(p)}" for p in ranked[:5])
 
-    def switch_to_best(self, *, full: bool = False, has_hedge: bool | None = None) -> list[StepResult]:
+    def switch_to_best(
+        self,
+        *,
+        full: bool = False,
+        has_hedge: bool | None = None,
+        require_pm_transfer: bool = False,
+    ) -> list[StepResult]:
         """把非目标活期换成当前最高年化产品。
 
         full=True：换年化/入场用。无仓时尽量一次赎完；有仓时仍守 uniMMR，但放宽单批与批次数，尽量一次换完。
         has_hedge：是否已有对冲仓。无仓时不按 uniMMR 估赎回量（文案与批次都跳过）。
+        require_pm_transfer：入场时只换到能划进统一账户的产品（跳过 BFUSD）。
         """
         try:
-            moves = self._allocation_moves()
+            moves = self._allocation_moves(require_pm_transfer=require_pm_transfer)
         except Exception as exc:
             return [StepResult("换产品", False, str(exc))]
         if not moves:

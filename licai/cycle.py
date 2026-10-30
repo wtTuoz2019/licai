@@ -293,17 +293,22 @@ class HedgeCycle:
         return steps
 
     def _bootstrap_funds(self) -> list[StepResult]:
-        # 闲置保证金 → 最高年化；其它活期换高；扫现货；再入金
+        # 闲置保证金 → 可划转理财；其它活期换到可划转；扫现货；再入金
+        # 入场必须立刻划进统一账户，不买 BFUSD（earn-asset-transfer 不支持）
         legs = self.futures.legs(self.symbol)
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
         steps: list[StepResult] = []
-        steps.extend(self.pipeline.pull_idle_margin_to_earn())
+        steps.extend(self.pipeline.pull_idle_margin_to_earn(require_pm_transfer=True))
         try:
-            steps.extend(self.pipeline.switch_to_best(full=not has_pos, has_hedge=has_pos))
+            steps.extend(
+                self.pipeline.switch_to_best(
+                    full=not has_pos, has_hedge=has_pos, require_pm_transfer=True
+                )
+            )
         except Exception as exc:
             steps.append(StepResult("换年化异常", True, str(exc)))
         # 换年化失败不拦住扫现货，否则闲置 U 会一直卡着（例如 RWUSD 地址验证 -9000）
-        sweep = self.pipeline.sweep_spot_to_earn()
+        sweep = self.pipeline.sweep_spot_to_earn(require_pm_transfer=True)
         steps.extend(sweep)
         if any(not s.ok for s in sweep):
             return steps
@@ -1039,7 +1044,7 @@ class HedgeCycle:
                 steps.append(StepResult("转出现货异常", False, str(exc)))
             earn_steps: list[StepResult] = []
             try:
-                earn_steps = self._spot_profit_to_earn(product=planned)
+                earn_steps = self._spot_profit_to_earn(product=planned, require_pm_transfer=True)
                 steps.extend(earn_steps)
             except Exception as exc:
                 steps.append(StepResult("归集理财异常", False, str(exc)))
@@ -1047,7 +1052,12 @@ class HedgeCycle:
             if bought and not self.settings.dry_run:
                 self._wait_earn_visible(planned, timeout=2.0)
             try:
-                steps.extend(self._fund_after_earn(earn_steps, check_idle_ldusdt=False))
+                # 收利裸仓：保证金必须回得来；BFUSD 划不进时赎回改 LDUSDT
+                steps.extend(
+                    self._fund_after_earn(
+                        earn_steps, check_idle_ldusdt=False, allow_redeem_fallback=True
+                    )
+                )
                 steps.extend(self._confirm_harvest_margin(planned, before_pm=before_pm, realized=pnl))
             except Exception as exc:
                 steps.append(StepResult("保证金回注异常", False, str(exc)))
@@ -1077,11 +1087,18 @@ class HedgeCycle:
         if restored.missing_side is None:
             try:
                 if self.pipeline.spot_needs_move() or self._spot_settle_left():
-                    residual = self._spot_profit_to_earn(product=self._harvest_earn_product or planned)
+                    residual = self._spot_profit_to_earn(
+                        product=self._harvest_earn_product or planned,
+                        require_pm_transfer=True,
+                    )
                     steps.extend(residual)
                     if _subscribed(residual) and not self.settings.dry_run:
                         time.sleep(max(int(self.settings.settle_seconds or 0), 2))
-                    steps.extend(self._fund_after_earn(residual, check_idle_ldusdt=False))
+                    steps.extend(
+                        self._fund_after_earn(
+                            residual, check_idle_ldusdt=False, allow_redeem_fallback=True
+                        )
+                    )
             except Exception as exc:
                 steps.append(StepResult("补仓后归集异常", False, str(exc)))
 
@@ -1635,8 +1652,15 @@ class HedgeCycle:
         steps.append(moved)
         return steps
 
-    def _spot_profit_to_earn(self, product: FlexibleProduct | None = None) -> list[StepResult]:
-        return self.pipeline.sweep_spot_to_earn(product=product)
+    def _spot_profit_to_earn(
+        self,
+        product: FlexibleProduct | None = None,
+        *,
+        require_pm_transfer: bool = False,
+    ) -> list[StepResult]:
+        return self.pipeline.sweep_spot_to_earn(
+            product=product, require_pm_transfer=require_pm_transfer
+        )
 
     def _quote_until_balanced(self, qty: Decimal, reduce_only: bool) -> list[StepResult]:
         """双边挂单直到对冲齐。
