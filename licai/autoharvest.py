@@ -55,6 +55,8 @@ class AutoHarvestWorker:
         # 闲置可转出探测节流
         self._withdraw_probe_at: dict[int, float] = {}
         self._withdraw_probe_gap = 600.0
+        # 有仓时空转归集后的加长退避（秒）
+        self._withdraw_busy_gap: dict[int, float] = {}
         # 账号下次完整检查时间；空闲（无仓/无迁仓/无挂起加仓）拉长，有交叉立刻查
         self._due_at: dict[int, float] = {}
         self._idle_gap = 180.0
@@ -603,15 +605,21 @@ class AutoHarvestWorker:
         """统一账户可转出闲置 U / 现货闲置 → 申购当前最高年化。返回是否实际跑过。"""
         if not bool(getattr(self.ops.base, "auto_sweep_spot", True)):
             return False
+        legs = live.get("legs") or {}
+        has_pos = _qty(legs, "long_qty") > 0 or _qty(legs, "short_qty") > 0
+        # 有仓时 1~几 U 的 maxWithdraw 会一直抖，门槛抬高避免空转刷事件
+        min_idle = d("10") if has_pos else d("1")
         spot = d(live.get("spot_usdt") or "0")
-        if spot < 1:
+        if spot < min_idle:
             spot = self.ops._idle_spot(account)
         withdrawable = d(live.get("withdrawable_usdt") or "0")
-        if spot < 1 and withdrawable < 1:
-            # 每 10 分钟最多探一次可转出，避免无闲置时每轮打 maxWithdraw
-            now = time.monotonic()
+        now = time.monotonic()
+        probe_gap = self._withdraw_probe_gap
+        if has_pos:
+            probe_gap = max(probe_gap, float(self._withdraw_busy_gap.get(account.id) or 0))
+        if spot < min_idle and withdrawable < min_idle:
             last = float(self._withdraw_probe_at.get(account.id) or 0)
-            if now - last < self._withdraw_probe_gap:
+            if now - last < probe_gap:
                 return False
             self._withdraw_probe_at[account.id] = now
             try:
@@ -623,11 +631,11 @@ class AutoHarvestWorker:
                 withdrawable = d(pipe.futures.max_withdraw(asset) or "0")
             except Exception:
                 withdrawable = d("0")
-        if spot < 1 and withdrawable < 1:
+        if spot < min_idle and withdrawable < min_idle:
             return False
         _print(
             f"自动归集闲置 account={account.id} spot_usdt={spot} "
-            f"withdrawable={withdrawable}"
+            f"withdrawable={withdrawable} min={min_idle}"
         )
         result = self.ops.run_action(
             account,
@@ -645,8 +653,17 @@ class AutoHarvestWorker:
             fails = [s for s in steps if not s.get("ok")]
             pick = fails or steps[-4:]
             detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+        subscribed = any(
+            s.get("ok") and "申购" in str(s.get("name") or "") for s in steps
+        )
+        if has_pos and not subscribed:
+            # 有仓只挪了一点保证金/暂留，没真正申购：2 小时内不再扫
+            self._withdraw_busy_gap[account.id] = 7200.0
+            self._withdraw_probe_at[account.id] = now
+        elif subscribed:
+            self._withdraw_busy_gap.pop(account.id, None)
         _print(f"自动归集闲置结束 account={account.id} ok={ok} {detail[:500]}")
-        return True
+        return bool(subscribed or ok)
 
     def _maybe_scale(self, account, live: dict) -> bool:
         """账户挂起了一次加仓：金叉/死叉与入场级平稳同时满足才加这一次。"""
