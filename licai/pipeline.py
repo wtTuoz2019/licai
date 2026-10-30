@@ -464,6 +464,7 @@ class Pipeline:
         margin_assets = margin_assets if margin_assets is not None else self.margin_assets()
         candidates = [p for p in products if self._eligible(p, margin_assets)]
         if require_pm_transfer:
+            # 只排除划不进统一账户的（如 BFUSD）；可划转里仍按最高年化选
             transferable = [p for p in candidates if self.pm_earn_transferable(p)]
             if transferable:
                 candidates = transferable
@@ -1261,6 +1262,42 @@ class Pipeline:
                     self.earn.invalidate()
         if not steps:
             return [StepResult("无需划转", True, "现货没有可划入统一账户的余额")]
+        return steps
+
+    def rescue_margin_for_refill(self) -> list[StepResult]:
+        """补仓 -2019 紧急回注：赎回理财 BFUSD/RWUSD → USDT 活期 → LDUSDT 进统一账户。
+
+        用于收利裸仓场景，避免保证金卡在理财里导致直接全平、对冲白做。
+        """
+        if not self.settings.unified_account:
+            return [StepResult("紧急回注保证金", False, "当前配置不是统一账户")]
+        steps = [
+            StepResult(
+                "紧急回注保证金",
+                True,
+                "补仓保证金不足，先把理财赎回成可划转的 USDT 活期再入统一账户",
+            )
+        ]
+        self.earn.invalidate()
+        for asset, bal_fn in (
+            ("BFUSD", self.earn.bfusd_balance),
+            ("RWUSD", self.earn.rwusd_balance),
+        ):
+            try:
+                earn_amt = bal_fn()
+            except Exception:
+                earn_amt = Decimal("0")
+            try:
+                spot_amt = self.earn.spot_free(asset)
+            except Exception:
+                spot_amt = Decimal("0")
+            amount = max(earn_amt, spot_amt)
+            if amount < SPOT_MIN:
+                continue
+            steps.extend(
+                self._fund_earn_token(asset, amount, allow_redeem_fallback=True)
+            )
+        steps.extend(self.fund_unified(check_ldusdt=True, allow_redeem_fallback=True))
         return steps
 
     def _fund_spot_asset(

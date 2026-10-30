@@ -1123,8 +1123,9 @@ class HedgeCycle:
         closed_side: str,
         wait_stable: bool = True,
     ) -> list[StepResult]:
-        """平盈利腿后的硬保证：补回对冲；实在补不齐则市价平掉裸仓。本函数不向外抛异常。"""
+        """平盈利腿后的硬保证：补回对冲；先救保证金再补；实在补不齐才平裸仓。本函数不向外抛异常。"""
         out: list[StepResult] = []
+        rescued = False
         try:
             legs = self.futures.legs(self.symbol)
             if legs.missing_side is None:
@@ -1160,7 +1161,33 @@ class HedgeCycle:
                                 )
                             )
                     elif any(_no_margin(item) for item in refill_steps):
-                        out.append(StepResult("补仓保证金不足", False, f"{miss} -2019，改走恢复/平裸仓"))
+                        out.append(
+                            StepResult(
+                                "补仓保证金不足",
+                                False,
+                                f"{miss} -2019，先紧急赎回理财入金再补，避免直接全平",
+                            )
+                        )
+                        try:
+                            out.extend(self.pipeline.rescue_margin_for_refill())
+                            rescued = True
+                        except Exception as exc:
+                            out.append(StepResult("紧急回注异常", False, str(exc)))
+                        if rescued:
+                            try:
+                                retry = self._quote_side(order, miss, qty, reduce_only=False)
+                                out.extend(retry)
+                                after = self.futures.legs(self.symbol)
+                                if after.missing_side is None:
+                                    out.append(
+                                        StepResult(
+                                            "紧急回注后补仓已齐",
+                                            True,
+                                            self._legs_text(after),
+                                        )
+                                    )
+                            except Exception as exc:
+                                out.append(StepResult("紧急回注后补仓异常", False, str(exc)))
                 except Exception as exc:
                     out.append(StepResult("补仓下单异常", False, str(exc)))
 
@@ -1176,14 +1203,26 @@ class HedgeCycle:
                 if legs.missing_side is None or (legs.long_qty <= 0 and legs.short_qty <= 0):
                     pass
                 else:
-                    out.append(
-                        StepResult(
-                            "裸仓兜底",
-                            False,
-                            f"仍有缺口，市价削平/平掉避免敞口：{self._legs_text(legs)}",
+                    # 最后再救一次保证金；仍缺才全平，尽量保住已套的对冲
+                    if not rescued:
+                        try:
+                            out.extend(self.pipeline.rescue_margin_for_refill())
+                            rescued = True
+                            out.extend(self._restore_harvest_balance(wait_stable=False))
+                            legs = self.futures.legs(self.symbol)
+                        except Exception as exc:
+                            out.append(StepResult("兜底回注异常", False, str(exc)))
+                    if legs.missing_side is None or (legs.long_qty <= 0 and legs.short_qty <= 0):
+                        pass
+                    else:
+                        out.append(
+                            StepResult(
+                                "裸仓兜底",
+                                False,
+                                f"紧急回注后仍有缺口，市价削平/平掉避免敞口：{self._legs_text(legs)}",
+                            )
                         )
-                    )
-                    out.extend(self._flatten_if_naked())
+                        out.extend(self._flatten_if_naked())
             except Exception as exc:
                 out.append(StepResult("平裸仓失败", False, str(exc)))
         return out
