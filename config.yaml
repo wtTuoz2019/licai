@@ -98,7 +98,7 @@ switch_batch_pct: 0.15       # 每批最多赎当前仓位的 15%
 switch_batch_usdt: 200       # 每批硬顶 USDT
 switch_min_batch: 10         # 小于这个就并进本批或留到下次
 switch_max_batches: 5        # 点一次最多换几批，剩下再点
-switch_min_apr_gap: 0.1      # 目标年化至少高出 0.1 个百分点才自动/建议换（避免无意义抖动）
+switch_min_apr_gap: 0.3      # 目标年化至少高出 0.3 个百分点才自动/建议换（覆盖赎回等成本）
 auto_switch_earn: true       # 仅「自动收利」账号每天查一次并按各产品额度自动换；未开的只在手动点「换年化」时换
 auto_sweep_spot: true        # 现货闲置 USDT/USDC 自动申购理财并入保证金
 auto_fund_margin: true       # 所有账号：BFUSD/RWUSD/LDUSDT 等理财定期划进统一账户当保证金

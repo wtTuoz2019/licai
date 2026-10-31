@@ -157,7 +157,7 @@ class Settings:
     switch_batch_usdt: Decimal = Decimal("200")
     switch_min_batch: Decimal = Decimal("10")
     switch_max_batches: int = 5
-    switch_min_apr_gap: Decimal = Decimal("0.1")
+    switch_min_apr_gap: Decimal = Decimal("0.3")
     auto_switch_earn: bool = True
     auto_sweep_spot: bool = True
     # 所有账号：现货/理财 BFUSD·RWUSD·LDUSDT 定期划进统一账户当保证金
@@ -279,7 +279,7 @@ def load_settings(config_path: str | Path | None = None, dry_run_override: bool 
         switch_batch_usdt=d(raw.get("switch_batch_usdt", "200")),
         switch_min_batch=d(raw.get("switch_min_batch", "10")),
         switch_max_batches=int(raw.get("switch_max_batches", 5)),
-        switch_min_apr_gap=d(raw.get("switch_min_apr_gap", "0.1")),
+        switch_min_apr_gap=d(raw.get("switch_min_apr_gap", "0.3")),
         auto_switch_earn=bool(raw.get("auto_switch_earn", True)),
         auto_sweep_spot=bool(raw.get("auto_sweep_spot", True)),
         auto_fund_margin=bool(raw.get("auto_fund_margin", True)),

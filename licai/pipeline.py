@@ -173,7 +173,7 @@ class Pipeline:
         small = d(raw.get("small_balance_apr") or 0)
         if small <= base:
             return None
-        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.1")
+        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.3")
         if gap < 0:
             gap = Decimal("0")
         best_other = Decimal("0")
@@ -199,7 +199,7 @@ class Pipeline:
         small = d(raw.get("small_balance_apr") or 0)
         if small <= base:
             return Decimal("0")
-        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.1")
+        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.3")
         if gap < 0:
             gap = Decimal("0")
         target_pct = apr_percent(target.apr)
@@ -212,7 +212,7 @@ class Pipeline:
         return min(amount, _BFUSD_TIER_USDT)
 
     def _apr_gap(self) -> Decimal:
-        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.1")
+        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.3")
         return gap if gap > 0 else Decimal("0")
 
     @staticmethod
@@ -1810,7 +1810,7 @@ class Pipeline:
     ) -> list[tuple[FlexibleProduct, Decimal]]:
         """低于目标年化、可赎回的仓位。stable_only 时只动稳定币理财（自动换年化用）。"""
         holdings = holdings if holdings is not None else self.earn_holdings()
-        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.1")
+        gap = d(getattr(self.settings, "switch_min_apr_gap", None) or "0.3")
         if gap < 0:
             gap = Decimal("0")
         target_pct = apr_percent(target.apr)
