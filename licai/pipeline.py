@@ -1224,9 +1224,28 @@ class Pipeline:
             "ld_transferable": fmt_amount(ld_free, 4),
         }
 
+    def needs_fund_to_pm(self) -> bool:
+        """现货/理财里是否还有可划进统一账户、但还没当保证金的仓。"""
+        if not self.settings.unified_account:
+            return False
+        for asset in ("USDT", "USDC", "BFUSD", "RWUSD"):
+            try:
+                if self.spot_cash(asset) >= SPOT_MIN:
+                    return True
+            except Exception:
+                pass
+        for asset in ("LDUSDT", "RWUSD"):
+            try:
+                if self.futures.earn_to_pm_balance(asset) >= SPOT_MIN:
+                    return True
+            except Exception:
+                pass
+        return False
+
     def fund_unified(
         self, *, check_ldusdt: bool = True, allow_redeem_fallback: bool = False
     ) -> list[StepResult]:
+        """把现货稳定币 + 可划转理财（BFUSD 现货 / LDUSDT·RWUSD 理财）划进统一账户当保证金。"""
         if not self.settings.unified_account:
             return [StepResult("保证金", False, "当前配置不是统一账户")]
         steps: list[StepResult] = []
@@ -1246,24 +1265,41 @@ class Pipeline:
             steps.extend(
                 self._fund_spot_asset("RWUSD", rwusd_spot, allow_redeem_fallback=allow_redeem_fallback)
             )
-        already_ld = any("LDUSDT" in s.name and s.ok for s in steps)
-        if check_ldusdt and not already_ld:
+        # 理财侧可划额度：LDUSDT / RWUSD（BFUSD 不走 earn-asset-transfer）
+        earn_assets = ["RWUSD"]
+        if check_ldusdt:
+            earn_assets.insert(0, "LDUSDT")
+        for asset in earn_assets:
+            already = any(asset in s.name and s.ok and "转入统一账户" in s.name for s in steps)
+            if already:
+                continue
             try:
-                ld_free = self.futures.earn_to_pm_balance("LDUSDT")
+                free = self.futures.earn_to_pm_balance(asset)
             except BinanceAPIError as exc:
-                ld_free = Decimal("0")
-                steps.append(StepResult("查询 LDUSDT", True, str(exc)))
-            if ld_free > 0:
-                steps.append(
-                    self._mutate(
-                        f"USDT 活期 LDUSDT {fmt_amount(ld_free)} 转入统一账户",
-                        lambda: self.futures.earn_to_pm("LDUSDT", ld_free),
+                if self._earn_transfer_unsupported(exc):
+                    steps.append(
+                        StepResult(
+                            f"查询 {asset}",
+                            True,
+                            f"earn-asset-transfer 不支持 {asset}：{exc}",
+                        )
                     )
+                else:
+                    steps.append(StepResult(f"查询 {asset}", True, str(exc)))
+                continue
+            if free < SPOT_MIN:
+                continue
+            label = "USDT 活期 LDUSDT" if asset == "LDUSDT" else asset
+            steps.append(
+                self._mutate(
+                    f"{label} {fmt_amount(free)} 转入统一账户",
+                    lambda a=asset, qty=free: self.futures.earn_to_pm(a, qty),
                 )
-                if steps[-1].ok and not steps[-1].dry_run:
-                    self.earn.invalidate()
+            )
+            if steps[-1].ok and not steps[-1].dry_run:
+                self.earn.invalidate()
         if not steps:
-            return [StepResult("无需划转", True, "现货没有可划入统一账户的余额")]
+            return [StepResult("无需划转", True, "没有可划入统一账户的现货/理财余额")]
         return steps
 
     def rescue_margin_for_refill(self) -> list[StepResult]:

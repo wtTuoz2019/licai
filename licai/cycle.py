@@ -267,6 +267,10 @@ class HedgeCycle:
             )
         return steps
 
+    def fund_margin_to_pm(self) -> list[StepResult]:
+        """只把现货/理财里已买好的保证金资产划进统一账户（不申购、不换年化）。"""
+        return self.pipeline.fund_unified(check_ldusdt=True, allow_redeem_fallback=False)
+
     def recycle_idle_to_earn(self) -> list[StepResult]:
         """把统一账户可转出的闲置 U + 现货闲置，全部申购当前最高年化并尽量划回保证金。"""
         legs = self.futures.legs(self.symbol)

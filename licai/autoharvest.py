@@ -57,6 +57,10 @@ class AutoHarvestWorker:
         self._withdraw_probe_gap = 600.0
         # 有仓时空转归集后的加长退避（秒）
         self._withdraw_busy_gap: dict[int, float] = {}
+        # 理财→统一账户保证金：全账号定期检查（与是否开自动收利无关）
+        self._fund_probe_at: dict[int, float] = {}
+        self._fund_probe_gap = 300.0
+        self._fund_busy_gap: dict[int, float] = {}
         # 账号下次完整检查时间；空闲（无仓/无迁仓/无挂起加仓）拉长，有交叉立刻查
         self._due_at: dict[int, float] = {}
         self._idle_gap = 180.0
@@ -93,6 +97,8 @@ class AutoHarvestWorker:
             extras.append("每日换低收益理财")
         if bool(getattr(self.ops.base, "auto_sweep_spot", True)):
             extras.append("闲置保证金/现货自动申购最高年化")
+        if bool(getattr(self.ops.base, "auto_fund_margin", True)):
+            extras.append("全账号理财自动划入统一账户保证金")
         extras.append("账户挂起自动加仓（金叉/死叉+平稳加一次）")
         extra = "；".join(extras) if extras else "无额外理财自动化"
         _print(f"自动收利后台已启动（{note}；{extra}）")
@@ -164,6 +170,11 @@ class AutoHarvestWorker:
                 self._maybe_daily_earn(account)
             except Exception:
                 log.exception("账号 %s 每日理财检查失败", account.id)
+            # 全账号：理财/现货保证金资产划进统一账户（与是否开自动收利无关）
+            try:
+                self._maybe_fund_margin(account)
+            except Exception:
+                log.exception("账号 %s 自动划入保证金失败", account.id)
             armed = bool(self.ops.migrate_arm(account.id))
             # 已挂起迁仓：每轮都查，别错过交叉+平稳窗口
             if armed:
@@ -664,6 +675,71 @@ class AutoHarvestWorker:
             self._withdraw_busy_gap.pop(account.id, None)
         _print(f"自动归集闲置结束 account={account.id} ok={ok} {detail[:500]}")
         return bool(subscribed or ok)
+
+    def _maybe_fund_margin(self, account) -> bool:
+        """全账号：把现货/理财里的 BFUSD·RWUSD·LDUSDT 划进统一账户当保证金。"""
+        if not bool(getattr(self.ops.base, "auto_fund_margin", True)):
+            return False
+        now = time.monotonic()
+        gap = max(self._fund_probe_gap, float(self._fund_busy_gap.get(account.id) or 0))
+        last = float(self._fund_probe_at.get(account.id) or 0)
+        if now - last < gap:
+            return False
+        self._fund_probe_at[account.id] = now
+        # 与收利/开仓抢锁时跳过，下轮再试
+        if not self.ops.try_begin_action(account.id):
+            return False
+        moved = False
+        try:
+            try:
+                pipe = pipeline_for(account, self.ops.base, dry_run=True, ops=self.ops)
+                if not pipe.needs_fund_to_pm():
+                    self._fund_busy_gap.pop(account.id, None)
+                    return False
+            except Exception:
+                log.exception("账号 %s 检查待划入保证金失败", account.id)
+                return False
+            _print(f"自动划入保证金 account={account.id}")
+            result = self.ops.run_action(
+                account,
+                "fund",
+                force=False,
+                mode=None,
+                _locked=True,
+                auto=True,
+                with_snapshot=False,
+            )
+            ok = bool(result.get("ok"))
+            steps = result.get("steps") or []
+            detail = result.get("reason") or ""
+            if steps:
+                fails = [s for s in steps if not s.get("ok")]
+                pick = fails or steps[-6:]
+                detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+            moved = any(
+                s.get("ok")
+                and (
+                    "划入统一账户" in str(s.get("name") or "")
+                    or "转入统一账户" in str(s.get("name") or "")
+                )
+                for s in steps
+            )
+            if moved:
+                self._fund_busy_gap.pop(account.id, None)
+                try:
+                    self.ops.refresh_account_snapshot(account)
+                except Exception:
+                    log.exception("账号 %s 划入保证金后刷新快照失败", account.id)
+            else:
+                # 探测有余额但没划成：拉长间隔，避免空转
+                self._fund_busy_gap[account.id] = 1800.0
+            _print(
+                f"自动划入保证金结束 account={account.id} ok={ok} moved={moved} "
+                f"{detail[:500]}"
+            )
+            return moved
+        finally:
+            self.ops.end_action(account.id)
 
     def _maybe_scale(self, account, live: dict) -> bool:
         """账户挂起了一次加仓：金叉/死叉与入场级平稳同时满足才加这一次。"""

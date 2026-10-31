@@ -1616,7 +1616,10 @@ class OpsService:
             run = lambda: cycle.switch_earn()
         elif action == "leverage":
             run = lambda: cycle.apply_leverage()
-        elif action in {"sweep", "recycle", "fund"}:
+        elif action == "fund":
+            # 现货/理财已买好的 BFUSD·RWUSD·LDUSDT → 划进统一账户当保证金
+            run = lambda: cycle.fund_margin_to_pm()
+        elif action in {"sweep", "recycle"}:
             # 闲置保证金/现货 → 当前最高年化理财
             run = lambda: cycle.recycle_idle_to_earn()
         else:
@@ -1799,6 +1802,7 @@ class OpsService:
                 "switch": "自动换年化：",
                 "scale": "自动加仓：",
                 "sweep": "自动归集：",
+                "fund": "自动划入保证金：",
                 "harvest": "自动收利：",
             }.get(action, "自动：")
             summary = prefix + summary
