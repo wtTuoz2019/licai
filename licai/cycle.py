@@ -56,7 +56,7 @@ def _order_filled_hint(step: StepResult) -> bool:
 def margin_use_pct(settings) -> Decimal:
     """入场/加仓占用比例：低杠杆吃满 hedge_margin_use_pct；高杠杆按 lev_cap/杠杆。
 
-    100x + lev_cap=40 → 40%。在 uniMMR 安全线内尽量开满；收利靠「全额转出→理财入保证金→再补仓」保对冲。
+    100x + lev_cap=40 → 40%。在 uniMMR 安全线内尽量开满；收利转出必留补仓垫，理财暂回不来也能对冲。
     """
     cap = settings.hedge_margin_use_pct
     lev = max(int(settings.hedge_leverage), 1)
@@ -1542,7 +1542,10 @@ class HedgeCycle:
         return steps
 
     def _refill_margin_buffer(self, refill_qty: Decimal) -> Decimal:
-        """估补仓所需保证金垫：名义/杠杆 × 1.25，至少 8U。"""
+        """估补仓所需保证金垫：名义/杠杆 × 2，至少 8U。
+
+        按「理财暂时划不回来」留垫：剩下一边常有浮亏占保，1.25 倍初保往往不够。
+        """
         qty = max(refill_qty, Decimal("0"))
         if qty <= 0:
             return Decimal("8")
@@ -1561,7 +1564,7 @@ class HedgeCycle:
                 mid = Decimal("0")
         lev = max(int(self.settings.hedge_leverage or 1), 1)
         im = (qty * mid / Decimal(lev)) if mid > 0 else Decimal("0")
-        return max(im * Decimal("1.25"), Decimal("8"))
+        return max(im * Decimal("2"), Decimal("8"))
 
     def _harvest_transfer_amount(
         self,
@@ -1569,11 +1572,12 @@ class HedgeCycle:
         realized: Decimal,
         refill_qty: Decimal,
     ) -> tuple[Decimal, str]:
-        """尽量转出浮盈去理财；有安全余裕再转闲置；小账户不抽干补仓垫。
+        """转出浮盈/闲置去理财，但绝不吃掉补仓留垫。
 
-        - 浮盈优先：可转额度内尽量转满本次 realized
-        - 闲置加码：仅在「可转 − 补仓留垫」之上再转（兼容可转尽转）
-        - 小账户（权益 < 300）：只转浮盈，多余可转额度留作补仓
+        万一下一步理财划不进统一账户，PM 里仍须能开回缺失腿。
+        - 硬上限：可转 − 补仓留垫（safe_cap）
+        - 小账户（权益 < 300）：只转浮盈，且仍受 safe_cap 限制
+        - 大账户：在 safe_cap 内尽量转（浮盈 + 闲置）
         """
         realized = max(realized, Decimal("0"))
         transferable = max(transferable, Decimal("0"))
@@ -1590,25 +1594,27 @@ class HedgeCycle:
             equity = Decimal("0")
 
         small = equity > 0 and equity < Decimal("300")
+        # 关键：转出不得超过 safe_cap（旧逻辑 max(浮盈, safe_cap) 会吃掉留垫）
         if small:
-            amount = profit_part
+            amount = min(profit_part, safe_cap)
             note = (
-                f"小账户权益约 {fmt_amount(equity)}，只转浮盈 {fmt_amount(amount)}"
-                f"（可转 {fmt_amount(transferable)}，留垫约 {fmt_amount(buffer)} 给补仓）"
+                f"小账户权益约 {fmt_amount(equity)}，转出浮盈 {fmt_amount(amount)}"
+                f"（可转 {fmt_amount(transferable)}，留垫约 {fmt_amount(buffer)} 给补仓；"
+                f"理财暂回不来也能对冲）"
             )
         else:
-            # 浮盈必转（额度内）；安全上限更高时再转闲置
-            amount = min(transferable, max(profit_part, safe_cap))
+            amount = safe_cap
             if amount <= profit_part + Decimal("0.01"):
                 note = (
                     f"转出浮盈 {fmt_amount(amount)}"
-                    f"（可转 {fmt_amount(transferable)}，留垫约 {fmt_amount(buffer)}）"
+                    f"（可转 {fmt_amount(transferable)}，留垫约 {fmt_amount(buffer)}；"
+                    f"理财暂回不来也能补仓）"
                 )
             else:
                 note = (
-                    f"转出 {fmt_amount(amount)}=浮盈 {fmt_amount(profit_part)}"
+                    f"转出 {fmt_amount(amount)}=浮盈 {fmt_amount(min(profit_part, amount))}"
                     f"+闲置（可转 {fmt_amount(transferable)}，安全上限 {fmt_amount(safe_cap)}，"
-                    f"留垫约 {fmt_amount(buffer)}）"
+                    f"留垫约 {fmt_amount(buffer)}；理财暂回不来也能补仓）"
                 )
         if amount < 1:
             return Decimal("0"), note + "；估完不足 1，跳过转出先补仓"
