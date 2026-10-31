@@ -428,13 +428,15 @@ class Pipeline:
         return filtered
 
     def pm_earn_transferable(self, product: FlexibleProduct) -> bool:
-        """申购后能否走 earn-asset-transfer 划进统一账户当保证金。
+        """申购后能否把仓位划进统一账户当保证金。
 
-        币安该接口正式支持 LDUSDT；BFUSD 固定 -1100；RWUSD 探测一次并缓存。
+        - LDUSDT / RWUSD：走 earn-asset-transfer（官方支持）
+        - BFUSD：earn-asset-transfer 不支持（-1100），但申购后在现货，
+          可用 MAIN_PORTFOLIO_MARGIN / 现货→全仓划进统一账户（实测可行）
         """
         kind = (product.kind or "").lower()
-        if kind == "bfusd":
-            return False
+        if kind == "bfusd" or (product.asset or "").upper() == "BFUSD":
+            return True
         token = (product.margin_token or "").upper()
         if not token and kind not in {"bfusd", "rwusd"}:
             token = f"LD{(product.asset or '').upper()}"
@@ -464,12 +466,12 @@ class Pipeline:
         margin_assets = margin_assets if margin_assets is not None else self.margin_assets()
         candidates = [p for p in products if self._eligible(p, margin_assets)]
         if require_pm_transfer:
-            # 只排除划不进统一账户的（如 BFUSD）；可划转里仍按最高年化选
+            # 只保留申购后能划进统一账户的产品；其中按最高年化选
             transferable = [p for p in candidates if self.pm_earn_transferable(p)]
             if transferable:
                 candidates = transferable
             else:
-                raise RuntimeError("没有可划入统一账户的理财产品（earn-asset-transfer，如 USDT 活期/LDUSDT）")
+                raise RuntimeError("没有可划入统一账户的理财产品（BFUSD 现货划转 / LDUSDT·RWUSD 理财划转）")
         if self._wallet_transfer_blocked:
             # 现货划不进统一账户时，只留申购后能用理财代币转入的产品（LDUSDT 这类）
             via_earn = [p for p in candidates if (p.margin_token or "").upper().startswith("LD")]
@@ -1313,9 +1315,33 @@ class Pipeline:
             ]
         if self._wallet_transfer_blocked:
             return self._spot_via_ldusdt(asset, amount)
-        # BFUSD / RWUSD 不能走 MAIN_PORTFOLIO_MARGIN（会 -3027），优先用理财代币转入
+        # BFUSD 申购后在现货：必须先走现货→统一账户（MAIN_PORTFOLIO_MARGIN / margin transfer）。
+        # earn-asset-transfer 官方只支持 LDUSDT/RWUSD，BFUSD 会 -1100；旧逻辑误跳过现货划转才导致「划不进」。
+        # RWUSD：现货有余额时同样先试现货划转；否则再走 earn-asset-transfer。
         if asset in {"BFUSD", "RWUSD"}:
-            return self._fund_earn_token(asset, amount, allow_redeem_fallback=allow_redeem_fallback)
+            step = self._move_spot(asset, amount)
+            if step.ok:
+                return [step]
+            if self._unauthorized(step):
+                self._wallet_transfer_blocked = True
+                note = StepResult(
+                    "现货无法划转",
+                    True,
+                    "API 没有现货↔统一账户划转权限（-1002）。改试理财划转 / LDUSDT。",
+                )
+                return [note, *self._fund_earn_token(asset, amount, allow_redeem_fallback=True)]
+            # 现货划转失败（如 -3027）再试理财代币通道；BFUSD 仍会 -1100，可按需赎回
+            steps = [
+                StepResult(
+                    f"现货 {asset} 划转未成",
+                    True,
+                    f"{step.detail}；改试 earn-asset-transfer / 赎回入金",
+                )
+            ]
+            steps.extend(
+                self._fund_earn_token(asset, amount, allow_redeem_fallback=allow_redeem_fallback)
+            )
+            return steps
         step = self._move_spot(asset, amount)
         if step.ok:
             return [step]
@@ -1349,7 +1375,8 @@ class Pipeline:
                 )
             ]
         unsupported = False
-        # BFUSD 的 earn-asset-transfer 固定 -1100，不再每次空探询
+        # BFUSD 的 earn-asset-transfer 官方不支持（只认 LDUSDT/RWUSD），固定 -1100。
+        # 正常入金应走现货→统一账户；此处仅作现货划转失败后的兜底。
         if asset.upper() == "BFUSD":
             unsupported = True
             cap = Decimal("0")
@@ -1357,7 +1384,7 @@ class Pipeline:
                 StepResult(
                     f"查询 {asset} 可转入",
                     True,
-                    f"理财划转接口不支持 {asset}，改暂留计息",
+                    f"earn-asset-transfer 不支持 {asset}（官方仅 LDUSDT/RWUSD）；应走现货划入统一账户",
                 )
             )
         else:

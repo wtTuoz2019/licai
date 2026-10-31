@@ -293,8 +293,8 @@ class HedgeCycle:
         return steps
 
     def _bootstrap_funds(self) -> list[StepResult]:
-        # 闲置保证金 → 可划转理财；其它活期换到可划转；扫现货；再入金
-        # 入场必须立刻划进统一账户，不买 BFUSD（earn-asset-transfer 不支持）
+        # 闲置保证金 → 可划进统一账户的最高年化；扫现货；再入金
+        # BFUSD 走现货→统一账户；LDUSDT/RWUSD 走 earn-asset-transfer
         legs = self.futures.legs(self.symbol)
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
         steps: list[StepResult] = []
