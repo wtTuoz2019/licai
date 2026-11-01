@@ -63,9 +63,10 @@ hedge_quote_retries: 8       # 挂单轮数：入场/补仓约 12+，平仓更�
 maker_improve_bps: 1         # 追价时相对现价最多往里靠 1bp；仍留 1 档，GTX 不吃单
 maker_passive_bps: 2         # 首挂：买/卖相对买一/卖一往外约 2bp，少贴盘口少 -5022
 maker_passive_ticks: 2       # 首挂至少离买一/卖一 2 档（与 bp 取更远）
-# 第二腿（单边成交后）：100ms 高频盯盘。价格往优势走一直挂；不利偏离超限才市价
-hedge_max_wait_seconds: 0.8  # 第二腿相对第一腿不利时，最多再等多久就市价
-hedge_max_slippage_bps: 3.5  # 相对第一腿成交价，BBO 不利偏离超过此 bp 则立刻市价
+# 第二腿/补仓：尽量挂单吃 maker；轻微不利多等一会，少市价省手续费
+hedge_max_wait_seconds: 3.0  # 不利≥2bp 时再挂这么久才市价（原 0.8 太急，大仓易吃 taker）
+hedge_mild_adverse_seconds: 10  # 不利<2bp：入场第二腿/收利补仓至少挂满再市价（xiaolin 曾 0.77bp/3.7s 就市价）
+hedge_max_slippage_bps: 5.0  # 相对锚价/开始价，BBO 不利超过此 bp 才立刻市价（原 3.5）
 watch_seconds: 60            # 命令行盯盘间隔
 live_poll_seconds: 120       # 操作台仓位/浮盈刷新间隔，不必太勤
 auto_harvest_seconds: 60     # 开启「自动收利」后后台检查间隔

@@ -906,8 +906,8 @@ class HedgeCycle:
                     f"两边先挂单（GTX，首挂买一/卖一外约 {getattr(self.settings, 'maker_passive_bps', 2)}bp/"
                     f"{getattr(self.settings, 'maker_passive_ticks', 2)} 档），按 MACD 涨跌决定先多/先空；"
                     f"第二腿价格优势（补多更低/补空更高）一直挂；不利超 "
-                    f"{getattr(self.settings, 'hedge_max_slippage_bps', 3.5)}bp 或不利超 "
-                    f"{getattr(self.settings, 'hedge_max_wait_seconds', 0.8)}s 才市价  "
+                    f"{getattr(self.settings, 'hedge_max_slippage_bps', 5.0)}bp 或轻微不利挂满 "
+                    f"{getattr(self.settings, 'hedge_mild_adverse_seconds', 10)}s 才市价  "
                     f"数量={fmt_amount(qty)} {self.symbol}",
                     dry_run=True,
                 )
@@ -1840,11 +1840,18 @@ class HedgeCycle:
         return self._finish_hedge_or_flatten(steps, reduce_only)
 
     def _hedge_max_wait_seconds(self) -> float:
-        return max(0.05, float(getattr(self.settings, "hedge_max_wait_seconds", 0.8) or 0.8))
+        return max(0.05, float(getattr(self.settings, "hedge_max_wait_seconds", 3.0) or 3.0))
+
+    def _hedge_mild_adverse_seconds(self) -> float:
+        """轻微不利（<2bp）时挂单最短等待，再市价；大仓省 taker。"""
+        return max(
+            REFILL_QUOTE_DWELL,
+            float(getattr(self.settings, "hedge_mild_adverse_seconds", 10.0) or 10.0),
+        )
 
     def _hedge_max_slippage_bps(self) -> Decimal:
-        raw = d(getattr(self.settings, "hedge_max_slippage_bps", None) or "3.5")
-        return raw if raw > 0 else Decimal("3.5")
+        raw = d(getattr(self.settings, "hedge_max_slippage_bps", None) or "5.0")
+        return raw if raw > 0 else Decimal("5.0")
 
     def _second_leg_slip(
         self, legs: HedgeLegs, anchor: Decimal
@@ -1893,8 +1900,12 @@ class HedgeCycle:
         # 仍优势（补多成本更低 / 补空卖价更高）：一直挂，不因时间市价
         if slip <= 0:
             return None
-        # 轻微不利多挂一会儿；接近滑点上限才用短超时，少吃单
-        wait_limit = 3.0 if slip < Decimal("2") else self._hedge_max_wait_seconds()
+        # 轻微不利多挂一会（省 taker）；不利较大用较短超时
+        wait_limit = (
+            self._hedge_mild_adverse_seconds()
+            if slip < Decimal("2")
+            else self._hedge_max_wait_seconds()
+        )
         if naked_since is not None and elapsed >= wait_limit:
             return (
                 f"第二腿不利 {fmt_amount(slip, 2)}bp，已等 {elapsed:.2f}s≥{wait_limit:.2f}s，"
@@ -2421,8 +2432,10 @@ class HedgeCycle:
                     and resting is not None
                 ):
                     waited = now - adverse_since
-                    wait_limit = 3.0 if slip < Decimal("2") else max(
-                        self._hedge_max_wait_seconds(), REFILL_QUOTE_DWELL
+                    wait_limit = (
+                        self._hedge_mild_adverse_seconds()
+                        if slip < Decimal("2")
+                        else max(self._hedge_max_wait_seconds(), REFILL_QUOTE_DWELL)
                     )
                     if waited >= wait_limit and age >= REFILL_QUOTE_DWELL:
                         steps.append(
