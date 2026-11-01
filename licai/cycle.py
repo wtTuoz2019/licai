@@ -217,34 +217,54 @@ class HedgeCycle:
             steps.extend(self._ensure_hedge())
             return steps
 
+        # 自动入场：后台已定期划入保证金 / 扫现货，这里不再做换年化·扫货·settle
+        # 睡眠；先卡时机，最多补一笔轻量划入，再挂单。
+        if auto and not force_hedge:
+            gate, ok = self._assert_enter_macd_and_stable_now()
+            steps.extend(gate)
+            if not ok:
+                return steps
+            try:
+                need_fund = bool(self.pipeline.needs_fund_to_pm())
+            except Exception:
+                need_fund = False
+            if need_fund:
+                fund_steps = self.fund_margin_to_pm()
+                steps.extend(fund_steps)
+                if any(not s.ok for s in fund_steps):
+                    return steps
+                # 划入可能吃掉几秒：再确认窗口还在，避免硬开
+                gate2, ok2 = self._assert_enter_macd_and_stable_now()
+                steps.extend(gate2)
+                if not ok2:
+                    return steps
+            steps.extend(self._prepare_account())
+            if any(not s.ok for s in steps):
+                return steps
+            steps.extend(self._ensure_hedge())
+            return steps
+
         steps.extend(self._bootstrap_funds())
         if any(not s.ok for s in steps):
             return steps
         steps.extend(self._prepare_account())
         if any(not s.ok for s in steps):
             return steps
-        # 自动入场：归集后重验本币对交叉+入场平稳，避免窗口已过仍硬开
-        if auto and not force_hedge:
-            gate, ok = self._assert_enter_macd_and_stable_now()
-            steps.extend(gate)
-            if not ok:
-                return steps
-        else:
-            try:
-                stability = price_stability(
-                    self.futures, self.settings, purpose="enter", symbol=self.symbol
+        try:
+            stability = price_stability(
+                self.futures, self.settings, purpose="enter", symbol=self.symbol
+            )
+        except Exception:
+            stability = None
+        if not force_hedge and stability is not None and not stability.stable:
+            steps.append(
+                StepResult(
+                    "暂缓开对冲",
+                    True,
+                    "理财已在保证金。现在价格不稳，等标签变绿后再开，或下次选择「强行开仓」",
                 )
-            except Exception:
-                stability = None
-            if not force_hedge and stability is not None and not stability.stable:
-                steps.append(
-                    StepResult(
-                        "暂缓开对冲",
-                        True,
-                        "理财已在保证金。现在价格不稳，等标签变绿后再开，或下次选择「强行开仓」",
-                    )
-                )
-                return steps
+            )
+            return steps
         steps.extend(self._ensure_hedge())
         return steps
 
@@ -439,7 +459,7 @@ class HedgeCycle:
         ], True
 
     def _assert_enter_macd_and_stable_now(self) -> tuple[list[StepResult], bool]:
-        """自动入场挂单前：本币对金叉/死叉与入场级平稳必须同时满足（归集后重验）。"""
+        """自动入场挂单前：本币对金叉/死叉与入场级平稳必须同时满足。"""
         need_macd = bool(getattr(self.settings, "macd_auto_harvest", True))
         try:
             st = price_stability(
