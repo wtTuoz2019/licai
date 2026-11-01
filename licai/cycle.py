@@ -217,8 +217,8 @@ class HedgeCycle:
             steps.extend(self._ensure_hedge())
             return steps
 
-        # 自动入场：后台已定期划入保证金 / 扫现货，这里不再做换年化·扫货·settle
-        # 睡眠；先卡时机，最多补一笔轻量划入，再挂单。
+        # 自动入场：每日管家已划入/扫闲置，这里不再做换年化·扫货·settle
+        # 睡眠；先卡时机，最多补一笔轻量划入（可赎回），再挂单。
         if auto and not force_hedge:
             gate, ok = self._assert_enter_macd_and_stable_now()
             steps.extend(gate)
@@ -3354,13 +3354,9 @@ class HedgeCycle:
                     placed = self._place("BUY", "LONG", leftover, buy_px, False)
                     steps.append(placed)
                     if _no_margin(placed):
-                        steps.append(StepResult("保证金不够", False, "另一边加不上，把多出来的一边平回平衡"))
-                        steps.extend(self._hedge_pass(add, True, market=True, aggressive=True, flatten=True))
-                        steps.extend(self._flatten_if_naked())
-                        after = self.futures.legs(self.symbol)
-                        if after.missing_side is not None and after.long_qty > 0 and after.short_qty > 0:
-                            steps.extend(recover_imbalance("保证金不够后拉齐"))
-                        return steps
+                        return self._scale_margin_reject_recover(
+                            steps, add=add, recover_imbalance=recover_imbalance, tag="挂多"
+                        )
             # 挂多后再读仓，避免用过期数量去挂空
             legs = self.futures.legs(self.symbol)
             if legs.short_qty < goal_short:
@@ -3369,13 +3365,9 @@ class HedgeCycle:
                     placed = self._place("SELL", "SHORT", leftover, sell_px, False)
                     steps.append(placed)
                     if _no_margin(placed):
-                        steps.append(StepResult("保证金不够", False, "另一边加不上，把多出来的一边平回平衡"))
-                        steps.extend(self._hedge_pass(add, True, market=True, aggressive=True, flatten=True))
-                        steps.extend(self._flatten_if_naked())
-                        after = self.futures.legs(self.symbol)
-                        if after.missing_side is not None and after.long_qty > 0 and after.short_qty > 0:
-                            steps.extend(recover_imbalance("保证金不够后拉齐"))
-                        return steps
+                        return self._scale_margin_reject_recover(
+                            steps, add=add, recover_imbalance=recover_imbalance, tag="挂空"
+                        )
             if self._wait_until(lambda: goals_met(self.futures.legs(self.symbol)), timeout=wait):
                 return steps + finish_ok(self.futures.legs(self.symbol))
         steps.append(StepResult("挂单未齐", True, f"加仓限价 {tries} 次未齐，改市价补"))
@@ -3387,12 +3379,9 @@ class HedgeCycle:
                 placed = self._place("BUY", "LONG", leftover, ask, False, market=True)
                 steps.append(placed)
                 if _no_margin(placed):
-                    steps.extend(self._hedge_pass(add, True, market=True, aggressive=True, flatten=True))
-                    steps.extend(self._flatten_if_naked())
-                    after = self.futures.legs(self.symbol)
-                    if after.missing_side is not None and after.long_qty > 0 and after.short_qty > 0:
-                        steps.extend(recover_imbalance("市价补仓保证金不够后拉齐"))
-                    return steps
+                    return self._scale_margin_reject_recover(
+                        steps, add=add, recover_imbalance=recover_imbalance, tag="市价补多"
+                    )
         legs = self.futures.legs(self.symbol)
         if legs.short_qty < goal_short:
             leftover = self.futures.round_qty(goal_short - legs.short_qty, step)
@@ -3400,12 +3389,9 @@ class HedgeCycle:
                 placed = self._place("SELL", "SHORT", leftover, bid, False, market=True)
                 steps.append(placed)
                 if _no_margin(placed):
-                    steps.extend(self._hedge_pass(add, True, market=True, aggressive=True, flatten=True))
-                    steps.extend(self._flatten_if_naked())
-                    after = self.futures.legs(self.symbol)
-                    if after.missing_side is not None and after.long_qty > 0 and after.short_qty > 0:
-                        steps.extend(recover_imbalance("市价补仓保证金不够后拉齐"))
-                    return steps
+                    return self._scale_margin_reject_recover(
+                        steps, add=add, recover_imbalance=recover_imbalance, tag="市价补空"
+                    )
         self._wait_until(lambda: goals_met(self.futures.legs(self.symbol)), timeout=0.8)
         legs = self.futures.legs(self.symbol)
         if goals_met(legs):
@@ -3413,8 +3399,43 @@ class HedgeCycle:
         if legs.long_qty > 0 and legs.short_qty > 0 and legs.long_qty != legs.short_qty:
             steps.extend(recover_imbalance("加仓收尾拉齐"))
             return steps
+        # 仍单边：先回注再补，最后才全平
+        return self._complete_hedge_after_margin_reject(
+            steps
+            + [StepResult("加仓未完成", False, "加仓后仍单边，先紧急回注再补")],
+            qty=self._restore_qty(legs) or add,
+            reduce_only=False,
+        )
+
+    def _scale_margin_reject_recover(
+        self,
+        steps: list[StepResult],
+        *,
+        add: Decimal,
+        recover_imbalance,
+        tag: str,
+    ) -> list[StepResult]:
+        """加仓一边成功另一边 -2019：先紧急回注再拉齐；仍乱再削回平衡。"""
+        steps.append(
+            StepResult(
+                "保证金不够",
+                False,
+                f"{tag}后另一边加不上，先紧急回注再补，避免直接砍仓",
+            )
+        )
+        try:
+            steps.extend(self.pipeline.rescue_margin_for_refill())
+            steps.extend(recover_imbalance(f"{tag}回注后拉齐"))
+            after = self.futures.legs(self.symbol)
+            if after.missing_side is None:
+                return steps
+        except Exception as exc:
+            steps.append(StepResult("紧急回注异常", False, str(exc)))
+        steps.extend(self._hedge_pass(add, True, market=True, aggressive=True, flatten=True))
         steps.extend(self._flatten_if_naked())
-        steps.append(StepResult("加仓未完成", False, self._legs_text(self.futures.legs(self.symbol))))
+        after = self.futures.legs(self.symbol)
+        if after.missing_side is not None and after.long_qty > 0 and after.short_qty > 0:
+            steps.extend(recover_imbalance(f"{tag}保证金不够后拉齐"))
         return steps
 
     def _legs_text(self, legs: HedgeLegs) -> str:
