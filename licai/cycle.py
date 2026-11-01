@@ -1087,7 +1087,7 @@ class HedgeCycle:
                 f"半平则继续平净；转出后先申购理财计入保证金，再补仓",
             )
         ]
-        # 浮盈已达标：先备好理财产品与保证金快照，再等时机；窗口内只平仓
+        # 浮盈已达标：先备好理财产品，再等时机；窗口内只打余额快照 + 平仓
         if earn_product is not None:
             planned = earn_product
             self._harvest_earn_product = planned
@@ -1102,10 +1102,6 @@ class HedgeCycle:
             planned, plan_step = self.pipeline.plan_earn_target()
             self._harvest_earn_product = planned
             steps.append(plan_step)
-        try:
-            before_pm = self.futures.papi_balances() if not self.settings.dry_run else {}
-        except Exception:
-            before_pm = {}
 
         if auto and wait_stable:
             gate, ok = self._assert_macd_and_stable_now(side)
@@ -1117,6 +1113,12 @@ class HedgeCycle:
                 steps.extend(self._wait_until_stable("平仓前"))
             except Exception as exc:
                 steps.append(StepResult("平仓前平稳跳过", True, str(exc)))
+
+        # 时机已确认后再读保证金快照，避免窗口外空打接口
+        try:
+            before_pm = self.futures.papi_balances() if not self.settings.dry_run else {}
+        except Exception:
+            before_pm = {}
 
         # 一经平掉盈利腿进入裸仓，后面任何报错都不能阻断补仓（finally 保底）
         refill_qty = Decimal("0")

@@ -47,6 +47,8 @@ class AutoHarvestWorker:
         self._last_cross_key: dict[int, str] = {}
         # account_id -> UTC 日期：利息到账并完成每日管家后才记完成（落盘）
         self._earn_day_done: dict[int, str] = self._load_earn_day_done()
+        # 当日已做过划入+扫闲置（换年化若被 uniMMR 挡住，仍可稍后只重试换）
+        self._daily_fund_sweep_done: dict[int, str] = {}
         # 等利息期间每账号最多半小时强刷一次快照，避免每分钟打爆币安
         self._earn_probe_at: dict[int, float] = {}
         self._earn_probe_gap = 1800.0
@@ -109,6 +111,9 @@ class AutoHarvestWorker:
         sec = int(getattr(self.ops.base, "auto_harvest_seconds", 0) or 0)
         if sec <= 0:
             sec = int(getattr(self.ops.base, "watch_seconds", 60) or 60)
+        # 1m MACD 交叉窗口短：开启过滤时轮询压到 15–20s，避免整分漏掉
+        if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
+            return float(max(15, min(int(sec), 20)))
         return max(60.0, float(sec))
 
     def _mark_due(self, account_id: int, gap: float) -> None:
@@ -476,17 +481,33 @@ class AutoHarvestWorker:
                 return
 
             notes: list[str] = []
-            # 1) 换年化（仅自动收利账号）
+            # 1) 划入 + 扫闲置：一天只做一次（与换年化是否挡住无关）
+            if self._daily_fund_sweep_done.get(account.id) != day:
+                if bool(getattr(self.ops.base, "auto_fund_margin", True)):
+                    notes.append(self._fund_margin_once(account))
+                else:
+                    notes.append("划入保证金跳过：已关闭")
+                if bool(getattr(self.ops.base, "auto_sweep_spot", True)):
+                    notes.append(self._sweep_idle_once(account, live))
+                else:
+                    notes.append("扫闲置跳过：已关闭")
+                self._daily_fund_sweep_done[account.id] = day
+            else:
+                notes.append("划入/扫闲置：今日已做过")
+
+            # 2) 换年化（仅自动收利账号）；被 uniMMR 挡住则今日稍后只重试这一步
             do_switch = bool(account.auto_harvest) and bool(
                 getattr(self.ops.base, "auto_switch_earn", True)
             )
+            switch_blocked = False
             if do_switch:
                 switch = live.get("switch") or {}
                 if not switch.get("needed"):
                     notes.append("换年化跳过：已是最高或无需换")
                 elif not switch.get("can_click"):
+                    switch_blocked = True
                     notes.append(
-                        f"换年化跳过：{switch.get('reason') or 'uniMMR/批次不够'}"
+                        f"换年化暂缓：{switch.get('reason') or 'uniMMR/批次不够'}（稍后重试）"
                     )
                 else:
                     _print(
@@ -512,20 +533,22 @@ class AutoHarvestWorker:
                             f"{s.get('name')}: {s.get('detail')}" for s in pick
                         )
                     notes.append(f"换年化 ok={result.get('ok')} {detail[:200]}")
+                    if not result.get("ok"):
+                        # 失败不记完，半小时后再试；划入/扫闲置不会重做
+                        _print(
+                            f"每日管家未完成 account={account.id}（换年化失败，稍后重试）："
+                            + "；".join(notes)[:700]
+                        )
+                        return
             else:
                 notes.append("换年化跳过：未开自动收利/自动换")
 
-            # 2) 划入保证金一次
-            if bool(getattr(self.ops.base, "auto_fund_margin", True)):
-                notes.append(self._fund_margin_once(account))
-            else:
-                notes.append("划入保证金跳过：已关闭")
-
-            # 3) 扫闲置一次
-            if bool(getattr(self.ops.base, "auto_sweep_spot", True)):
-                notes.append(self._sweep_idle_once(account, live))
-            else:
-                notes.append("扫闲置跳过：已关闭")
+            if switch_blocked:
+                _print(
+                    f"每日管家部分完成 account={account.id}："
+                    + "；".join(notes)[:700]
+                )
+                return
 
             self._mark_earn_day_done(account.id, day)
             _print(
@@ -720,12 +743,13 @@ class AutoHarvestWorker:
             f"long={long_pnl} short={short_pnl} min={min_profit} · {step.detail}"
         )
 
-    def _take_harvest_prep(self, account_id: int):
-        """取出并消费预扫结果（过期则丢弃）。"""
-        hit = self._harvest_prep.pop(account_id, None)
+    def _peek_harvest_prep(self, account_id: int):
+        """查看预扫结果（不消费；过期则清掉）。"""
+        hit = self._harvest_prep.get(account_id)
         if not hit:
             return None
         if (time.monotonic() - float(hit.get("at") or 0)) > self._harvest_prep_ttl:
+            self._harvest_prep.pop(account_id, None)
             return None
         if not hit.get("ok"):
             return None
@@ -864,10 +888,14 @@ class AutoHarvestWorker:
             fails = [s for s in steps if not s.get("ok")]
             pick = fails or steps[-4:]
             detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+        timing_miss = any(
+            (s.get("name") or "") in {"入场时机未齐", "时机未齐"} for s in steps
+        )
         if ok and bool(getattr(self.ops.base, "macd_auto_harvest", True)):
             self._remember_cross(account.id, sym)
         _print(f"自动开仓结束 account={account.id} ok={ok} {detail[:500]}")
-        return True
+        # 时机未齐不算成交，避免无意义 settle 刷快照
+        return bool(ok) and not timing_miss
 
     def _maybe_harvest(self, account, live: dict) -> bool:
         harvest = live.get("harvest") or {}
@@ -897,7 +925,7 @@ class AutoHarvestWorker:
             side = None
             macd_note = "未启用 MACD 过滤"
 
-        prep = self._take_harvest_prep(account.id)
+        prep = self._peek_harvest_prep(account.id)
         _print(
             f"自动收利触发 account={account.id} side={side or harvest.get('winner')} "
             f"pnl={harvest.get('winner_pnl')} macd={macd_note} "
@@ -927,8 +955,10 @@ class AutoHarvestWorker:
             fails = [s for s in steps if not s.get("ok")]
             pick = fails or steps[-4:]
             detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
-        # 收利后无论成败，再确认一次没有单边敞口
-        self._repair_naked_hedge(account)
+        timing_miss = any((s.get("name") or "") == "时机未齐" for s in steps)
+        # 收利后无论成败，再确认一次没有单边敞口（时机未齐未平仓则不必）
+        if not timing_miss:
+            self._repair_naked_hedge(account)
         if ok and side:
             cross = self._tick_crosses.get(sym)
             if cross is None and sym not in self._tick_crosses:
@@ -939,10 +969,12 @@ class AutoHarvestWorker:
                 )
             if cross and cross.harvest_side == side:
                 self._last_cross_key[account.id] = f"{sym}:{cross.kind}:{cross.time}"
-        # 成功或失败都清掉预扫，避免用过期产品
-        self._harvest_prep.pop(account.id, None)
+        # 时机未齐：保留预扫给下一根交叉；真正动手后清掉
+        if not timing_miss:
+            self._harvest_prep.pop(account.id, None)
         _print(f"自动收利结束 account={account.id} ok={ok} {detail[:500]}")
-        return True
+        # 时机未齐不算成交；一旦过了断言（哪怕中途失败）都要刷快照
+        return not timing_miss
 
     def _repair_naked_hedge(self, account) -> None:
         """收利后若仍单边，强行一键补仓/平裸仓，避免爆仓。"""
