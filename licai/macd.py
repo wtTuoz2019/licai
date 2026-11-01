@@ -202,6 +202,7 @@ def _format_kline_time(open_ms: int) -> str:
 
 
 def _fetch_binance_macd_rows(symbol: str, *, timeout: float) -> list[dict]:
+    """拉 1m K 线并丢掉未收盘那根，交叉只认已收盘的上一条。"""
     sym = _norm_symbol(symbol)
     if not sym:
         return []
@@ -215,13 +216,27 @@ def _fetch_binance_macd_rows(symbol: str, *, timeout: float) -> list[dict]:
     raw = resp.json()
     if not isinstance(raw, list) or not raw:
         return []
+    now_ms = int(time.time() * 1000)
     closes: list[Decimal] = []
     times: list[str] = []
     for row in raw:
         if not isinstance(row, (list, tuple)) or len(row) < 5:
             continue
+        # index6=close_time；未收盘 K 的 close_time 还在未来 → 跳过
+        close_ms = 0
+        if len(row) > 6:
+            try:
+                close_ms = int(row[6])
+            except Exception:
+                close_ms = 0
+        if close_ms > now_ms:
+            continue
         closes.append(d(row[4]))
         times.append(_format_kline_time(int(row[0])))
+    # 兜底：没带 close_time 时丢掉最后一根（多为当前分钟未收盘）
+    if closes and (not isinstance(raw[-1], (list, tuple)) or len(raw[-1]) <= 6):
+        closes = closes[:-1]
+        times = times[:-1]
     return _macd_rows_from_closes(closes, times)
 
 

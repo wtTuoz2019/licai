@@ -98,7 +98,7 @@ class AutoHarvestWorker:
             extras.append("利息到账后每日扫闲置一次")
         extras.append("浮盈达标先预扫理财；账户挂起自动加仓")
         extra = "；".join(extras) if extras else "无额外理财自动化"
-        _print(f"自动收利后台已启动（{note}；{extra}）")
+        _print(f"自动收利后台已启动（每分:05 拉已收盘K；{note}；{extra}）")
 
     def stop(self) -> None:
         self._stop.set()
@@ -108,13 +108,21 @@ class AutoHarvestWorker:
         self._thread = None
 
     def _interval(self) -> float:
+        """账号级 due 间隔（有仓/交叉时）；主循环已按整分+5s 对齐。"""
         sec = int(getattr(self.ops.base, "auto_harvest_seconds", 0) or 0)
         if sec <= 0:
             sec = int(getattr(self.ops.base, "watch_seconds", 60) or 60)
-        # 1m MACD 交叉窗口短：开启过滤时轮询压到 15–20s，避免整分漏掉
-        if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
-            return float(max(15, min(int(sec), 20)))
         return max(60.0, float(sec))
+
+    @staticmethod
+    def _seconds_until_minute_mark(offset_sec: float = 5.0) -> float:
+        """距下一个「整分钟 + offset」的秒数（默认每分 :05 拉已收盘 K）。"""
+        now = time.time()
+        minute = now // 60.0
+        target = minute * 60.0 + float(offset_sec)
+        if now >= target:
+            target += 60.0
+        return max(0.5, target - now)
 
     def _mark_due(self, account_id: int, gap: float) -> None:
         # 错开账号，避免整点一起打币安
@@ -146,7 +154,10 @@ class AutoHarvestWorker:
         return _qty(legs, "long_qty") <= 0 and _qty(legs, "short_qty") <= 0
 
     def _loop(self) -> None:
-        while not self._stop.wait(self._interval()):
+        # 每分钟 :05 跑一轮：上一根 1m K 已收盘，交叉窗口约一整分，不必 15s 狂扫
+        while not self._stop.is_set():
+            if self._stop.wait(self._seconds_until_minute_mark(5.0)):
+                break
             try:
                 self._tick()
             except Exception:
