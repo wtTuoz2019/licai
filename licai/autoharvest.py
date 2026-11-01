@@ -53,8 +53,9 @@ class AutoHarvestWorker:
         # 本轮按币对各刷一次 MACD（同币对多账号共用，避免重复 force）
         self._tick_crosses: dict[str, object] = {}
         # 浮盈已达标时提前扫好的理财产品：account_id -> {product, detail, at}
+        # 年化很少变，缓存拉长到 24h，避免反复打产品列表
         self._harvest_prep: dict[int, dict] = {}
-        self._harvest_prep_ttl = 1800.0
+        self._harvest_prep_ttl = 86400.0
         # 账号下次完整检查时间；空闲（无仓/无迁仓/无挂起加仓）拉长，有交叉立刻查
         self._due_at: dict[int, float] = {}
         self._idle_gap = 180.0
