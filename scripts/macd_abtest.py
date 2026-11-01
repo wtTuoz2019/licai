@@ -592,22 +592,22 @@ class AbTestCycle(HedgeCycle):
 
     def _ab_resolve_enter_order(self) -> list[StepResult]:
         url = getattr(self.settings, "macd_indicator_url", None) or ""
-        state = fetch_macd_state(url)
+        state = fetch_macd_state(url, symbol=self.symbol)
         if state is None:
             self._enter_first_side = "LONG"
-            note = "MACD 不可用，默认先多后空"
+            note = f"{self.symbol} MACD 不可用，默认先多后空"
         elif state.cross == "golden":
             self._enter_first_side = "LONG"
-            note = f"金叉@{state.time}，先多后空"
+            note = f"{self.symbol} 金叉@{state.time}，先多后空"
         elif state.cross == "death":
             self._enter_first_side = "SHORT"
-            note = f"死叉@{state.time}，先空后多"
+            note = f"{self.symbol} 死叉@{state.time}，先空后多"
         elif state.bias == "bear":
             self._enter_first_side = "SHORT"
-            note = f"下跌@{state.time}，先空后多"
+            note = f"{self.symbol} 下跌@{state.time}，先空后多"
         else:
             self._enter_first_side = "LONG"
-            note = f"上涨@{state.time}，先多后空"
+            note = f"{self.symbol} 上涨@{state.time}，先多后空"
         self._enter_order_note = note
         return [StepResult("入场顺序", True, note)]
 
@@ -983,7 +983,8 @@ class GridRunner:
 
     def _macd_snap(self) -> dict | None:
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
-        state = fetch_macd_state(url)
+        sym = str(getattr(self.account, "hedge_symbol", "") or "").upper()
+        state = fetch_macd_state(url, symbol=sym or None)
         if state is None:
             return None
         return {
@@ -998,17 +999,19 @@ class GridRunner:
             "gap_abs": str(state.gap_abs),
             "enter_first": state.enter_first_side,
             "harvest_side": state.harvest_side,
+            "symbol": sym or state.symbol,
         }
 
     def _fresh_cross(self, *, max_gap: Decimal | None = None, trial: str = ""):
         """取未用过的金叉/死叉；敞口大于上限则跳过并消费这根。"""
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
-        cross = fetch_macd_cross(url)
+        sym = str(getattr(self.account, "hedge_symbol", "") or "").upper()
+        cross = fetch_macd_cross(url, symbol=sym or None)
         if cross is None:
-            return None, "等待金叉/死叉"
-        key = f"{cross.kind}:{cross.time}"
+            return None, f"等待 {sym or 'MACD'} 金叉/死叉"
+        key = f"{sym}:{cross.kind}:{cross.time}"
         if key == self._last_cross_key:
-            return None, f"{cross.label}@{cross.time} 已用过"
+            return None, f"{sym} {cross.label}@{cross.time} 已用过"
         if key != self._last_gap_logged:
             self._last_gap_logged = key
             self._log(
@@ -1363,7 +1366,7 @@ class GridRunner:
                 time.sleep(self.poll_seconds)
                 continue
             # 拿到锁后再标记交叉已用，避免 busy 时白白跳过信号
-            self._last_cross_key = f"{cross.kind}:{cross.time}"
+            self._last_cross_key = f"{getattr(cross, 'symbol', '') or ''}:{cross.kind}:{cross.time}"
             self._trial_metrics["enter_gap_abs"] = str(cross.gap_abs)
             self._trial_metrics["book_spread_bps"] = book_meta.get("book_spread_bps")
             self._log(
@@ -1477,7 +1480,7 @@ class GridRunner:
             side = cross.harvest_side
             pnl = legs.long_pnl if side == "LONG" else legs.short_pnl
             if pnl < need:
-                self._last_cross_key = f"{cross.kind}:{cross.time}"
+                self._last_cross_key = f"{getattr(cross, 'symbol', '') or ''}:{cross.kind}:{cross.time}"
                 self._log(
                     {
                         "event": "cross_skip_pnl",
@@ -1501,7 +1504,7 @@ class GridRunner:
                 )
                 time.sleep(self.poll_seconds)
                 continue
-            self._last_cross_key = f"{cross.kind}:{cross.time}"
+            self._last_cross_key = f"{getattr(cross, 'symbol', '') or ''}:{cross.kind}:{cross.time}"
             self._trial_metrics["harvest_gap_abs"] = str(cross.gap_abs)
 
             self._log(

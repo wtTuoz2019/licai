@@ -184,7 +184,13 @@ class HedgeCycle:
             return steps
         return self._watch_loop(steps)
 
-    def setup_once(self, force_hedge: bool = False, skip_hedge: bool = False) -> list[StepResult]:
+    def setup_once(
+        self,
+        force_hedge: bool = False,
+        skip_hedge: bool = False,
+        *,
+        auto: bool = False,
+    ) -> list[StepResult]:
         steps: list[StepResult] = []
         legs = self.futures.legs(self.symbol)
         hedged = legs.missing_side is None and legs.long_qty > 0 and legs.short_qty > 0
@@ -217,19 +223,28 @@ class HedgeCycle:
         steps.extend(self._prepare_account())
         if any(not s.ok for s in steps):
             return steps
-        try:
-            stability = price_stability(self.futures, self.settings)
-        except Exception:
-            stability = None
-        if not force_hedge and stability is not None and not stability.stable:
-            steps.append(
-                StepResult(
-                    "暂缓开对冲",
-                    True,
-                    "理财已在保证金。现在价格不稳，等标签变绿后再开，或下次选择「强行开仓」",
+        # 自动入场：归集后重验本币对交叉+入场平稳，避免窗口已过仍硬开
+        if auto and not force_hedge:
+            gate, ok = self._assert_enter_macd_and_stable_now()
+            steps.extend(gate)
+            if not ok:
+                return steps
+        else:
+            try:
+                stability = price_stability(
+                    self.futures, self.settings, purpose="enter", symbol=self.symbol
                 )
-            )
-            return steps
+            except Exception:
+                stability = None
+            if not force_hedge and stability is not None and not stability.stable:
+                steps.append(
+                    StepResult(
+                        "暂缓开对冲",
+                        True,
+                        "理财已在保证金。现在价格不稳，等标签变绿后再开，或下次选择「强行开仓」",
+                    )
+                )
+                return steps
         steps.extend(self._ensure_hedge())
         return steps
 
@@ -387,7 +402,7 @@ class HedgeCycle:
             return [StepResult("时机已到", True, f"已平稳（{hint}）")], True
         url = getattr(self.settings, "macd_indicator_url", None) or ""
         try:
-            hit = fetch_macd_cross(url, force=True)
+            hit = fetch_macd_cross(url, symbol=self.symbol, force=True)
         except Exception as exc:
             return [StepResult("时机未齐", False, f"MACD 拉取失败：{exc}")], False
         if hit is None:
@@ -419,7 +434,52 @@ class HedgeCycle:
             StepResult(
                 "时机已到",
                 True,
-                f"{hit.label}@{hit.time} 与收利级平稳同时满足，平 {side}",
+                f"{self.symbol} {hit.label}@{hit.time} 与收利级平稳同时满足，平 {side}",
+            )
+        ], True
+
+    def _assert_enter_macd_and_stable_now(self) -> tuple[list[StepResult], bool]:
+        """自动入场挂单前：本币对金叉/死叉与入场级平稳必须同时满足（归集后重验）。"""
+        need_macd = bool(getattr(self.settings, "macd_auto_harvest", True))
+        try:
+            st = price_stability(
+                self.futures, self.settings, purpose="enter", symbol=self.symbol
+            )
+            stable = bool(st.stable)
+            hint = st.hint
+        except Exception as exc:
+            return [StepResult("入场时机未齐", False, f"平稳检测失败：{exc}")], False
+        if not need_macd:
+            if not stable:
+                return [StepResult("入场时机未齐", False, f"须入场级平稳（{hint}）")], False
+            return [StepResult("入场时机已到", True, f"已平稳（{hint}）")], True
+        url = getattr(self.settings, "macd_indicator_url", None) or ""
+        try:
+            hit = fetch_macd_cross(url, symbol=self.symbol, force=True)
+        except Exception as exc:
+            return [StepResult("入场时机未齐", False, f"MACD 拉取失败：{exc}")], False
+        if hit is None:
+            miss = "已平稳但本币对无金叉/死叉" if stable else "无交叉且不稳"
+            return [
+                StepResult(
+                    "入场时机未齐",
+                    False,
+                    f"须本币对金叉/死叉与入场级平稳同时满足（{miss}）",
+                )
+            ], False
+        if not stable:
+            return [
+                StepResult(
+                    "入场时机未齐",
+                    False,
+                    f"{self.symbol} 有{hit.label}@{hit.time} 但不稳（{hint}），归集后已错失窗口",
+                )
+            ], False
+        return [
+            StepResult(
+                "入场时机已到",
+                True,
+                f"{self.symbol} {hit.label}@{hit.time} 与入场平稳同时满足，开始挂单",
             )
         ], True
 
@@ -455,7 +515,7 @@ class HedgeCycle:
             return True, f"已平稳（{hint}）", prefer
         url = getattr(self.settings, "macd_indicator_url", None) or ""
         try:
-            hit = fetch_macd_cross(url, force=True)
+            hit = fetch_macd_cross(url, symbol=symbol, force=True)
         except Exception as exc:
             return False, f"MACD 拉取失败：{exc}", prefer
         if hit is None:
@@ -463,8 +523,8 @@ class HedgeCycle:
             return False, f"须交叉与平稳同时满足（{miss}）", prefer
         prefer = hit.harvest_side
         if not stable:
-            return False, f"有{hit.label}@{hit.time} 但不稳（{hint}）", prefer
-        return True, f"{hit.label}@{hit.time} 与平稳同时满足，优先平 {prefer}", prefer
+            return False, f"{symbol} 有{hit.label}@{hit.time} 但不稳（{hint}）", prefer
+        return True, f"{symbol} {hit.label}@{hit.time} 与平稳同时满足，优先平 {prefer}", prefer
 
     def migrate_symbol_and_enter(
         self,
@@ -551,7 +611,7 @@ class HedgeCycle:
             # MACD 约 15s 拉一次（只认当前那一根交叉）；平稳 2s 看一次
             if need_macd and (last_macd_pull <= 0 or now - last_macd_pull >= 15.0):
                 try:
-                    hit = fetch_macd_cross(url, force=True)
+                    hit = fetch_macd_cross(url, symbol=self.symbol, force=True)
                 except Exception:
                     hit = None
                 last_macd_pull = now
@@ -573,7 +633,7 @@ class HedgeCycle:
                 # 平稳刚到位时再确认一次交叉，避免拿着过期交叉当真
                 if need_macd:
                     try:
-                        hit = fetch_macd_cross(url, force=True)
+                        hit = fetch_macd_cross(url, symbol=self.symbol, force=True)
                     except Exception:
                         hit = None
                     last_macd_pull = time.monotonic()
@@ -584,8 +644,8 @@ class HedgeCycle:
                 if hit is not None:
                     prefer = hit.harvest_side
                     detail = (
-                        f"{purpose}：等了 {waited}s，{hit.label}@{hit.time} 与平稳同时满足"
-                        f"（{hint}），优先挂单平 {prefer}"
+                        f"{purpose}：等了 {waited}s，{self.symbol} {hit.label}@{hit.time} "
+                        f"与平稳同时满足（{hint}），优先挂单平 {prefer}"
                     )
                 else:
                     detail = f"{purpose}：等了 {waited}s，已平稳（{hint}）"
@@ -877,18 +937,18 @@ class HedgeCycle:
         return tries, wait
 
     def _resolve_enter_leg_order(self) -> list[StepResult]:
-        """按 MACD 涨跌决定入场先挂哪边：上涨先多，下跌先空。"""
+        """按本币对 MACD 涨跌决定入场先挂哪边：上涨先多，下跌先空。"""
         url = getattr(self.settings, "macd_indicator_url", None) or ""
-        state = fetch_macd_state(url)
+        state = fetch_macd_state(url, symbol=self.symbol)
         if state is None:
             self._enter_first_side = "LONG"
-            self._enter_order_note = "MACD 不可用，默认先挂多再挂空"
+            self._enter_order_note = f"{self.symbol} MACD 不可用，默认先挂多再挂空"
         elif state.bias == "bear":
             self._enter_first_side = "SHORT"
-            self._enter_order_note = f"MACD 下跌@{state.time}，先挂空再挂多"
+            self._enter_order_note = f"{self.symbol} MACD 下跌@{state.time}，先挂空再挂多"
         else:
             self._enter_first_side = "LONG"
-            self._enter_order_note = f"MACD 上涨@{state.time}，先挂多再挂空"
+            self._enter_order_note = f"{self.symbol} MACD 上涨@{state.time}，先挂多再挂空"
         return [StepResult("入场顺序", True, self._enter_order_note)]
 
     def _ensure_hedge(self) -> list[StepResult]:

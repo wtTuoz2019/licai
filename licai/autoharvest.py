@@ -50,8 +50,8 @@ class AutoHarvestWorker:
         # 等利息期间每账号最多半小时强刷一次快照，避免每分钟打爆币安
         self._earn_probe_at: dict[int, float] = {}
         self._earn_probe_gap = 1800.0
-        # 本轮 tick 共用一根 MACD，避免 6 个账号各自 force 打 c7.pro
-        self._tick_cross = None
+        # 本轮按币对各刷一次 MACD（同币对多账号共用，避免重复 force）
+        self._tick_crosses: dict[str, object] = {}
         # 闲置可转出探测节流
         self._withdraw_probe_at: dict[int, float] = {}
         self._withdraw_probe_gap = 600.0
@@ -155,15 +155,27 @@ class AutoHarvestWorker:
     def _utc_day(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+    def _account_symbol(self, account) -> str:
+        return str(getattr(account, "hedge_symbol", "") or "").strip().upper()
+
     def _tick(self) -> None:
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
-        # 整轮只强刷一次；失败退避由 macd 模块处理
-        try:
-            self._tick_cross = fetch_macd_cross(url, force=True)
-        except Exception:
-            self._tick_cross = None
-        cross_now = self._tick_cross is not None
-        for account in self.ops.store.list_accounts():
+        accounts = list(self.ops.store.list_accounts())
+        # 整轮按币对各强刷一次；失败退避由 macd 模块处理
+        symbols = sorted(
+            {
+                self._account_symbol(a)
+                for a in accounts
+                if self._account_symbol(a)
+            }
+        )
+        self._tick_crosses = {}
+        for sym in symbols:
+            try:
+                self._tick_crosses[sym] = fetch_macd_cross(url, symbol=sym, force=True)
+            except Exception:
+                self._tick_crosses[sym] = None
+        for account in accounts:
             if self._stop.is_set():
                 return
             try:
@@ -189,7 +201,9 @@ class AutoHarvestWorker:
             )
             if not account.auto_harvest and not pending_scale:
                 continue
-            # 有交叉 / 有仓 / 挂起加仓 / 迁仓：按正常间隔；纯空仓空闲拉到 ~3 分钟
+            # 本币对有交叉 / 有仓 / 挂起加仓 / 迁仓：按正常间隔；纯空仓空闲拉到 ~3 分钟
+            sym = self._account_symbol(account)
+            cross_now = bool(sym and self._tick_crosses.get(sym) is not None)
             urgent = (
                 cross_now
                 or armed
@@ -321,7 +335,9 @@ class AutoHarvestWorker:
                     if not left:
                         # 单边清净后也不立刻开仓，留给自动开仓等下一根交叉
                         self.ops.clear_migrate_arm(account.id)
-                        self._remember_cross(account.id)
+                        self._remember_cross(
+                            account.id, self._account_symbol(account)
+                        )
                         self.ops.store.add_event(
                             account.id,
                             "harvest",
@@ -398,8 +414,10 @@ class AutoHarvestWorker:
             )
             if ok:
                 self.ops.clear_migrate_arm(account.id)
-                # 吃掉本根交叉，避免同一根马上又自动开新套保
-                self._remember_cross(account.id)
+                # 吃掉本币对本根交叉，避免同一根马上又自动开新套保
+                self._remember_cross(
+                    account.id, self._account_symbol(account)
+                )
             else:
                 self.ops.touch_migrate_event(account.id)
             self.ops.refresh_account_snapshot(account)
@@ -536,28 +554,43 @@ class AutoHarvestWorker:
         finally:
             self.ops.end_action(account.id)
 
-    def _macd_side(self, account_id: int) -> tuple[str | None, str]:
-        """仅金叉/死叉那一根才返回腿；否则 None。"""
+    def _macd_side(self, account_id: int, symbol: str | None = None) -> tuple[str | None, str]:
+        """仅本币对金叉/死叉那一根才返回腿；否则 None。"""
         base = self.ops.base
         if not bool(getattr(base, "macd_auto_harvest", True)):
             return None, "MACD 过滤已关闭"
-        cross = self._tick_cross
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            return None, "无套保币对，无法取 MACD"
+        cross = self._tick_crosses.get(sym)
+        if cross is None and sym not in self._tick_crosses:
+            # 本轮未预刷到该币对时再取缓存（不 force）
+            cross = fetch_macd_cross(
+                getattr(base, "macd_indicator_url", None), symbol=sym, force=False
+            )
         if cross is None:
-            # 本轮已 force 过；再用缓存确认一次（不额外打网）
-            cross = fetch_macd_cross(getattr(base, "macd_indicator_url", None), force=False)
-        if cross is None:
-            return None, "当前不是金叉/死叉那一根"
-        key = f"{cross.kind}:{cross.time}"
+            return None, f"{sym} 当前不是金叉/死叉那一根"
+        key = f"{sym}:{cross.kind}:{cross.time}"
         if self._last_cross_key.get(account_id) == key:
-            return None, f"{cross.label}@{cross.time} 已处理过"
-        return cross.harvest_side, f"{cross.label}@{cross.time} → 收{cross.harvest_side}"
-
-    def _remember_cross(self, account_id: int) -> None:
-        cross = self._tick_cross or fetch_macd_cross(
-            getattr(self.ops.base, "macd_indicator_url", None), force=False
+            return None, f"{sym} {cross.label}@{cross.time} 已处理过"
+        return (
+            cross.harvest_side,
+            f"{sym} {cross.label}@{cross.time} → 收{cross.harvest_side}",
         )
+
+    def _remember_cross(self, account_id: int, symbol: str | None = None) -> None:
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            return
+        cross = self._tick_crosses.get(sym)
+        if cross is None and sym not in self._tick_crosses:
+            cross = fetch_macd_cross(
+                getattr(self.ops.base, "macd_indicator_url", None),
+                symbol=sym,
+                force=False,
+            )
         if cross:
-            self._last_cross_key[account_id] = f"{cross.kind}:{cross.time}"
+            self._last_cross_key[account_id] = f"{sym}:{cross.kind}:{cross.time}"
 
     def _maybe_act(self, account) -> None:
         if not self.ops.try_begin_action(account.id):
@@ -760,17 +793,22 @@ class AutoHarvestWorker:
             return False
         if not enter.get("stable_ok", stability.get("stable")):
             return False
+        sym = (live.get("symbol") or self._account_symbol(account) or "").upper()
         macd_note = "未启用 MACD 过滤"
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
-            side, macd_note = self._macd_side(account.id)
+            side, macd_note = self._macd_side(account.id, sym)
             if not side:
                 return False
             # 动手前再确认交叉与平稳仍同时成立
             if not (live.get("stability") or {}).get("stable") and not enter.get("stable_ok"):
                 return False
-            cross = self._tick_cross or fetch_macd_cross(
-                getattr(self.ops.base, "macd_indicator_url", None), force=False
-            )
+            cross = self._tick_crosses.get(sym)
+            if cross is None and sym not in self._tick_crosses:
+                cross = fetch_macd_cross(
+                    getattr(self.ops.base, "macd_indicator_url", None),
+                    symbol=sym,
+                    force=False,
+                )
             if cross is None:
                 return False
         _print(
@@ -798,7 +836,7 @@ class AutoHarvestWorker:
             for s in steps
         )
         if ok and not soft and bool(getattr(self.ops.base, "macd_auto_harvest", True)):
-            self._remember_cross(account.id)
+            self._remember_cross(account.id, sym)
         _print(f"挂起自动加仓结束 account={account.id} ok={ok} soft={soft} {detail[:500]}")
         return True
 
@@ -837,14 +875,19 @@ class AutoHarvestWorker:
             return False
         if not enter.get("stable_ok", stability.get("stable")):
             return False
+        sym = (live.get("symbol") or self._account_symbol(account) or "").upper()
         macd_note = "未启用 MACD 过滤"
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
-            side, macd_note = self._macd_side(account.id)
+            side, macd_note = self._macd_side(account.id, sym)
             if not side:
                 return False
-            cross = self._tick_cross or fetch_macd_cross(
-                getattr(self.ops.base, "macd_indicator_url", None), force=False
-            )
+            cross = self._tick_crosses.get(sym)
+            if cross is None and sym not in self._tick_crosses:
+                cross = fetch_macd_cross(
+                    getattr(self.ops.base, "macd_indicator_url", None),
+                    symbol=sym,
+                    force=False,
+                )
             if cross is None or not stability.get("stable"):
                 return False
         _print(f"自动开仓触发 account={account.id} 严平稳 · {macd_note}，双边挂单入场")
@@ -865,7 +908,7 @@ class AutoHarvestWorker:
             pick = fails or steps[-4:]
             detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
         if ok and bool(getattr(self.ops.base, "macd_auto_harvest", True)):
-            self._remember_cross(account.id)
+            self._remember_cross(account.id, sym)
         _print(f"自动开仓结束 account={account.id} ok={ok} {detail[:500]}")
         return True
 
@@ -875,7 +918,8 @@ class AutoHarvestWorker:
         if self.ops.migrate_arm(account.id) or harvest.get("migrate"):
             return False
 
-        side, macd_note = self._macd_side(account.id)
+        sym = (live.get("symbol") or self._account_symbol(account) or "").upper()
+        side, macd_note = self._macd_side(account.id, sym)
         if bool(getattr(self.ops.base, "macd_auto_harvest", True)):
             # 金叉/死叉与收利级平稳必须同一轮同时满足（与迁仓一致）
             if not side:
@@ -926,9 +970,15 @@ class AutoHarvestWorker:
         # 收利后无论成败，再确认一次没有单边敞口
         self._repair_naked_hedge(account)
         if ok and side:
-            cross = fetch_macd_cross(getattr(self.ops.base, "macd_indicator_url", None))
+            cross = self._tick_crosses.get(sym)
+            if cross is None and sym not in self._tick_crosses:
+                cross = fetch_macd_cross(
+                    getattr(self.ops.base, "macd_indicator_url", None),
+                    symbol=sym,
+                    force=False,
+                )
             if cross and cross.harvest_side == side:
-                self._last_cross_key[account.id] = f"{cross.kind}:{cross.time}"
+                self._last_cross_key[account.id] = f"{sym}:{cross.kind}:{cross.time}"
         _print(f"自动收利结束 account={account.id} ok={ok} {detail[:500]}")
         return True
 

@@ -1626,6 +1626,7 @@ class OpsService:
             run = lambda: cycle.setup_once(
                 force_hedge=force or mode == "force",
                 skip_hedge=mode == "earn_only",
+                auto=auto,
             )
 
         steps: list[StepResult] = []

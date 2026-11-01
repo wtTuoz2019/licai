@@ -1,4 +1,7 @@
-"""c7.pro MACD：自动收利看金叉/死叉；入场看涨跌方向决定先挂哪一边。"""
+"""按币对 MACD：默认用币安 K 线自算；可选外部 URL（支持 {symbol}）。
+
+自动收利看金叉/死叉；入场看涨跌方向决定先挂哪一边。
+"""
 
 from __future__ import annotations
 
@@ -6,6 +9,7 @@ import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 
@@ -14,10 +18,16 @@ from .config import d
 log = logging.getLogger("licai.macd")
 
 DEFAULT_URL = "https://c7.pro/capi/indicator"
+# 公共行情，不需 API Key；与原 c7 分钟级交叉对齐
+_BINANCE_KLINES = "https://fapi.binance.com/fapi/v1/klines"
+_MACD_FAST = 12
+_MACD_SLOW = 26
+_MACD_SIGNAL = 9
+_KLINE_LIMIT = 120
 _CACHE_TTL = 55.0
-# 失败后即使 force=True 也先退避，避免每个自动轮询都卡 4 秒超时
+# 失败后即使 force=True 也先退避，避免每个自动轮询都卡超时
 _FAIL_BACKOFF = 180.0
-# endpoint -> (mono_ts, state|None, err)
+# cache_key -> (mono_ts, state|None, err)
 _cache: dict[str, tuple[float, "MacdState | None", str]] = {}
 _last_fail_log: dict[str, float] = {}
 
@@ -33,8 +43,8 @@ class MacdState:
     signal: Decimal
     hist: Decimal
     # 交叉前一根 |hist|（开口敞口）；无交叉则为当前 |hist|
-    # 交叉当下 hist≈0，用前柱衡量这波波动大小
     gap_abs: Decimal = Decimal("0")
+    symbol: str = ""
 
     @property
     def kind(self) -> str:
@@ -64,6 +74,14 @@ class MacdState:
 MacdCross = MacdState
 
 
+def _norm_symbol(symbol: str | None) -> str:
+    return str(symbol or "").strip().upper()
+
+
+def _cache_key(url: str | None, symbol: str, *, source: str) -> str:
+    return f"{source}|{(url or '').strip()}|{symbol or '-'}"
+
+
 def _parse_rows(payload) -> list[dict]:
     if not isinstance(payload, list):
         return []
@@ -86,7 +104,58 @@ def _parse_rows(payload) -> list[dict]:
     return rows
 
 
-def _detect_state(rows: list[dict]) -> MacdState | None:
+def _ema_series(values: list[Decimal], period: int) -> list[Decimal | None]:
+    """标准 EMA；前 period-1 根为 None，第 period 根用 SMA 播种。"""
+    out: list[Decimal | None] = [None] * len(values)
+    if period <= 0 or len(values) < period:
+        return out
+    seed = sum(values[:period]) / Decimal(period)
+    out[period - 1] = seed
+    mult = Decimal(2) / Decimal(period + 1)
+    prev = seed
+    for i in range(period, len(values)):
+        prev = (values[i] - prev) * mult + prev
+        out[i] = prev
+    return out
+
+
+def _macd_rows_from_closes(closes: list[Decimal], times: list[str]) -> list[dict]:
+    if len(closes) < _MACD_SLOW + _MACD_SIGNAL:
+        return []
+    ema_fast = _ema_series(closes, _MACD_FAST)
+    ema_slow = _ema_series(closes, _MACD_SLOW)
+    macd_line: list[Decimal | None] = [None] * len(closes)
+    for i in range(len(closes)):
+        if ema_fast[i] is None or ema_slow[i] is None:
+            continue
+        macd_line[i] = ema_fast[i] - ema_slow[i]
+    # Signal = EMA of MACD line（只对已有 MACD 的点）
+    macd_vals = [v for v in macd_line if v is not None]
+    if len(macd_vals) < _MACD_SIGNAL:
+        return []
+    signal_on_macd = _ema_series(macd_vals, _MACD_SIGNAL)
+    rows: list[dict] = []
+    mi = 0
+    for i, macd in enumerate(macd_line):
+        if macd is None:
+            continue
+        sig = signal_on_macd[mi]
+        mi += 1
+        if sig is None:
+            continue
+        hist = macd - sig
+        rows.append(
+            {
+                "time": times[i],
+                "macd": macd,
+                "signal": sig,
+                "hist": hist,
+            }
+        )
+    return rows
+
+
+def _detect_state(rows: list[dict], *, symbol: str = "") -> MacdState | None:
     if not rows:
         return None
     curr = rows[-1]
@@ -107,7 +176,6 @@ def _detect_state(rows: list[dict]) -> MacdState | None:
             cross = "golden"
         elif prev_diff >= 0 and diff < 0:
             cross = "death"
-    # 交叉时用前柱 |hist| 作敞口；平时用当前 |hist|
     gap_abs = abs(prev_hist) if cross else abs(curr["hist"])
     return MacdState(
         bias=bias,
@@ -117,58 +185,154 @@ def _detect_state(rows: list[dict]) -> MacdState | None:
         signal=curr["signal"],
         hist=curr["hist"],
         gap_abs=gap_abs,
+        symbol=symbol,
     )
 
 
-def _detect_cross(rows: list[dict]) -> MacdState | None:
-    """仅在刚交叉时返回。"""
-    state = _detect_state(rows)
+def _detect_cross(rows: list[dict], *, symbol: str = "") -> MacdState | None:
+    state = _detect_state(rows, symbol=symbol)
     if state is None or not state.cross:
         return None
     return state
 
 
-def _load_state(url: str | None, *, timeout: float = 4.0, force: bool = False) -> MacdState | None:
+def _format_kline_time(open_ms: int) -> str:
+    # 与 c7 类似的本地分钟串；用 UTC 分钟避免时区漂
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(int(open_ms) / 1000.0))
+
+
+def _fetch_binance_macd_rows(symbol: str, *, timeout: float) -> list[dict]:
+    sym = _norm_symbol(symbol)
+    if not sym:
+        return []
+    resp = requests.get(
+        _BINANCE_KLINES,
+        params={"symbol": sym, "interval": "1m", "limit": _KLINE_LIMIT},
+        timeout=timeout,
+        proxies={"http": None, "https": None},
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    if not isinstance(raw, list) or not raw:
+        return []
+    closes: list[Decimal] = []
+    times: list[str] = []
+    for row in raw:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        closes.append(d(row[4]))
+        times.append(_format_kline_time(int(row[0])))
+    return _macd_rows_from_closes(closes, times)
+
+
+def _url_for_symbol(url: str, symbol: str) -> str:
+    """支持 {symbol}；否则若像裸 indicator 地址则追加 symbol 查询参数。"""
+    sym = _norm_symbol(symbol)
+    if not url:
+        return url
+    if "{symbol}" in url:
+        return url.replace("{symbol}", sym or "")
+    if not sym:
+        return url
+    parts = urlsplit(url)
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if "symbol" not in q and "{symbol}" not in url:
+        q["symbol"] = sym
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
+
+
+def _fetch_remote_rows(url: str, *, timeout: float) -> list[dict]:
+    resp = requests.get(url, timeout=timeout, proxies={"http": None, "https": None})
+    resp.raise_for_status()
+    return _parse_rows(resp.json())
+
+
+def _load_state(
+    url: str | None,
+    *,
+    symbol: str | None = None,
+    timeout: float = 4.0,
+    force: bool = False,
+) -> MacdState | None:
+    sym = _norm_symbol(symbol)
+    # 有币对：优先币安 K 线自算（c7 实际忽略 symbol）
+    source = "binance" if sym else "remote"
     endpoint = (url or DEFAULT_URL).strip() or DEFAULT_URL
+    key = _cache_key(endpoint, sym, source=source)
     now = time.monotonic()
-    hit = _cache.get(endpoint)
+    hit = _cache.get(key)
     if hit:
         ts, state, err = hit
         age = now - ts
-        # 失败退避优先于 force：多账号自动轮询不要连环打挂掉的 c7.pro
         if err and age < _FAIL_BACKOFF:
             return state
         if not force and age < _CACHE_TTL:
             return state
     try:
-        resp = requests.get(endpoint, timeout=timeout, proxies={"http": None, "https": None})
-        resp.raise_for_status()
-        state = _detect_state(_parse_rows(resp.json()))
-        _cache[endpoint] = (now, state, "")
+        if sym:
+            rows = _fetch_binance_macd_rows(sym, timeout=timeout)
+            state = _detect_state(rows, symbol=sym)
+        else:
+            rows = _fetch_remote_rows(endpoint, timeout=timeout)
+            state = _detect_state(rows, symbol="")
+        _cache[key] = (now, state, "")
         return state
     except Exception as exc:
-        last = _last_fail_log.get(endpoint, 0.0)
+        last = _last_fail_log.get(key, 0.0)
         if now - last >= _FAIL_BACKOFF:
-            log.warning("MACD 指标拉取失败（%ss 内不再重试）: %s", int(_FAIL_BACKOFF), exc)
-            _last_fail_log[endpoint] = now
-        _cache[endpoint] = (now, None, str(exc))
+            log.warning(
+                "MACD 指标拉取失败 symbol=%s（%ss 内不再重试）: %s",
+                sym or "-",
+                int(_FAIL_BACKOFF),
+                exc,
+            )
+            _last_fail_log[key] = now
+        # 有币对时币安失败：再试一次带 symbol 的远程 URL（兼容以后 c7 支持）
+        if sym and endpoint:
+            try:
+                remote = _url_for_symbol(endpoint, sym)
+                rows = _fetch_remote_rows(remote, timeout=timeout)
+                state = _detect_state(rows, symbol=sym)
+                _cache[key] = (now, state, "")
+                return state
+            except Exception:
+                pass
+        _cache[key] = (now, None, str(exc))
         return None
 
 
-def fetch_macd_state(url: str | None = None, *, timeout: float = 4.0, force: bool = False) -> MacdState | None:
-    """最新涨跌方向；失败返回 None。"""
-    return _load_state(url, timeout=timeout, force=force)
+def fetch_macd_state(
+    url: str | None = None,
+    *,
+    symbol: str | None = None,
+    timeout: float = 4.0,
+    force: bool = False,
+) -> MacdState | None:
+    """最新涨跌方向；失败返回 None。有 symbol 时按该币对算。"""
+    return _load_state(url, symbol=symbol, timeout=timeout, force=force)
 
 
-def fetch_macd_bias(url: str | None = None, *, timeout: float = 4.0, force: bool = False) -> str | None:
+def fetch_macd_bias(
+    url: str | None = None,
+    *,
+    symbol: str | None = None,
+    timeout: float = 4.0,
+    force: bool = False,
+) -> str | None:
     """返回 bull / bear；失败 None。"""
-    state = _load_state(url, timeout=timeout, force=force)
+    state = _load_state(url, symbol=symbol, timeout=timeout, force=force)
     return None if state is None else state.bias
 
 
-def fetch_macd_cross(url: str | None = None, *, timeout: float = 4.0, force: bool = False) -> MacdState | None:
+def fetch_macd_cross(
+    url: str | None = None,
+    *,
+    symbol: str | None = None,
+    timeout: float = 4.0,
+    force: bool = False,
+) -> MacdState | None:
     """仅在刚交叉时返回；无交叉或失败返回 None。"""
-    state = _load_state(url, timeout=timeout, force=force)
+    state = _load_state(url, symbol=symbol, timeout=timeout, force=force)
     if state is None or not state.cross:
         return None
     return state
