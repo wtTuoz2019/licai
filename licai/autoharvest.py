@@ -158,6 +158,17 @@ class AutoHarvestWorker:
     def _account_symbol(self, account) -> str:
         return str(getattr(account, "hedge_symbol", "") or "").strip().upper()
 
+    def _housekeep(self, account) -> None:
+        """换年化 / 划入保证金：不抢交叉窗口。"""
+        try:
+            self._maybe_daily_earn(account)
+        except Exception:
+            log.exception("账号 %s 每日理财检查失败", account.id)
+        try:
+            self._maybe_fund_margin(account)
+        except Exception:
+            log.exception("账号 %s 自动划入保证金失败", account.id)
+
     def _tick(self) -> None:
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
         accounts = list(self.ops.store.list_accounts())
@@ -178,32 +189,29 @@ class AutoHarvestWorker:
         for account in accounts:
             if self._stop.is_set():
                 return
-            try:
-                self._maybe_daily_earn(account)
-            except Exception:
-                log.exception("账号 %s 每日理财检查失败", account.id)
-            # 全账号：理财/现货保证金资产划进统一账户（与是否开自动收利无关）
-            try:
-                self._maybe_fund_margin(account)
-            except Exception:
-                log.exception("账号 %s 自动划入保证金失败", account.id)
             armed = bool(self.ops.migrate_arm(account.id))
+            pending_scale = (
+                bool(getattr(account, "auto_scale", False))
+                and account.scale_add_qty is not None
+                and float(account.scale_add_qty) > 0
+            )
+            sym = self._account_symbol(account)
+            cross_now = bool(sym and self._tick_crosses.get(sym) is not None)
+            # 交叉/迁仓窗口：先交易，换年化·划入保证金放到后面，避免拖死窗口
+            window_open = cross_now or armed
+            if not window_open:
+                self._housekeep(account)
             # 已挂起迁仓：每轮都查，别错过交叉+平稳窗口
             if armed:
                 try:
                     self._maybe_armed_migrate(account)
                 except Exception:
                     log.exception("账号 %s 挂起迁仓检查失败", account.id)
-            pending_scale = (
-                bool(getattr(account, "auto_scale", False))
-                and account.scale_add_qty is not None
-                and float(account.scale_add_qty) > 0
-            )
             if not account.auto_harvest and not pending_scale:
+                if window_open:
+                    self._housekeep(account)
                 continue
             # 本币对有交叉 / 有仓 / 挂起加仓 / 迁仓：按正常间隔；纯空仓空闲拉到 ~3 分钟
-            sym = self._account_symbol(account)
-            cross_now = bool(sym and self._tick_crosses.get(sym) is not None)
             urgent = (
                 cross_now
                 or armed
@@ -211,6 +219,8 @@ class AutoHarvestWorker:
                 or self._likely_has_pos(account)
             )
             if not urgent and not self._is_due(account.id):
+                if window_open:
+                    self._housekeep(account)
                 continue
             if account.auto_harvest and not armed:
                 try:
@@ -221,6 +231,8 @@ class AutoHarvestWorker:
                 self._maybe_act(account)
             except Exception:
                 log.exception("账号 %s 自动开仓/收利/加仓失败", account.id)
+            if window_open:
+                self._housekeep(account)
             idle = self._is_idle(account, pending_scale=pending_scale)
             gap = self._interval() if (urgent or not idle) else self._idle_gap
             self._mark_due(account.id, gap)
@@ -613,8 +625,14 @@ class AutoHarvestWorker:
                 if not self.ops.migrate_arm(account.id):
                     self._maybe_auto_arm_migrate(account)
                 return
-            # 现货加了 U：先申购理财入保证金（不等交叉）
-            if self._maybe_sweep_spot(account, live):
+            sym = (
+                str(live.get("symbol") or self._account_symbol(account) or "")
+                .strip()
+                .upper()
+            )
+            cross_now = bool(sym and self._tick_crosses.get(sym) is not None)
+            # 交叉窗口内禁止先扫闲置（换年化/settle 会拖死开平仓）
+            if not cross_now and self._maybe_sweep_spot(account, live):
                 did_trade = True
                 # 申购后权益变了，重拉再决定开仓/加仓
                 live = self.ops.monitor(account)

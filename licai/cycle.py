@@ -1074,17 +1074,8 @@ class HedgeCycle:
                 f"半平则继续平净；转出后先申购理财计入保证金，再补仓",
             )
         ]
-        # 平仓前先查好目标理财，避免平完再扫产品列表
-        planned, plan_step = self.pipeline.plan_earn_target()
-        self._harvest_earn_product = planned
-        steps.append(plan_step)
-        try:
-            before_pm = self.futures.papi_balances() if not self.settings.dry_run else {}
-        except Exception:
-            before_pm = {}
-
+        # 先卡时机再扫理财产品：plan_earn_target 会打产品列表，不能放在窗口判定前
         if auto and wait_stable:
-            # 自动收利：与迁仓一样，交叉与平稳须同时满足；不单独干等平稳后强平
             gate, ok = self._assert_macd_and_stable_now(side)
             steps.extend(gate)
             if not ok:
@@ -1095,14 +1086,27 @@ class HedgeCycle:
             except Exception as exc:
                 steps.append(StepResult("平仓前平稳跳过", True, str(exc)))
 
+        # 时机已确认：再查目标理财 / 保证金快照，随后立刻平仓
+        planned, plan_step = self.pipeline.plan_earn_target()
+        self._harvest_earn_product = planned
+        steps.append(plan_step)
+        try:
+            before_pm = self.futures.papi_balances() if not self.settings.dry_run else {}
+        except Exception:
+            before_pm = {}
+
         # 一经平掉盈利腿进入裸仓，后面任何报错都不能阻断补仓（finally 保底）
         refill_qty = Decimal("0")
         must_refill = False
         try:
-            steps.extend(self._close_winner_for_harvest(side, qty, wait_stable=wait_stable))
+            # 自动路径：时机已断言过，平仓重试不再干等平稳，尽快平净好补仓
+            close_wait = False if auto else wait_stable
+            steps.extend(self._close_winner_for_harvest(side, qty, wait_stable=close_wait))
             after = self.futures.legs(self.symbol)
             still = after.long_qty if side == "LONG" else after.short_qty
             # 盈利腿必须归零才转出；否则先把仓位拉回平衡再停
+            # 自动：裸仓不等平稳，尽快补齐
+            balance_wait = False if auto else wait_stable
             if still > 0:
                 steps.append(
                     StepResult(
@@ -1111,11 +1115,11 @@ class HedgeCycle:
                         f"{side} 仍剩 {fmt_amount(still)}，无法安全转出，先恢复对冲平衡",
                     )
                 )
-                steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
+                steps.extend(self._restore_harvest_balance(wait_stable=balance_wait))
                 return steps
             if after.missing_side is None:
                 steps.append(StepResult("平仓异常", False, "平仓后两侧仍在，没有实现盈利可转出"))
-                steps.extend(self._restore_harvest_balance(wait_stable=wait_stable))
+                steps.extend(self._restore_harvest_balance(wait_stable=balance_wait))
                 return steps
 
             must_refill = True
@@ -1161,7 +1165,7 @@ class HedgeCycle:
                     self._guarantee_refill_after_harvest(
                         refill_qty=refill_qty,
                         closed_side=side,
-                        wait_stable=wait_stable,
+                        wait_stable=False if auto else wait_stable,
                     )
                 )
 
