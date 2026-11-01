@@ -104,7 +104,8 @@ def _latest_history_row(rows: list) -> dict:
     return newest
 
 _YDAY_REWARD_CACHE: dict[str, tuple[float, dict]] = {}
-_YDAY_REWARD_TTL = 600.0
+# 利息分产品错峰入账，缓存太久会把「只有 RWUSD、还没有 BFUSD」锁住显示不全
+_YDAY_REWARD_TTL = 120.0
 
 
 def _reward_query_window_ms(now_ms: int | None = None) -> tuple[int, int]:
@@ -804,7 +805,10 @@ class EarnAPI:
         return {"by_day": merged, "errors": errors[:12], "source": source}
 
     def yesterday_earn_reward(self) -> dict[str, object]:
-        """理财昨日收益：汇总账户全部理财产品的奖励记录（折 USDT），不做年化粗算。"""
+        """最近一轮理财到账：BFUSD/RWUSD/活期可能错峰几小时，按各产品最近入账日合并。
+
+        不再只取 max(自然日) 那一天——否则 RWUSD 已到、BFUSD 仍记在前一日时会少算。
+        """
         key = (self.client.api_key or "")[:12]
         now = time.monotonic()
         hit = _YDAY_REWARD_CACHE.get(key)
@@ -826,12 +830,27 @@ class EarnAPI:
             latest = ""
         else:
             latest = max(by_day)
-            slot = by_day[latest]
-            flex = d(slot.get("flex"))
-            bfusd = d(slot.get("bfusd"))
-            rwusd = d(slot.get("rwusd"))
-            other = d(slot.get("other"))
-            total = d(slot.get("total"))
+            try:
+                latest_dt = datetime.strptime(latest, "%Y-%m-%d").date()
+                floor = (latest_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+            except ValueError:
+                floor = latest
+
+            def _kind_latest(kind: str) -> Decimal:
+                # 该产品在「最新日或前一日」里取最近一次有金额的入账
+                for day in sorted(by_day.keys(), reverse=True):
+                    if day < floor:
+                        break
+                    amt = d((by_day.get(day) or {}).get(kind))
+                    if amt > 0:
+                        return amt
+                return Decimal("0")
+
+            flex = _kind_latest("flex")
+            bfusd = _kind_latest("bfusd")
+            rwusd = _kind_latest("rwusd")
+            other = _kind_latest("other")
+            total = flex + bfusd + rwusd + other
 
         source = (
             "records"

@@ -548,7 +548,9 @@
           <div class="kpi" title="当前套保多空浮盈合计（未实现）">
             <span>仓位浮盈</span><b id="pos-upnl">-</b>
           </div>
-          <div class="kpi"><span>昨日收益</span><b id="earn-yesterday">-</b></div>
+          <div class="kpi" id="earn-yesterday-box" title="最近一轮理财到账（BFUSD/RWUSD/活期合并；各产品可能错峰几小时）。">
+            <span>昨日收益</span><b id="earn-yesterday">-</b>
+          </div>
           <div class="kpi" id="earn-income-box" title="自首次入场日起，按币安真实奖励入账累计，记在数据库；每天收益到账只加一次。">
             <span>累计理财收益</span><b id="earn-income-total">-</b>
           </div>
@@ -1718,6 +1720,22 @@
       renderEarnKpis(s.holdings || []);
       $("equity").textContent = s.account_total || s.pm_equity || "-";
       $("earn-yesterday").textContent = s.earn_yesterday || "0";
+      const ydayBox = $("earn-yesterday-box");
+      if (ydayBox) {
+        const parts = [];
+        const bf = s.earn_yesterday_bfusd;
+        const rw = s.earn_yesterday_rwusd;
+        const flex = s.earn_yesterday_flex;
+        const other = s.earn_yesterday_other;
+        if (bf && bf !== "0") parts.push(`BFUSD ${bf}`);
+        if (rw && rw !== "0") parts.push(`RWUSD ${rw}`);
+        if (flex && flex !== "0") parts.push(`活期 ${flex}`);
+        if (other && other !== "0") parts.push(`其他 ${other}`);
+        const day = s.earn_yesterday_day || "-";
+        ydayBox.title = parts.length
+          ? `收益日 ${day} 本轮到账：${parts.join(" + ")} = ${s.earn_yesterday || "0"}`
+          : `最近一轮理财到账（收益日 ${day}）。BFUSD/RWUSD 可能错峰几小时入账。`;
+      }
       if ($("earn-income-total")) {
         $("earn-income-total").textContent = s.earn_income_total || "0";
       }
