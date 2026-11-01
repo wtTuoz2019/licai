@@ -384,6 +384,7 @@ class HedgeCycle:
         side: str | None = None,
         allow_migrate: bool = True,
         auto: bool = False,
+        earn_product=None,
     ) -> list[StepResult]:
         # 换币后手动收利：当前套保无仓但旧币种仍有仓 → 挂单全平旧仓（开仓留给下次交叉）
         legs = self.futures.legs(self.symbol)
@@ -403,7 +404,13 @@ class HedgeCycle:
         pnl = legs.long_pnl if winner == "LONG" else legs.short_pnl
         if pnl <= 0:
             return [StepResult("平仓跳过", False, f"{note}：该腿没有浮盈（{fmt_amount(pnl, 4)}）")]
-        return self._harvest(winner, legs, wait_stable=wait_stable, auto=auto)
+        return self._harvest(
+            winner,
+            legs,
+            wait_stable=wait_stable,
+            auto=auto,
+            earn_product=earn_product,
+        )
 
     def _assert_macd_and_stable_now(self, side: str) -> tuple[list[StepResult], bool]:
         """自动收利动手前：金叉/死叉与收利级平稳必须同一时刻同时满足。"""
@@ -1062,7 +1069,13 @@ class HedgeCycle:
         return steps
 
     def _harvest(
-        self, side: str, legs: HedgeLegs, *, wait_stable: bool = True, auto: bool = False
+        self,
+        side: str,
+        legs: HedgeLegs,
+        *,
+        wait_stable: bool = True,
+        auto: bool = False,
+        earn_product=None,
     ) -> list[StepResult]:
         qty = legs.long_qty if side == "LONG" else legs.short_qty
         pnl = legs.long_pnl if side == "LONG" else legs.short_pnl
@@ -1074,7 +1087,26 @@ class HedgeCycle:
                 f"半平则继续平净；转出后先申购理财计入保证金，再补仓",
             )
         ]
-        # 先卡时机再扫理财产品：plan_earn_target 会打产品列表，不能放在窗口判定前
+        # 浮盈已达标：先备好理财产品与保证金快照，再等时机；窗口内只平仓
+        if earn_product is not None:
+            planned = earn_product
+            self._harvest_earn_product = planned
+            steps.append(
+                StepResult(
+                    "预选理财",
+                    True,
+                    f"使用提前扫描：{getattr(planned, 'asset', None) or planned}",
+                )
+            )
+        else:
+            planned, plan_step = self.pipeline.plan_earn_target()
+            self._harvest_earn_product = planned
+            steps.append(plan_step)
+        try:
+            before_pm = self.futures.papi_balances() if not self.settings.dry_run else {}
+        except Exception:
+            before_pm = {}
+
         if auto and wait_stable:
             gate, ok = self._assert_macd_and_stable_now(side)
             steps.extend(gate)
@@ -1085,15 +1117,6 @@ class HedgeCycle:
                 steps.extend(self._wait_until_stable("平仓前"))
             except Exception as exc:
                 steps.append(StepResult("平仓前平稳跳过", True, str(exc)))
-
-        # 时机已确认：再查目标理财 / 保证金快照，随后立刻平仓
-        planned, plan_step = self.pipeline.plan_earn_target()
-        self._harvest_earn_product = planned
-        steps.append(plan_step)
-        try:
-            before_pm = self.futures.papi_balances() if not self.settings.dry_run else {}
-        except Exception:
-            before_pm = {}
 
         # 一经平掉盈利腿进入裸仓，后面任何报错都不能阻断补仓（finally 保底）
         refill_qty = Decimal("0")

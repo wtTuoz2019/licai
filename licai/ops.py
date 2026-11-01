@@ -1383,6 +1383,7 @@ class OpsService:
         _locked: bool = False,
         auto: bool = False,
         harvest_side: str | None = None,
+        earn_product=None,
         with_snapshot: bool = True,
     ) -> dict:
         own_lock = False
@@ -1404,6 +1405,7 @@ class OpsService:
                 mode=mode,
                 auto=auto,
                 harvest_side=harvest_side,
+                earn_product=earn_product,
                 with_snapshot=with_snapshot,
             )
         finally:
@@ -1442,6 +1444,7 @@ class OpsService:
         *,
         auto: bool = False,
         harvest_side: str | None = None,
+        earn_product=None,
         with_snapshot: bool = True,
     ) -> dict:
         if action not in {"enter", "harvest", "switch", "sweep", "hedge", "recycle", "fund", "leverage", "scale"}:
@@ -1582,11 +1585,13 @@ class OpsService:
                 side = None
             # 自动收利：交叉与收利级平稳须同时满足；迁仓仅手动
             wait_stable = not force
+            planned = earn_product
             run = lambda: cycle.harvest_once(
                 wait_stable=wait_stable,
                 side=side if auto else None,
                 allow_migrate=not auto,
                 auto=auto,
+                earn_product=planned,
             )
         elif action == "scale":
             # 自动挂起加仓：按账户填写的两边各加数量；手动加仓仍按保证金目标加满

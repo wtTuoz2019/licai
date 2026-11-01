@@ -33,9 +33,9 @@ def _qty(legs: dict, key: str):
 class AutoHarvestWorker:
     """后台轮询：
 
-    - 每日：等理财利息到账后，自动换年化一次（需开自动收利且 auto_switch_earn）
+    - 每日：理财利息到账后，换年化 + 划入保证金 + 扫闲置各做一次（不反复扫）
     - 账号开启「自动收利」时：无仓须金叉/死叉与严平稳同时满足才开仓；
-      有仓须金叉/死叉与收利级平稳同时满足，且浮盈达标才收利
+      有仓浮盈达标先预扫理财产品，再等交叉+平稳收利
     手动一键入场/收利不受影响。
     """
 
@@ -45,22 +45,16 @@ class AutoHarvestWorker:
         self._thread: threading.Thread | None = None
         # account_id -> 已处理的金叉/死叉 key（多账号不能共用一根）
         self._last_cross_key: dict[int, str] = {}
-        # account_id -> UTC 日期：利息到账并完成换年化检查后才记完成（落盘）
+        # account_id -> UTC 日期：利息到账并完成每日管家后才记完成（落盘）
         self._earn_day_done: dict[int, str] = self._load_earn_day_done()
         # 等利息期间每账号最多半小时强刷一次快照，避免每分钟打爆币安
         self._earn_probe_at: dict[int, float] = {}
         self._earn_probe_gap = 1800.0
         # 本轮按币对各刷一次 MACD（同币对多账号共用，避免重复 force）
         self._tick_crosses: dict[str, object] = {}
-        # 闲置可转出探测节流
-        self._withdraw_probe_at: dict[int, float] = {}
-        self._withdraw_probe_gap = 600.0
-        # 有仓时空转归集后的加长退避（秒）
-        self._withdraw_busy_gap: dict[int, float] = {}
-        # 理财→统一账户保证金：全账号定期检查（与是否开自动收利无关）
-        self._fund_probe_at: dict[int, float] = {}
-        self._fund_probe_gap = 300.0
-        self._fund_busy_gap: dict[int, float] = {}
+        # 浮盈已达标时提前扫好的理财产品：account_id -> {product, detail, at}
+        self._harvest_prep: dict[int, dict] = {}
+        self._harvest_prep_ttl = 1800.0
         # 账号下次完整检查时间；空闲（无仓/无迁仓/无挂起加仓）拉长，有交叉立刻查
         self._due_at: dict[int, float] = {}
         self._idle_gap = 180.0
@@ -94,12 +88,12 @@ class AutoHarvestWorker:
             note = "MACD 过滤已关：无仓严平稳开仓；有仓按名义比例收"
         extras = []
         if bool(getattr(self.ops.base, "auto_switch_earn", True)):
-            extras.append("每日换低收益理财")
-        if bool(getattr(self.ops.base, "auto_sweep_spot", True)):
-            extras.append("闲置保证金/现货自动申购最高年化")
+            extras.append("利息到账后每日换年化一次")
         if bool(getattr(self.ops.base, "auto_fund_margin", True)):
-            extras.append("全账号理财自动划入统一账户保证金")
-        extras.append("账户挂起自动加仓（金叉/死叉+平稳加一次）")
+            extras.append("利息到账后每日划入保证金一次")
+        if bool(getattr(self.ops.base, "auto_sweep_spot", True)):
+            extras.append("利息到账后每日扫闲置一次")
+        extras.append("浮盈达标先预扫理财；账户挂起自动加仓")
         extra = "；".join(extras) if extras else "无额外理财自动化"
         _print(f"自动收利后台已启动（{note}；{extra}）")
 
@@ -159,15 +153,11 @@ class AutoHarvestWorker:
         return str(getattr(account, "hedge_symbol", "") or "").strip().upper()
 
     def _housekeep(self, account) -> None:
-        """换年化 / 划入保证金：不抢交叉窗口。"""
+        """利息到账后的每日一次管家（换年化/划入/扫闲置）。"""
         try:
-            self._maybe_daily_earn(account)
+            self._maybe_daily_housekeep(account)
         except Exception:
-            log.exception("账号 %s 每日理财检查失败", account.id)
-        try:
-            self._maybe_fund_margin(account)
-        except Exception:
-            log.exception("账号 %s 自动划入保证金失败", account.id)
+            log.exception("账号 %s 每日理财管家失败", account.id)
 
     def _tick(self) -> None:
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
@@ -449,17 +439,10 @@ class AutoHarvestWorker:
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
         return reward_day in {today, yesterday}
 
-    def _maybe_daily_earn(self, account) -> None:
-        """利息到账后每日自动换年化一次；有低收益稳定币仓且安全时换到最高年化。"""
+    def _maybe_daily_housekeep(self, account) -> None:
+        """利息到账后每日一次：换年化 + 划入保证金 + 扫闲置；不等交叉、不反复扫。"""
         day = self._utc_day()
         if self._earn_day_done.get(account.id) == day:
-            return
-        # 未开自动收利 / 关了自动换：直接记完成，不打币安
-        if not account.auto_harvest:
-            self._mark_earn_day_done(account.id, day)
-            return
-        if not bool(getattr(self.ops.base, "auto_switch_earn", True)):
-            self._mark_earn_day_done(account.id, day)
             return
         now = time.monotonic()
         last = float(self._earn_probe_at.get(account.id) or 0)
@@ -469,102 +452,157 @@ class AutoHarvestWorker:
             return
         try:
             self._earn_probe_at[account.id] = now
-            # 只清本账号奖励缓存，避免全站缓存被每分钟打掉
             cache_key = (account.api_key or "")[:12]
             earn_mod._YDAY_REWARD_CACHE.pop(cache_key, None)
             self.ops.invalidate_snapshot(account.id)
             live = self.ops.snapshot(account, force=True)
             if not live.get("ok"):
-                _print(f"每日换年化跳过 account={account.id}：{live.get('error') or '快照失败'}")
+                _print(f"每日管家跳过 account={account.id}：{live.get('error') or '快照失败'}")
                 return
             yday = live.get("earn_yesterday") or "0"
             src = live.get("earn_yesterday_source") or ""
             reward_day = live.get("earn_yesterday_day") or ""
+            earn_total = d(live.get("earn_total") or "0")
             _print(
                 f"每日理财收益 account={account.id} 昨日={yday} day={reward_day} source={src}"
             )
-
-            earn_total = d(live.get("earn_total") or "0")
+            # 有理财仓才等利息；无仓也做一次划入/扫闲置
             if earn_total > 0 and not self._interest_arrived(live):
                 _print(
-                    f"每日换年化等待利息到账 account={account.id} "
+                    f"每日管家等待利息到账 account={account.id} "
                     f"昨日={yday} day={reward_day} source={src}（半小时后再查）"
                 )
                 return
 
-            switch = live.get("switch") or {}
-            if not switch.get("needed"):
-                _print(f"每日换年化跳过 account={account.id}：已是最高或无需换")
-                self._mark_earn_day_done(account.id, day)
-                return
-            if not switch.get("can_click"):
-                _print(
-                    f"每日换年化暂缓 account={account.id}："
-                    f"{switch.get('reason') or 'uniMMR/批次不够'}（利息已到，安全线够了再换）"
-                )
-                return
-
-            _print(
-                f"每日自动换年化 account={account.id} "
-                f"→ {switch.get('target')} {switch.get('target_apr')}% · {switch.get('reason')}"
+            notes: list[str] = []
+            # 1) 换年化（仅自动收利账号）
+            do_switch = bool(account.auto_harvest) and bool(
+                getattr(self.ops.base, "auto_switch_earn", True)
             )
-            result = self.ops.run_action(
-                account,
-                "switch",
-                force=False,
-                mode=None,
-                _locked=True,
-                auto=True,
-            )
-            ok = bool(result.get("ok"))
-            detail = result.get("reason") or ""
-            steps = result.get("steps") or []
-            if steps:
-                fails = [s for s in steps if not s.get("ok")]
-                pick = fails or steps[-4:]
-                detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
-            paused = any(
-                (s.get("name") == "暂停换产品") or ("先不动" in str(s.get("detail") or ""))
-                for s in steps
-            )
-            subscribed = any(
-                s.get("ok") and ("申购" in str(s.get("name") or ""))
-                for s in steps
-            )
-            margin_locked = any(
-                s.get("name") == "暂停换产品"
-                and (
-                    "留作保证金" in str(s.get("detail") or "")
-                    or "最多能转回" in str(s.get("detail") or "")
-                )
-                for s in steps
-            )
-            if paused:
-                # 已换出一部分，或剩余被保证金锁死：今日不再空转刷事件
-                if subscribed or margin_locked:
-                    self._mark_earn_day_done(account.id, day)
-                    why = "已换出一部分，剩余保证金占用" if subscribed else "可转额度被保证金占用"
-                    _print(
-                        f"每日自动换年化结束 account={account.id} ok={ok} "
-                        f"{why}，今日不再重试：{detail[:400]}"
+            if do_switch:
+                switch = live.get("switch") or {}
+                if not switch.get("needed"):
+                    notes.append("换年化跳过：已是最高或无需换")
+                elif not switch.get("can_click"):
+                    notes.append(
+                        f"换年化跳过：{switch.get('reason') or 'uniMMR/批次不够'}"
                     )
-                    return
-                _print(
-                    f"每日自动换年化暂缓 account={account.id} ok={ok} "
-                    f"碰到安全线，稍后重试：{detail[:400]}"
-                )
-                return
-            if not ok:
-                _print(
-                    f"每日自动换年化失败 account={account.id} "
-                    f"今日稍后重试：{detail[:500]}"
-                )
-                return
-            # 真正换完才记今日完成
+                else:
+                    _print(
+                        f"每日自动换年化 account={account.id} "
+                        f"→ {switch.get('target')} {switch.get('target_apr')}% · "
+                        f"{switch.get('reason')}"
+                    )
+                    result = self.ops.run_action(
+                        account,
+                        "switch",
+                        force=False,
+                        mode=None,
+                        _locked=True,
+                        auto=True,
+                        with_snapshot=False,
+                    )
+                    detail = result.get("reason") or ""
+                    steps = result.get("steps") or []
+                    if steps:
+                        fails = [s for s in steps if not s.get("ok")]
+                        pick = fails or steps[-4:]
+                        detail = "；".join(
+                            f"{s.get('name')}: {s.get('detail')}" for s in pick
+                        )
+                    notes.append(f"换年化 ok={result.get('ok')} {detail[:200]}")
+            else:
+                notes.append("换年化跳过：未开自动收利/自动换")
+
+            # 2) 划入保证金一次
+            if bool(getattr(self.ops.base, "auto_fund_margin", True)):
+                notes.append(self._fund_margin_once(account))
+            else:
+                notes.append("划入保证金跳过：已关闭")
+
+            # 3) 扫闲置一次
+            if bool(getattr(self.ops.base, "auto_sweep_spot", True)):
+                notes.append(self._sweep_idle_once(account, live))
+            else:
+                notes.append("扫闲置跳过：已关闭")
+
             self._mark_earn_day_done(account.id, day)
-            _print(f"每日自动换年化结束 account={account.id} ok={ok} {detail[:500]}")
+            _print(
+                f"每日管家完成 account={account.id}："
+                + "；".join(notes)[:700]
+            )
         finally:
             self.ops.end_action(account.id)
+
+    def _fund_margin_once(self, account) -> str:
+        """每日管家内：把待划入的 BFUSD/RWUSD/LDUSDT 划进统一账户。已持锁。"""
+        try:
+            pipe = pipeline_for(account, self.ops.base, dry_run=True, ops=self.ops)
+            if not pipe.needs_fund_to_pm():
+                return "划入保证金：无需划入"
+        except Exception as exc:
+            return f"划入保证金检查失败：{exc}"
+        result = self.ops.run_action(
+            account,
+            "fund",
+            force=False,
+            mode=None,
+            _locked=True,
+            auto=True,
+            with_snapshot=False,
+        )
+        detail = result.get("reason") or ""
+        steps = result.get("steps") or []
+        if steps:
+            fails = [s for s in steps if not s.get("ok")]
+            pick = fails or steps[-4:]
+            detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+        moved = any(
+            s.get("ok")
+            and (
+                "划入统一账户" in str(s.get("name") or "")
+                or "转入统一账户" in str(s.get("name") or "")
+            )
+            for s in steps
+        )
+        return f"划入保证金 ok={result.get('ok')} moved={moved} {detail[:160]}"
+
+    def _sweep_idle_once(self, account, live: dict) -> str:
+        """每日管家内：闲置 U/现货 → 最高年化。已持锁。"""
+        legs = live.get("legs") or {}
+        has_pos = _qty(legs, "long_qty") > 0 or _qty(legs, "short_qty") > 0
+        min_idle = d("10") if has_pos else d("1")
+        spot = d(live.get("spot_usdt") or "0")
+        if spot < min_idle:
+            spot = self.ops._idle_spot(account)
+        withdrawable = d(live.get("withdrawable_usdt") or "0")
+        if spot < min_idle and withdrawable < min_idle:
+            try:
+                pipe = pipeline_for(account, self.ops.base, dry_run=True, ops=self.ops)
+                from .config import settle_asset_of
+
+                asset = settle_asset_of(str(getattr(pipe.settings, "hedge_symbol", "") or "")) or "USDT"
+                withdrawable = d(pipe.futures.max_withdraw(asset) or "0")
+            except Exception:
+                withdrawable = d("0")
+        if spot < min_idle and withdrawable < min_idle:
+            return f"扫闲置：无闲置（spot={spot} withdraw={withdrawable}）"
+        result = self.ops.run_action(
+            account,
+            "sweep",
+            force=False,
+            mode=None,
+            _locked=True,
+            auto=True,
+            with_snapshot=False,
+        )
+        detail = result.get("reason") or ""
+        steps = result.get("steps") or []
+        if steps:
+            fails = [s for s in steps if not s.get("ok")]
+            pick = fails or steps[-4:]
+            detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
+        return f"扫闲置 ok={result.get('ok')} {detail[:160]}"
 
     def _macd_side(self, account_id: int, symbol: str | None = None) -> tuple[str | None, str]:
         """仅本币对金叉/死叉那一根才返回腿；否则 None。"""
@@ -625,31 +663,14 @@ class AutoHarvestWorker:
                 if not self.ops.migrate_arm(account.id):
                     self._maybe_auto_arm_migrate(account)
                 return
-            sym = (
-                str(live.get("symbol") or self._account_symbol(account) or "")
-                .strip()
-                .upper()
-            )
-            cross_now = bool(sym and self._tick_crosses.get(sym) is not None)
-            # 交叉窗口内禁止先扫闲置（换年化/settle 会拖死开平仓）
-            if not cross_now and self._maybe_sweep_spot(account, live):
-                did_trade = True
-                # 申购后权益变了，重拉再决定开仓/加仓
-                live = self.ops.monitor(account)
-                if not live.get("ok"):
-                    return
-                legs = live.get("legs") or {}
-                missing = legs.get("missing")
-                if missing in {"LONG", "SHORT", "IMBALANCE"}:
-                    if self._maybe_repair_hedge(account, live):
-                        did_trade = True
-                    return
             flat = _qty(legs, "long_qty") <= 0 and _qty(legs, "short_qty") <= 0
             if flat:
                 if account.auto_harvest and self._maybe_enter(account, live):
                     did_trade = True
             else:
-                # 有仓且已齐：优先收利；否则在好时机处理账户挂起加仓
+                # 浮盈达标：先预扫理财产品，交叉到来时收利不再扫列表
+                if account.auto_harvest:
+                    self._maybe_prep_harvest(account, live)
                 if account.auto_harvest and self._maybe_harvest(account, live):
                     did_trade = True
                 elif self._maybe_scale(account, live):
@@ -663,134 +684,51 @@ class AutoHarvestWorker:
                     log.exception("账号 %s 操作后刷新快照失败", account.id)
             self.ops.end_action(account.id)
 
-    def _maybe_sweep_spot(self, account, live: dict) -> bool:
-        """统一账户可转出闲置 U / 现货闲置 → 申购当前最高年化。返回是否实际跑过。"""
-        if not bool(getattr(self.ops.base, "auto_sweep_spot", True)):
-            return False
+    def _maybe_prep_harvest(self, account, live: dict) -> None:
+        """浮盈已达收利门槛：提前扫理财产品，交叉窗口里不再打产品列表。"""
+        harvest = live.get("harvest") or {}
         legs = live.get("legs") or {}
-        has_pos = _qty(legs, "long_qty") > 0 or _qty(legs, "short_qty") > 0
-        # 有仓时 1~几 U 的 maxWithdraw 会一直抖，门槛抬高避免空转刷事件
-        min_idle = d("10") if has_pos else d("1")
-        spot = d(live.get("spot_usdt") or "0")
-        if spot < min_idle:
-            spot = self.ops._idle_spot(account)
-        withdrawable = d(live.get("withdrawable_usdt") or "0")
-        now = time.monotonic()
-        probe_gap = self._withdraw_probe_gap
-        if has_pos:
-            probe_gap = max(probe_gap, float(self._withdraw_busy_gap.get(account.id) or 0))
-        if spot < min_idle and withdrawable < min_idle:
-            last = float(self._withdraw_probe_at.get(account.id) or 0)
-            if now - last < probe_gap:
-                return False
-            self._withdraw_probe_at[account.id] = now
-            try:
-                pipe = pipeline_for(account, self.ops.base, dry_run=True, ops=self.ops)
-                settle = str(getattr(pipe.settings, "hedge_symbol", "") or "")
-                from .config import settle_asset_of
-
-                asset = settle_asset_of(settle) or "USDT"
-                withdrawable = d(pipe.futures.max_withdraw(asset) or "0")
-            except Exception:
-                withdrawable = d("0")
-        if spot < min_idle and withdrawable < min_idle:
-            return False
-        _print(
-            f"自动归集闲置 account={account.id} spot_usdt={spot} "
-            f"withdrawable={withdrawable} min={min_idle}"
-        )
-        result = self.ops.run_action(
-            account,
-            "sweep",
-            force=False,
-            mode=None,
-            _locked=True,
-            auto=True,
-            with_snapshot=False,
-        )
-        ok = bool(result.get("ok"))
-        detail = result.get("reason") or ""
-        steps = result.get("steps") or []
-        if steps:
-            fails = [s for s in steps if not s.get("ok")]
-            pick = fails or steps[-4:]
-            detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
-        subscribed = any(
-            s.get("ok") and "申购" in str(s.get("name") or "") for s in steps
-        )
-        if has_pos and not subscribed:
-            # 有仓只挪了一点保证金/暂留，没真正申购：2 小时内不再扫
-            self._withdraw_busy_gap[account.id] = 7200.0
-            self._withdraw_probe_at[account.id] = now
-        elif subscribed:
-            self._withdraw_busy_gap.pop(account.id, None)
-        _print(f"自动归集闲置结束 account={account.id} ok={ok} {detail[:500]}")
-        return bool(subscribed or ok)
-
-    def _maybe_fund_margin(self, account) -> bool:
-        """全账号：把现货/理财里的 BFUSD·RWUSD·LDUSDT 划进统一账户当保证金。"""
-        if not bool(getattr(self.ops.base, "auto_fund_margin", True)):
-            return False
-        now = time.monotonic()
-        gap = max(self._fund_probe_gap, float(self._fund_busy_gap.get(account.id) or 0))
-        last = float(self._fund_probe_at.get(account.id) or 0)
-        if now - last < gap:
-            return False
-        self._fund_probe_at[account.id] = now
-        # 与收利/开仓抢锁时跳过，下轮再试
-        if not self.ops.try_begin_action(account.id):
-            return False
-        moved = False
+        if harvest.get("migrate") or legs.get("missing"):
+            return
+        if not harvest.get("cooldown_ok", True):
+            return
+        min_profit = d(harvest.get("min_profit") or "0")
+        long_pnl = d(legs.get("long_pnl") or "0")
+        short_pnl = d(legs.get("short_pnl") or "0")
+        if max(long_pnl, short_pnl) < min_profit or max(long_pnl, short_pnl) <= 0:
+            self._harvest_prep.pop(account.id, None)
+            return
+        hit = self._harvest_prep.get(account.id)
+        if hit and (time.monotonic() - float(hit.get("at") or 0)) < self._harvest_prep_ttl:
+            return
         try:
-            try:
-                pipe = pipeline_for(account, self.ops.base, dry_run=True, ops=self.ops)
-                if not pipe.needs_fund_to_pm():
-                    self._fund_busy_gap.pop(account.id, None)
-                    return False
-            except Exception:
-                log.exception("账号 %s 检查待划入保证金失败", account.id)
-                return False
-            _print(f"自动划入保证金 account={account.id}")
-            result = self.ops.run_action(
-                account,
-                "fund",
-                force=False,
-                mode=None,
-                _locked=True,
-                auto=True,
-                with_snapshot=False,
-            )
-            ok = bool(result.get("ok"))
-            steps = result.get("steps") or []
-            detail = result.get("reason") or ""
-            if steps:
-                fails = [s for s in steps if not s.get("ok")]
-                pick = fails or steps[-6:]
-                detail = "；".join(f"{s.get('name')}: {s.get('detail')}" for s in pick)
-            moved = any(
-                s.get("ok")
-                and (
-                    "划入统一账户" in str(s.get("name") or "")
-                    or "转入统一账户" in str(s.get("name") or "")
-                )
-                for s in steps
-            )
-            if moved:
-                self._fund_busy_gap.pop(account.id, None)
-                try:
-                    self.ops.refresh_account_snapshot(account)
-                except Exception:
-                    log.exception("账号 %s 划入保证金后刷新快照失败", account.id)
-            else:
-                # 探测有余额但没划成：拉长间隔，避免空转
-                self._fund_busy_gap[account.id] = 1800.0
-            _print(
-                f"自动划入保证金结束 account={account.id} ok={ok} moved={moved} "
-                f"{detail[:500]}"
-            )
-            return moved
-        finally:
-            self.ops.end_action(account.id)
+            pipe = pipeline_for(account, self.ops.base, dry_run=True, ops=self.ops)
+            product, step = pipe.plan_earn_target()
+        except Exception as exc:
+            log.exception("账号 %s 预扫理财失败", account.id)
+            _print(f"收利预扫失败 account={account.id}：{exc}")
+            return
+        self._harvest_prep[account.id] = {
+            "product": product,
+            "detail": getattr(step, "detail", "") or "",
+            "ok": bool(getattr(step, "ok", True)),
+            "at": time.monotonic(),
+        }
+        _print(
+            f"收利预扫完成 account={account.id} "
+            f"long={long_pnl} short={short_pnl} min={min_profit} · {step.detail}"
+        )
+
+    def _take_harvest_prep(self, account_id: int):
+        """取出并消费预扫结果（过期则丢弃）。"""
+        hit = self._harvest_prep.pop(account_id, None)
+        if not hit:
+            return None
+        if (time.monotonic() - float(hit.get("at") or 0)) > self._harvest_prep_ttl:
+            return None
+        if not hit.get("ok"):
+            return None
+        return hit.get("product")
 
     def _maybe_scale(self, account, live: dict) -> bool:
         """账户挂起了一次加仓：金叉/死叉与入场级平稳同时满足才加这一次。"""
@@ -958,9 +896,11 @@ class AutoHarvestWorker:
             side = None
             macd_note = "未启用 MACD 过滤"
 
+        prep = self._take_harvest_prep(account.id)
         _print(
             f"自动收利触发 account={account.id} side={side or harvest.get('winner')} "
-            f"pnl={harvest.get('winner_pnl')} macd={macd_note}"
+            f"pnl={harvest.get('winner_pnl')} macd={macd_note} "
+            f"prep={'已预扫' if prep is not None else '临扫'}"
         )
         result: dict = {}
         try:
@@ -972,6 +912,7 @@ class AutoHarvestWorker:
                 _locked=True,
                 auto=True,
                 harvest_side=side,
+                earn_product=prep,
                 with_snapshot=False,
             )
         except Exception as exc:
@@ -997,6 +938,8 @@ class AutoHarvestWorker:
                 )
             if cross and cross.harvest_side == side:
                 self._last_cross_key[account.id] = f"{sym}:{cross.kind}:{cross.time}"
+        # 成功或失败都清掉预扫，避免用过期产品
+        self._harvest_prep.pop(account.id, None)
         _print(f"自动收利结束 account={account.id} ok={ok} {detail[:500]}")
         return True
 
