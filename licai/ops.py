@@ -1454,21 +1454,6 @@ class OpsService:
                     }
                 )
                 continue
-            holdings = []
-            for h in snap.get("holdings") or []:
-                if not isinstance(h, dict):
-                    continue
-                amt = d(h.get("amount") or 0)
-                if amt <= 0:
-                    continue
-                holdings.append(
-                    {
-                        "label": h.get("label") or h.get("asset") or "理财",
-                        "asset": h.get("asset") or "",
-                        "amount": h.get("amount") or "0",
-                        "apr": h.get("apr") or "",
-                    }
-                )
             rows.append(
                 {
                     "ui_no": idx,
@@ -1484,7 +1469,6 @@ class OpsService:
                     "earn_yesterday_flex": snap.get("earn_yesterday_flex") or "0",
                     "earn_apy": snap.get("earn_apy") or "-",
                     "earn_income_total": snap.get("earn_income_total") or "0",
-                    "holdings": holdings,
                     "from_cache": bool(snap.get("from_cache")),
                     "cache_age": int(snap.get("cache_age") or 0),
                 }

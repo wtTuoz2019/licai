@@ -118,7 +118,6 @@
       display: flex;
       flex-direction: column;
       gap: 12px;
-      min-height: 210px;
     }
     .card.err { border-color: #5a2a33; }
     .card-head {
@@ -153,27 +152,6 @@
       font-weight: 650;
     }
     .metric.wide { grid-column: 1 / -1; }
-    .holdings {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-top: auto;
-      padding-top: 2px;
-    }
-    .chip {
-      font-size: 11px;
-      color: #c5d3e2;
-      background: var(--panel2);
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 3px 8px;
-      font-variant-numeric: tabular-nums;
-    }
-    .chip em {
-      color: var(--muted);
-      font-style: normal;
-      margin-left: 4px;
-    }
     .muted { color: var(--muted); }
     .err-text { color: var(--bad); font-size: 13px; }
     .status {
@@ -285,10 +263,6 @@
         if (row.earn_yesterday_rwusd && row.earn_yesterday_rwusd !== "0") parts.push(`RWUSD ${esc(row.earn_yesterday_rwusd)}`);
         if (row.earn_yesterday_flex && row.earn_yesterday_flex !== "0") parts.push(`活期 ${esc(row.earn_yesterday_flex)}`);
         const ydayTip = parts.length ? `${day}：${parts.join(" + ")}` : day;
-        const chips = (row.holdings || []).map((h) => {
-          const apr = h.apr && Number(h.apr) > 0 ? `<em>${esc(String(h.apr))}%</em>` : "";
-          return `<span class="chip">${esc(h.label || h.asset || "理财")} ${esc(h.amount)}${apr}</span>`;
-        }).join("");
         card.innerHTML = `
           <div class="card-head">
             <div class="name">${esc(row.name || "账号")}</div>
@@ -300,8 +274,7 @@
             <div class="metric" title="${ydayTip}"><span>每日收益</span><b>${esc(fmt(row.earn_yesterday))}</b></div>
             <div class="metric"><span>相对年化</span><b>${esc(row.earn_apy || "-")}</b></div>
             <div class="metric wide"><span>累计理财收益</span><b>${esc(fmt(row.earn_income_total))}</b></div>
-          </div>
-          <div class="holdings">${chips || '<span class="muted">暂无理财持仓</span>'}</div>`;
+          </div>`;
         grid.appendChild(card);
       });
       $("sum-principal").textContent = fmt(sumP.toFixed(4));
