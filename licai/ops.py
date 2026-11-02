@@ -1390,6 +1390,10 @@ class OpsService:
                 earn_principal,
             ),
             "earn_yesterday": wallet.get("earn_yesterday") or "0",
+            "earn_yesterday_flex": wallet.get("earn_yesterday_flex") or "0",
+            "earn_yesterday_bfusd": wallet.get("earn_yesterday_bfusd") or "0",
+            "earn_yesterday_rwusd": wallet.get("earn_yesterday_rwusd") or "0",
+            "earn_yesterday_other": wallet.get("earn_yesterday_other") or "0",
             "earn_yesterday_source": wallet.get("earn_yesterday_source") or "none",
             "earn_yesterday_day": wallet.get("earn_yesterday_day") or "",
             "earn_yesterday_error": wallet.get("earn_yesterday_error") or "",
@@ -1418,6 +1422,74 @@ class OpsService:
             "holdings": wallet.get("holdings") or [],
             "events": _events_payload(account.id, self.store.recent_events(account.id, 30)),
         }
+
+    def board_summary(self, *, role: str = "admin", force: bool = False) -> dict:
+        """理财展示页：本金 / 理财额度 / 每日收益 / 年化（不含仓位与浮盈浮亏）。"""
+        accounts = list(self.store.list_accounts())
+        if role != "super":
+            accounts = [a for a in accounts if not a.hidden]
+        rows: list[dict] = []
+        for idx, account in enumerate(accounts, start=1):
+            try:
+                snap = self.snapshot(account, force=force)
+            except Exception as exc:
+                rows.append(
+                    {
+                        "ui_no": idx,
+                        "id": account.id,
+                        "name": account.name,
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                )
+                continue
+            if not snap.get("ok"):
+                rows.append(
+                    {
+                        "ui_no": idx,
+                        "id": account.id,
+                        "name": account.name,
+                        "ok": False,
+                        "error": snap.get("error") or "快照失败",
+                    }
+                )
+                continue
+            holdings = []
+            for h in snap.get("holdings") or []:
+                if not isinstance(h, dict):
+                    continue
+                amt = d(h.get("amount") or 0)
+                if amt <= 0:
+                    continue
+                holdings.append(
+                    {
+                        "label": h.get("label") or h.get("asset") or "理财",
+                        "asset": h.get("asset") or "",
+                        "amount": h.get("amount") or "0",
+                        "apr": h.get("apr") or "",
+                    }
+                )
+            rows.append(
+                {
+                    "ui_no": idx,
+                    "id": account.id,
+                    "name": account.name,
+                    "ok": True,
+                    "principal": snap.get("earn_principal") or snap.get("account_total") or "0",
+                    "earn_total": snap.get("earn_total") or "0",
+                    "earn_yesterday": snap.get("earn_yesterday") or "0",
+                    "earn_yesterday_day": snap.get("earn_yesterday_day") or "",
+                    "earn_yesterday_bfusd": snap.get("earn_yesterday_bfusd") or "0",
+                    "earn_yesterday_rwusd": snap.get("earn_yesterday_rwusd") or "0",
+                    "earn_yesterday_flex": snap.get("earn_yesterday_flex") or "0",
+                    "earn_apy": snap.get("earn_apy") or "-",
+                    "earn_income_total": snap.get("earn_income_total") or "0",
+                    "holdings": holdings,
+                    "from_cache": bool(snap.get("from_cache")),
+                    "cache_age": int(snap.get("cache_age") or 0),
+                }
+            )
+        return {"ok": True, "accounts": rows, "role": role}
 
     def list_events(self, account: Account, *, limit: int = 100, before_id: int | None = None) -> dict:
         limit = max(1, min(int(limit or 100), 500))

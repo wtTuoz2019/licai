@@ -19,6 +19,8 @@ COOKIE_TTL = 7 * 24 * 3600
 OPEN_PATHS = {
     ("/", "GET"),
     ("/", "HEAD"),
+    ("/ops", "GET"),
+    ("/ops", "HEAD"),
     ("/api/login", "POST"),
     ("/api/logout", "POST"),
 }

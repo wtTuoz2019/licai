@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <title>理财看板</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #12181f;
+      --panel2: #181f28;
+      --line: #243041;
+      --text: #e8eef6;
+      --muted: #7d8fa3;
+      --good: #3dd68c;
+      --warn: #f5c26b;
+      --bad: #ff7a8a;
+      --accent: #4da3ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "PingFang SC", sans-serif;
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #152033 0%, transparent 55%),
+        radial-gradient(900px 500px at 100% 0%, #13241c 0%, transparent 50%),
+        var(--bg);
+      color: var(--text);
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px 22px;
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(8px);
+      background: rgba(11, 15, 20, 0.72);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 650;
+      letter-spacing: 0.04em;
+    }
+    header .sub {
+      margin: 2px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    button {
+      font: inherit;
+      color: var(--text);
+      background: #1c2633;
+      border: 1px solid #33455c;
+      border-radius: 8px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    button.primary { background: #1a4f8f; border-color: #2d74c2; }
+    button.ghost { background: transparent; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    a.btn {
+      display: inline-block;
+      text-decoration: none;
+      color: var(--text);
+      background: #1c2633;
+      border: 1px solid #33455c;
+      border-radius: 8px;
+      padding: 8px 12px;
+    }
+    a.btn.primary { background: #1a4f8f; border-color: #2d74c2; }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 20px 18px 40px;
+    }
+    .totals {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .total {
+      background: rgba(18, 24, 31, 0.92);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px 16px;
+    }
+    .total span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+    .total b {
+      font-size: 22px;
+      font-variant-numeric: tabular-nums;
+      font-weight: 650;
+      letter-spacing: 0.01em;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 12px;
+    }
+    .card {
+      background: rgba(18, 24, 31, 0.94);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px 14px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 210px;
+    }
+    .card.err { border-color: #5a2a33; }
+    .card-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .card-head .name {
+      font-weight: 650;
+      font-size: 15px;
+    }
+    .card-head .no {
+      color: var(--muted);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px 12px;
+    }
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 3px;
+    }
+    .metric b {
+      font-size: 16px;
+      font-variant-numeric: tabular-nums;
+      font-weight: 650;
+    }
+    .metric.wide { grid-column: 1 / -1; }
+    .holdings {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: auto;
+      padding-top: 2px;
+    }
+    .chip {
+      font-size: 11px;
+      color: #c5d3e2;
+      background: var(--panel2);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-variant-numeric: tabular-nums;
+    }
+    .chip em {
+      color: var(--muted);
+      font-style: normal;
+      margin-left: 4px;
+    }
+    .muted { color: var(--muted); }
+    .err-text { color: var(--bad); font-size: 13px; }
+    .status {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .empty {
+      padding: 40px 16px;
+      text-align: center;
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 14px;
+    }
+    @media (max-width: 820px) {
+      .totals { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      header { padding: 14px 14px; }
+      main { padding: 14px 12px 28px; }
+      .total b { font-size: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>理财看板</h1>
+      <p class="sub">本金 · 理财额度 · 每日收益 · 年化</p>
+    </div>
+    <div class="tools">
+      <button type="button" id="btn-refresh" class="ghost">刷新</button>
+      <a class="btn primary" href="/ops">进入后台</a>
+      <button type="button" id="btn-logout" class="ghost">退出</button>
+    </div>
+  </header>
+  <main>
+    <p class="status" id="status">加载中…</p>
+    <section class="totals" id="totals" hidden>
+      <div class="total"><span>合计本金</span><b id="sum-principal">-</b></div>
+      <div class="total"><span>合计理财</span><b id="sum-earn">-</b></div>
+      <div class="total"><span>合计日收益</span><b id="sum-yday">-</b></div>
+      <div class="total"><span>账号数</span><b id="sum-count">-</b></div>
+    </section>
+    <section class="grid" id="grid"></section>
+    <div class="empty" id="empty" hidden>暂无账号</div>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const fmt = (v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return String(v ?? "-");
+      return n.toLocaleString("en-US", { maximumFractionDigits: 4 });
+    };
+    const esc = (s) => String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+    async function api(url, opts = {}) {
+      const res = await fetch(url, {
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+        ...opts,
+      });
+      if (res.status === 401) {
+        location.replace("/");
+        throw new Error("未登录");
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.statusText || "请求失败");
+      return data;
+    }
+
+    function render(data) {
+      const rows = data.accounts || [];
+      const grid = $("grid");
+      const empty = $("empty");
+      const totals = $("totals");
+      grid.innerHTML = "";
+      if (!rows.length) {
+        empty.hidden = false;
+        totals.hidden = true;
+        $("status").textContent = "没有可见账号";
+        return;
+      }
+      empty.hidden = true;
+      totals.hidden = false;
+      let sumP = 0, sumE = 0, sumY = 0, okN = 0;
+      rows.forEach((row) => {
+        const card = document.createElement("article");
+        card.className = "card" + (row.ok ? "" : " err");
+        if (!row.ok) {
+          card.innerHTML = `
+            <div class="card-head">
+              <div class="name">${esc(row.name || "账号")}</div>
+              <div class="no">#${esc(row.ui_no)} · id ${esc(row.id)}</div>
+            </div>
+            <p class="err-text">${esc(row.error || "加载失败")}</p>`;
+          grid.appendChild(card);
+          return;
+        }
+        okN += 1;
+        sumP += Number(row.principal) || 0;
+        sumE += Number(row.earn_total) || 0;
+        sumY += Number(row.earn_yesterday) || 0;
+        const day = row.earn_yesterday_day ? `收益日 ${esc(row.earn_yesterday_day)}` : "最近到账";
+        const parts = [];
+        if (row.earn_yesterday_bfusd && row.earn_yesterday_bfusd !== "0") parts.push(`BFUSD ${esc(row.earn_yesterday_bfusd)}`);
+        if (row.earn_yesterday_rwusd && row.earn_yesterday_rwusd !== "0") parts.push(`RWUSD ${esc(row.earn_yesterday_rwusd)}`);
+        if (row.earn_yesterday_flex && row.earn_yesterday_flex !== "0") parts.push(`活期 ${esc(row.earn_yesterday_flex)}`);
+        const ydayTip = parts.length ? `${day}：${parts.join(" + ")}` : day;
+        const chips = (row.holdings || []).map((h) => {
+          const apr = h.apr && Number(h.apr) > 0 ? `<em>${esc(String(h.apr))}%</em>` : "";
+          return `<span class="chip">${esc(h.label || h.asset || "理财")} ${esc(h.amount)}${apr}</span>`;
+        }).join("");
+        card.innerHTML = `
+          <div class="card-head">
+            <div class="name">${esc(row.name || "账号")}</div>
+            <div class="no">#${esc(row.ui_no)}</div>
+          </div>
+          <div class="metrics">
+            <div class="metric"><span>本金</span><b>${esc(fmt(row.principal))}</b></div>
+            <div class="metric"><span>理财额度</span><b>${esc(fmt(row.earn_total))}</b></div>
+            <div class="metric" title="${ydayTip}"><span>每日收益</span><b>${esc(fmt(row.earn_yesterday))}</b></div>
+            <div class="metric"><span>相对年化</span><b>${esc(row.earn_apy || "-")}</b></div>
+            <div class="metric wide"><span>累计理财收益</span><b>${esc(fmt(row.earn_income_total))}</b></div>
+          </div>
+          <div class="holdings">${chips || '<span class="muted">暂无理财持仓</span>'}</div>`;
+        grid.appendChild(card);
+      });
+      $("sum-principal").textContent = fmt(sumP.toFixed(4));
+      $("sum-earn").textContent = fmt(sumE.toFixed(4));
+      $("sum-yday").textContent = fmt(sumY.toFixed(4));
+      $("sum-count").textContent = String(okN);
+      const now = new Date();
+      const hh = String(now.getHours()).padStart(2, "0");
+      const mm = String(now.getMinutes()).padStart(2, "0");
+      $("status").textContent = `已更新 ${hh}:${mm} · 共 ${rows.length} 个账号`;
+    }
+
+    let loading = false;
+    async function load({ force = false } = {}) {
+      if (loading) return;
+      loading = true;
+      $("btn-refresh").disabled = true;
+      try {
+        const q = force ? "?force=1" : "";
+        const data = await api(`/api/board${q}`);
+        render(data);
+      } catch (err) {
+        $("status").textContent = err.message || "加载失败";
+      } finally {
+        loading = false;
+        $("btn-refresh").disabled = false;
+      }
+    }
+
+    $("btn-refresh").onclick = () => load({ force: true });
+    $("btn-logout").onclick = async () => {
+      try {
+        await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
+      } catch (_) {}
+      location.replace("/");
+    };
+
+    load({ force: false });
+    setInterval(() => {
+      if (!document.hidden) load({ force: false });
+    }, 120000);
+  </script>
+</body>
+</html>

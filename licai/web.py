@@ -98,7 +98,14 @@ def create_app() -> FastAPI:
     app.add_middleware(AuthMiddleware)
 
     @app.get("/")
-    def index(request: Request):
+    def board_page(request: Request):
+        """登录后默认进理财展示看板；操作台在 /ops。"""
+        if valid_session(request.cookies.get(COOKIE_NAME)):
+            return FileResponse(STATIC_DIR / "board.html", headers=NO_STORE)
+        return FileResponse(STATIC_DIR / "login.html", headers=NO_STORE)
+
+    @app.get("/ops")
+    def ops_page(request: Request):
         if valid_session(request.cookies.get(COOKIE_NAME)):
             return FileResponse(STATIC_DIR / "index.html", headers=NO_STORE)
         return FileResponse(STATIC_DIR / "login.html", headers=NO_STORE)
@@ -140,6 +147,15 @@ def create_app() -> FastAPI:
             "live_poll_seconds": int(ops.base.live_poll_seconds),
             "role": role,
         }
+
+    @app.get("/api/board")
+    def board(request: Request, force: bool = False):
+        """展示页：只返回本金/理财/日收益/年化，不含仓位浮盈浮亏。"""
+        role = _role(request)
+        try:
+            return ops.board_summary(role=role, force=force)
+        except Exception as exc:
+            raise HTTPException(500, str(exc)) from exc
 
     @app.post("/api/accounts")
     def add_account(request: Request, body: AccountIn):
