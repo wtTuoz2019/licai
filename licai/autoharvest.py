@@ -52,6 +52,11 @@ class AutoHarvestWorker:
         # 等利息期间每账号最多半小时强刷一次快照，避免每分钟打爆币安
         self._earn_probe_at: dict[int, float] = {}
         self._earn_probe_gap = 1800.0
+        # 持仓产品今日利息全部到齐后，强刷一次页面快照（每账号每天一次）
+        self._earn_ui_refreshed: dict[int, str] = {}
+        self._earn_ui_probe_at: dict[int, float] = {}
+        self._earn_ui_probe_gap = 300.0
+        self._earn_ui_wait_msg: dict[int, str] = {}
         # 本轮按币对各刷一次 MACD（同币对多账号共用，避免重复 force）
         self._tick_crosses: dict[str, object] = {}
         # 浮盈已达标时提前扫好的理财产品：account_id -> {product, detail, at}
@@ -176,6 +181,87 @@ class AutoHarvestWorker:
         except Exception:
             log.exception("账号 %s 每日理财管家失败", account.id)
 
+    def _today_earn_complete(self, pipe) -> tuple[bool | None, str]:
+        """今日 UTC：账户持有的 BFUSD/RWUSD 是否都已有到账记录。
+
+        返回 True=齐 / False=未齐 / None=无相关仓（跳过）。
+        """
+        need: list[str] = []
+        try:
+            if pipe.earn.bfusd_balance() >= 1:
+                need.append("bfusd")
+        except Exception:
+            pass
+        try:
+            if pipe.earn.rwusd_balance() >= 1:
+                need.append("rwusd")
+        except Exception:
+            pass
+        if not need:
+            return None, "无 BFUSD/RWUSD 仓"
+        today = self._utc_day()
+        try:
+            end_ms = int(pipe.earn.client.timestamp())
+        except Exception:
+            end_ms = int(time.time() * 1000)
+        start_ms = end_ms - 2 * 86400 * 1000
+        packed = pipe.earn.rewards_usdt_by_day(start_ms, end_ms, chunk_days=30)
+        slot = (packed.get("by_day") or {}).get(today) or {}
+        missing = [k for k in need if d(slot.get(k)) <= 0]
+        got = {k: str(slot.get(k) or 0) for k in need}
+        if missing:
+            return False, f"今日缺 {','.join(x.upper() for x in missing)}（已到 {got}）"
+        return True, f"今日齐 {got}"
+
+    def _maybe_refresh_earn_ui(self, account) -> None:
+        """持仓理财产品今日利息全部到齐后，强刷一次快照，页面轮询即可看到新收益。"""
+        day = self._utc_day()
+        if self._earn_ui_refreshed.get(account.id) == day:
+            return
+        now = time.monotonic()
+        last = float(self._earn_ui_probe_at.get(account.id) or 0)
+        if now - last < self._earn_ui_probe_gap:
+            return
+        if not self.ops.try_begin_action(account.id):
+            return
+        try:
+            self._earn_ui_probe_at[account.id] = now
+            pipe = pipeline_for(account, self.ops.base, dry_run=True, ops=self.ops)
+            pipe.earn.invalidate()
+            ok, detail = self._today_earn_complete(pipe)
+            if ok is None:
+                self._earn_ui_refreshed[account.id] = day
+                return
+            if not ok:
+                if self._earn_ui_wait_msg.get(account.id) != detail:
+                    self._earn_ui_wait_msg[account.id] = detail
+                    _print(f"理财到账等待 account={account.id} {detail}")
+                return
+            cache_key = (account.api_key or "")[:12]
+            earn_mod._YDAY_REWARD_CACHE.pop(cache_key, None)
+            self.ops.invalidate_snapshot(account.id)
+            snap = self.ops.snapshot(account, force=True)
+            self._earn_ui_refreshed[account.id] = day
+            self._earn_ui_wait_msg.pop(account.id, None)
+            gen = int(self.ops._earn_ui_gen.get(account.id) or 0) + 1
+            self.ops._earn_ui_gen[account.id] = gen
+            yday = (snap or {}).get("earn_yesterday") or "0"
+            _print(
+                f"理财全部到账已自动刷新 account={account.id} "
+                f"昨日收益={yday} gen={gen} · {detail}"
+            )
+            try:
+                self.ops.store.add_event(
+                    account.id,
+                    "earn",
+                    True,
+                    f"理财全部到账，已自动刷新收益展示：{yday}（{detail}）"[:500],
+                )
+            except Exception:
+                pass
+        finally:
+            self.ops.end_action(account.id)
+
     def _tick(self) -> None:
         url = getattr(self.ops.base, "macd_indicator_url", None) or ""
         accounts = list(self.ops.store.list_accounts())
@@ -196,6 +282,10 @@ class AutoHarvestWorker:
         for account in accounts:
             if self._stop.is_set():
                 return
+            try:
+                self._maybe_refresh_earn_ui(account)
+            except Exception:
+                log.exception("账号 %s 理财到账刷新失败", account.id)
             armed = bool(self.ops.migrate_arm(account.id))
             pending_scale = (
                 bool(getattr(account, "auto_scale", False))
@@ -833,8 +923,16 @@ class AutoHarvestWorker:
         return True
 
     def _maybe_repair_hedge(self, account, live: dict) -> bool:
-        """多空缺口（缺一边或数量不等）：不等平稳/交叉，立刻强行补齐。迁仓待命中也要修当前币对。"""
-        missing = (live.get("legs") or {}).get("missing")
+        """多空缺口（缺一边或数量不等）：不等平稳/交叉，立刻强行补齐。迁仓待命中也要修当前币对。
+
+        空仓（missing=BOTH）不是裸仓：禁止强制入场，必须等金叉/死叉+平稳走 _maybe_enter。
+        """
+        legs = live.get("legs") or {}
+        missing = legs.get("missing")
+        if missing not in {"LONG", "SHORT", "IMBALANCE"}:
+            return False
+        if _qty(legs, "long_qty") <= 0 and _qty(legs, "short_qty") <= 0:
+            return False
         _print(f"自动补齐对冲 account={account.id} missing={missing}")
         result = self.ops.run_action(
             account,
@@ -970,7 +1068,8 @@ class AutoHarvestWorker:
         # 收利后无论成败，再确认一次没有单边敞口（时机未齐未平仓则不必）
         if not timing_miss:
             self._repair_naked_hedge(account)
-        if ok and side:
+        # 只要过了时机断言（含中途失败已平仓），本根交叉就算用过，禁止马上同根再自动开仓
+        if not timing_miss and side:
             cross = self._tick_crosses.get(sym)
             if cross is None and sym not in self._tick_crosses:
                 cross = fetch_macd_cross(
@@ -988,7 +1087,11 @@ class AutoHarvestWorker:
         return not timing_miss
 
     def _repair_naked_hedge(self, account) -> None:
-        """收利后若仍单边，强行一键补仓/平裸仓，避免爆仓。"""
+        """收利后若仍单边/数量不等，强行补仓或削齐，避免敞口爆仓。
+
+        若收利失败已把仓位清成空仓（missing=BOTH），不能当裸仓强制重开——
+        那会绕过金叉/死叉+平稳。空仓留给下一根交叉走 _maybe_enter。
+        """
         try:
             live = self.ops.monitor(account)
         except Exception:
@@ -996,7 +1099,15 @@ class AutoHarvestWorker:
             return
         legs = live.get("legs") or {}
         missing = legs.get("missing")
-        if not missing:
+        long_qty = _qty(legs, "long_qty")
+        short_qty = _qty(legs, "short_qty")
+        if long_qty <= 0 and short_qty <= 0:
+            _print(
+                f"裸仓修复跳过 account={account.id} 已空仓（missing={missing}），"
+                f"等下一根金叉/死叉与入场平稳再开，不强制入场"
+            )
+            return
+        if missing not in {"LONG", "SHORT", "IMBALANCE"}:
             return
         _print(f"裸仓修复 account={account.id} missing={missing} → 强制入场补齐")
         try:

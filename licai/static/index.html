@@ -554,7 +554,7 @@
           <div class="kpi" id="earn-income-box" title="自首次入场日起，按币安真实奖励入账累计，记在数据库；每天收益到账只加一次。">
             <span>累计理财收益</span><b id="earn-income-total">-</b>
           </div>
-          <div class="kpi" id="earn-apy-box" title="按当天实际理财收入算一次相对年化，同一收益日不再重算。">
+          <div class="kpi" id="earn-apy-box" title="按币安真实到账利息算相对年化；同一收益日错峰产品后到会按新到账重算。">
             <span>相对年化</span><b id="earn-apy">-</b>
           </div>
         </div>
@@ -744,6 +744,7 @@
     let liveAt = 0;
     let fundsRefreshTimer = null;
     const lastSeenByAccount = Object.create(null);
+    const lastEarnUiGen = Object.create(null);
     const TAB_ID = Math.random().toString(36).slice(2);
     const TAB_LEADER_KEY = "licai_poll_leader_v1";
     const $ = (id) => document.getElementById(id);
@@ -1641,6 +1642,15 @@
           }
         }
       }
+      applyEarnFromSnap(s);
+      const gen = Number(s.earn_ui_gen || 0);
+      const prevGen = lastEarnUiGen[selected];
+      if (prevGen === undefined) {
+        lastEarnUiGen[selected] = gen;
+      } else if (gen > prevGen) {
+        lastEarnUiGen[selected] = gen;
+        scheduleFundsRefresh(selected, "理财全部到账，正在刷新收益…");
+      }
       showSnapAge();
     }
 
@@ -1680,6 +1690,46 @@
       return (s && s.earn_apy) || "-";
     }
 
+    function applyEarnFromSnap(s) {
+      if (!s || s.earn_yesterday == null) return;
+      if ($("earn-yesterday")) $("earn-yesterday").textContent = s.earn_yesterday || "0";
+      const ydayBox = $("earn-yesterday-box");
+      if (ydayBox) {
+        const parts = [];
+        const bf = s.earn_yesterday_bfusd;
+        const rw = s.earn_yesterday_rwusd;
+        const flex = s.earn_yesterday_flex;
+        const other = s.earn_yesterday_other;
+        if (bf && bf !== "0") parts.push(`BFUSD ${bf}`);
+        if (rw && rw !== "0") parts.push(`RWUSD ${rw}`);
+        if (flex && flex !== "0") parts.push(`活期 ${flex}`);
+        if (other && other !== "0") parts.push(`其他 ${other}`);
+        const day = s.earn_yesterday_day || "-";
+        ydayBox.title = parts.length
+          ? `收益日 ${day} 本轮到账：${parts.join(" + ")} = ${s.earn_yesterday || "0"}`
+          : `最近一轮理财到账（收益日 ${day}）。BFUSD/RWUSD 可能错峰几小时入账。`;
+      }
+      if ($("earn-income-total") && s.earn_income_total != null) {
+        $("earn-income-total").textContent = s.earn_income_total || "0";
+      }
+      const incomeBox = $("earn-income-box");
+      if (incomeBox && (s.earn_income_from != null || s.earn_income_error != null)) {
+        const from = s.earn_income_from || "";
+        const to = s.earn_income_to || "";
+        const days = s.earn_income_days || 0;
+        const err = s.earn_income_error || "";
+        incomeBox.title = err
+          ? `累计理财收益读取异常：${err}`
+          : `自入场日 ${from || "?"} 起累计到 ${to || "?"}，共 ${days} 个收益日（数据库记账，每日到账加一次）。`;
+      }
+      if ($("earn-apy") && s.earn_apy != null) $("earn-apy").textContent = blendedApyText(s);
+      const apyBox = $("earn-apy-box");
+      if (apyBox && s.earn_principal) {
+        apyBox.title = `按收益日 ${s.earn_yesterday_day || "-"} 真实到账 ${s.earn_yesterday || "0"} 计算；错峰入账变大时会重算。`;
+      }
+      if (s.holdings) renderEarnKpis(s.holdings);
+    }
+
     function renderEarnKpis(holdings) {
       const box = $("wallet-funds");
       if (!box) return;
@@ -1698,7 +1748,9 @@
         const name = esc(h.label || h.asset || "理财");
         const amt = esc(h.amount || "0");
         const apr = toNum(h.apr);
-        const aprText = Number.isFinite(apr) && apr > 0 ? ` · ${esc(String(h.apr))}%` : "";
+        const aprText = Number.isFinite(apr) && apr > 0
+          ? ` · ${esc(apr.toFixed(4).replace(/\.?0+$/, "") || "0")}%`
+          : "";
         el.innerHTML = `<span>${name}${aprText}</span><b>${amt}</b>`;
         box.appendChild(el);
       });
@@ -1717,43 +1769,9 @@
       $("ip").textContent = s.exit_ip || "-";
       if ($("proxy-mode")) $("proxy-mode").textContent = s.proxy_mode || "";
       $("spot").textContent = s.spot_usdt || "-";
-      renderEarnKpis(s.holdings || []);
       $("equity").textContent = s.account_total || s.pm_equity || "-";
-      $("earn-yesterday").textContent = s.earn_yesterday || "0";
-      const ydayBox = $("earn-yesterday-box");
-      if (ydayBox) {
-        const parts = [];
-        const bf = s.earn_yesterday_bfusd;
-        const rw = s.earn_yesterday_rwusd;
-        const flex = s.earn_yesterday_flex;
-        const other = s.earn_yesterday_other;
-        if (bf && bf !== "0") parts.push(`BFUSD ${bf}`);
-        if (rw && rw !== "0") parts.push(`RWUSD ${rw}`);
-        if (flex && flex !== "0") parts.push(`活期 ${flex}`);
-        if (other && other !== "0") parts.push(`其他 ${other}`);
-        const day = s.earn_yesterday_day || "-";
-        ydayBox.title = parts.length
-          ? `收益日 ${day} 本轮到账：${parts.join(" + ")} = ${s.earn_yesterday || "0"}`
-          : `最近一轮理财到账（收益日 ${day}）。BFUSD/RWUSD 可能错峰几小时入账。`;
-      }
-      if ($("earn-income-total")) {
-        $("earn-income-total").textContent = s.earn_income_total || "0";
-      }
-      const incomeBox = $("earn-income-box");
-      if (incomeBox) {
-        const from = s.earn_income_from || "";
-        const to = s.earn_income_to || "";
-        const days = s.earn_income_days || 0;
-        const err = s.earn_income_error || "";
-        incomeBox.title = err
-          ? `累计理财收益读取异常：${err}`
-          : `自入场日 ${from || "?"} 起累计到 ${to || "?"}，共 ${days} 个收益日（数据库记账，每日到账加一次）。`;
-      }
-      if ($("earn-apy")) $("earn-apy").textContent = blendedApyText(s);
-      const apyBox = $("earn-apy-box");
-      if (apyBox && s.earn_principal) {
-        apyBox.title = `按收益日 ${s.earn_yesterday_day || "-"} 的实际收入算过一次，同一天再打开不再重算。`;
-      }
+      applyEarnFromSnap({ ...s, earn_yesterday: s.earn_yesterday || "0" });
+      if (!s.holdings) renderEarnKpis([]);
       $("mid-price").textContent = s.price || (s.stability && s.stability.mid) || "-";
       setMmr(s.uni_mmr || "-");
       setAcctLabel(s.account);

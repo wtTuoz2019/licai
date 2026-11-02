@@ -1034,7 +1034,7 @@ class Pipeline:
                     "asset": product.asset,
                     "kind": product.kind,
                     "amount": fmt_amount(amount, 4),
-                    "apr": str(apr_pct),
+                    "apr": fmt_amount(apr_pct, 4),
                     "product_id": product.product_id,
                 }
             )

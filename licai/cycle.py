@@ -217,9 +217,10 @@ class HedgeCycle:
             steps.extend(self._ensure_hedge())
             return steps
 
-        # 自动入场：每日管家已划入/扫闲置，这里不再做换年化·扫货·settle
-        # 睡眠；先卡时机，最多补一笔轻量划入（可赎回），再挂单。
-        if auto and not force_hedge:
+        # 空仓自动开仓（含误带 force）：必须过金叉/死叉+入场平稳。
+        # force 只允许用来补单边/削齐，不能用来在收利清仓后硬开新仓。
+        flat = legs.long_qty <= 0 and legs.short_qty <= 0
+        if auto and flat:
             gate, ok = self._assert_enter_macd_and_stable_now()
             steps.extend(gate)
             if not ok:

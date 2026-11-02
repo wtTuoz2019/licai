@@ -417,6 +417,8 @@ class OpsService:
         self._daily_apy: dict[int, dict] = {}
         self._daily_apy_lock = threading.Lock()
         self._load_daily_apy()
+        # 理财全部到账后 bump；前端 monitor 看到代次变大就自动强刷一次
+        self._earn_ui_gen: dict[int, int] = {}
         # 累计理财收益：按首次入场日起算，SQLite 记账，每日到账加一次
         self._income_total_lock = threading.Lock()
 
@@ -648,11 +650,18 @@ class OpsService:
         income: Decimal,
         principal: Decimal,
     ) -> str:
-        """同一收益日只算一次相对年化，之后页面加载直接用记下的结果。"""
+        """相对年化只按币安真实到账利息算。
+
+        同一收益日默认只记一次，避免本金随浮盈飘动；但 BFUSD/RWUSD 错峰入账时，
+        若当日真实到账变大，必须按新的到账重算（不能锁在半份利息上）。
+        """
         with self._daily_apy_lock:
             row = self._daily_apy.get(account_id) or {}
-            if day and row.get("day") == day and row.get("apy"):
-                return str(row["apy"])
+            same_day = bool(day and row.get("day") == day and row.get("apy"))
+            if same_day:
+                cached_income = d(row.get("income"))
+                if income <= cached_income + Decimal("0.0001"):
+                    return str(row["apy"])
             apy = relative_earn_apy(income, principal)
             if not apy:
                 return str(row.get("apy") or "")
@@ -1070,6 +1079,33 @@ class OpsService:
             self.invalidate_snapshot(account.id)
         return out
 
+    def _attach_earn_ui(self, account: Account, out: dict) -> dict:
+        """把快照里的收益字段和到账刷新代次挂到 monitor，供页面自动更新。"""
+        out["earn_ui_gen"] = int(self._earn_ui_gen.get(account.id) or 0)
+        snap_hit = self._snap_cache.get(account.id)
+        if not snap_hit:
+            return out
+        snap = snap_hit[1] or {}
+        for key in (
+            "earn_yesterday",
+            "earn_yesterday_bfusd",
+            "earn_yesterday_rwusd",
+            "earn_yesterday_flex",
+            "earn_yesterday_other",
+            "earn_yesterday_day",
+            "earn_yesterday_source",
+            "earn_apy",
+            "earn_income_total",
+            "earn_income_from",
+            "earn_income_to",
+            "earn_income_days",
+            "holdings",
+            "earn_principal",
+        ):
+            if key in snap:
+                out[key] = snap[key]
+        return out
+
     def monitor(self, account: Account) -> dict:
         now = time.monotonic()
         hit = self._monitor_cache.get(account.id)
@@ -1078,7 +1114,7 @@ class OpsService:
             cached["monitor_cached"] = True
             cached["action_busy"] = account.id in self._busy
             cached["migrate_armed"] = bool(self.migrate_arm(account.id))
-            return cached
+            return self._attach_earn_ui(account, cached)
         try:
             pipe = pipeline_for(account, self.base, dry_run=True, ops=self)
         except Exception as exc:
@@ -1183,7 +1219,7 @@ class OpsService:
             "monitor_cached": False,
         }
         self._monitor_cache[account.id] = (now, out)
-        return out
+        return self._attach_earn_ui(account, dict(out))
 
     def _build_snapshot(self, account: Account, *, force_income: bool = False) -> dict:
         base = {
