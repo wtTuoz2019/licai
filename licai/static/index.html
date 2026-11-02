@@ -535,6 +535,7 @@
             <button id="btn-enter" class="primary" type="button">一键入场</button>
             <button id="btn-scale" class="warn" type="button" disabled>加仓</button>
             <button id="btn-harvest" class="good" type="button">一键收利</button>
+            <button id="btn-cancel-migrate" class="ghost" type="button" hidden>取消迁仓</button>
             <button id="btn-switch" class="warn" type="button">换年化</button>
             <button type="button" id="btn-settings" class="ghost">设置</button>
           </div>
@@ -893,6 +894,10 @@
       $("harvest-why").textContent = "加载中…";
       $("btn-enter").disabled = true;
       $("btn-harvest").disabled = true;
+      if ($("btn-cancel-migrate")) {
+        $("btn-cancel-migrate").hidden = true;
+        $("btn-cancel-migrate").disabled = true;
+      }
       $("btn-scale").disabled = true;
       $("btn-switch").disabled = true;
       const pill = $("stable-pill");
@@ -1564,6 +1569,13 @@
         : (h.migrate
           ? (accLive.auto_harvest ? "强行迁仓" : "迁仓开新")
           : "一键收利");
+      const cancelMig = $("btn-cancel-migrate");
+      if (cancelMig) {
+        const armed = !!(h.migrate_armed || s.migrate_armed);
+        cancelMig.hidden = !armed;
+        cancelMig.disabled = !!busy;
+        cancelMig.title = armed ? "取消迁仓待命，有旧仓时也不会自动再挂起" : "";
+      }
       const en = s.enter || {};
       const scaleBox = $("scale-box");
       const scaleEl = $("scale-why");
@@ -2492,6 +2504,36 @@
     $("btn-enter").onclick = () => act("enter");
     $("btn-scale").onclick = () => act("scale");
     $("btn-harvest").onclick = () => act("harvest");
+    if ($("btn-cancel-migrate")) {
+      $("btn-cancel-migrate").onclick = async () => {
+        if (!selected || busy) return;
+        const ok = await confirmAction({
+          title: "取消迁仓",
+          body: "取消后后台不再等时机平旧仓；有旧仓时也不会自动再挂起。需要时再点「迁仓开新」或「强行迁仓」。",
+          okText: "确认取消",
+          danger: false,
+        });
+        if (!ok) return;
+        showLoading("取消迁仓", "请稍候…");
+        try {
+          const data = await api(`/api/accounts/${selected}/actions`, {
+            method: "POST",
+            body: JSON.stringify({ action: "cancel_migrate" }),
+          });
+          if (data.snapshot) {
+            rememberSnap(selected, data.snapshot);
+            render(data.snapshot);
+          } else {
+            await refresh({ force: true, silent: true });
+          }
+          hideModal();
+          setActionMsg(data.reason || "已取消迁仓", data.ok ? "ok" : "bad");
+        } catch (err) {
+          hideModal();
+          setActionMsg(err.message || String(err), "bad");
+        }
+      };
+    }
     $("btn-switch").onclick = () => act("switch");
     if ($("btn-proxy")) {
       $("btn-proxy").onclick = () => setActionMsg("当前未启用代理");

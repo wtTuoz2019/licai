@@ -402,6 +402,8 @@ class OpsService:
         # 换币迁仓挂起：点「一键收利」后后台等到交叉+平稳再执行，不堵 HTTP
         # account_id -> {"force": bool, "armed_at": float, "last_event_at": float}
         self._migrate_armed: dict[int, dict] = {}
+        # 用户点「取消迁仓」后：有旧仓也不自动再挂起，直到手动再点迁仓或旧仓消失
+        self._migrate_dismissed: set[int] = set()
         self._webshare = WebshareClient(
             self.base.webshare_api_token,
             mode=self.base.webshare_mode,
@@ -811,9 +813,10 @@ class OpsService:
             self._busy.discard(account_id)
 
     def arm_migrate(self, account_id: int, *, force: bool = False) -> dict:
-        """挂起换币迁仓；已挂起则更新 force。"""
+        """挂起换币迁仓；已挂起则更新 force。手动挂起时清掉「已取消」标记。"""
         now = time.monotonic()
         with self._action_guard:
+            self._migrate_dismissed.discard(account_id)
             prev = self._migrate_armed.get(account_id)
             if prev:
                 prev["force"] = bool(force) or bool(prev.get("force"))
@@ -822,14 +825,26 @@ class OpsService:
             self._migrate_armed[account_id] = row
             return dict(row)
 
-    def clear_migrate_arm(self, account_id: int) -> None:
+    def clear_migrate_arm(self, account_id: int, *, dismiss: bool = False) -> None:
         with self._action_guard:
             self._migrate_armed.pop(account_id, None)
+            if dismiss:
+                self._migrate_dismissed.add(account_id)
+            else:
+                self._migrate_dismissed.discard(account_id)
 
     def migrate_arm(self, account_id: int) -> dict | None:
         with self._action_guard:
             hit = self._migrate_armed.get(account_id)
             return dict(hit) if hit else None
+
+    def migrate_dismissed(self, account_id: int) -> bool:
+        with self._action_guard:
+            return account_id in self._migrate_dismissed
+
+    def clear_migrate_dismiss(self, account_id: int) -> None:
+        with self._action_guard:
+            self._migrate_dismissed.discard(account_id)
 
     def touch_migrate_event(self, account_id: int) -> None:
         with self._action_guard:
@@ -1007,7 +1022,8 @@ class OpsService:
         if armed:
             out["reason"] = (
                 f"迁仓已挂起：旧仓 {tip}。后台等到金叉/死叉与收利级平稳后会挂单全平；"
-                f"清完后等下次交叉再开 {current_symbol}。可在事件里看进度。"
+                f"清完后等下次交叉再开 {current_symbol}。"
+                "不想迁了请点「取消迁仓」。"
             )
         elif auto_harvest:
             out["reason"] = (
@@ -1492,8 +1508,51 @@ class OpsService:
         earn_product=None,
         with_snapshot: bool = True,
     ) -> dict:
-        if action not in {"enter", "harvest", "switch", "sweep", "hedge", "recycle", "fund", "leverage", "scale"}:
+        if action not in {
+            "enter",
+            "harvest",
+            "switch",
+            "sweep",
+            "hedge",
+            "recycle",
+            "fund",
+            "leverage",
+            "scale",
+            "cancel_migrate",
+        }:
             raise ValueError(f"未知动作: {action}")
+        if action == "cancel_migrate":
+            arm = self.migrate_arm(account.id)
+            if not arm:
+                detail = "当前没有挂起的迁仓"
+                return {
+                    "ok": True,
+                    "blocked": False,
+                    "live": True,
+                    "migrate_armed": False,
+                    "reason": detail,
+                    "steps": [{"name": "取消迁仓", "ok": True, "detail": detail}],
+                    "snapshot": self.snapshot(account, force=True) if with_snapshot else None,
+                }
+            self.clear_migrate_arm(account.id, dismiss=True)
+            detail = (
+                "已取消迁仓待命；有旧仓时不会自动再挂起。"
+                "要迁仓请再点「迁仓开新」或「强行迁仓」。"
+            )
+            try:
+                self.store.add_event(account.id, "harvest", True, detail[:500])
+            except Exception:
+                pass
+            self.invalidate_snapshot(account.id)
+            return {
+                "ok": True,
+                "blocked": False,
+                "live": True,
+                "migrate_armed": False,
+                "reason": detail,
+                "steps": [{"name": "取消迁仓", "ok": True, "detail": detail}],
+                "snapshot": self.snapshot(account, force=True) if with_snapshot else None,
+            }
         try:
             pipe = pipeline_for(account, self.base, dry_run=False, ops=self)
         except Exception as exc:

@@ -350,6 +350,11 @@ class AutoHarvestWorker:
             return False
         others = live.get("other_positions") or []
         if not others:
+            # 旧仓已没了，清掉「取消迁仓」标记，方便下次换币再自动挂
+            self.ops.clear_migrate_dismiss(account.id)
+            return False
+        # 用户刚取消过：不要立刻再自动挂起
+        if self.ops.migrate_dismissed(account.id):
             return False
         tip = "、".join(
             f"{r.get('symbol')} 多{r.get('long_qty') or 0}/空{r.get('short_qty') or 0}"
