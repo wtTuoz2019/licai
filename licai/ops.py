@@ -1080,8 +1080,17 @@ class OpsService:
         return out
 
     def _attach_earn_ui(self, account: Account, out: dict) -> dict:
-        """把快照里的收益字段和到账刷新代次挂到 monitor，供页面自动更新。"""
+        """把快照收益字段、到账代次、最近操作日志挂到 monitor，供页面自动更新。
+
+        events 走 SQLite 轻量读：后台迁仓/收利写完后，不必等用户点刷新也能看到日志。
+        """
         out["earn_ui_gen"] = int(self._earn_ui_gen.get(account.id) or 0)
+        try:
+            out["events"] = _events_payload(
+                account.id, self.store.recent_events(account.id, 30)
+            )
+        except Exception:
+            pass
         snap_hit = self._snap_cache.get(account.id)
         if not snap_hit:
             return out
@@ -1215,7 +1224,7 @@ class OpsService:
                 armed=bool(armed),
                 auto_harvest=bool(account.auto_harvest),
             ),
-            # 事件留给 snapshot / 动作后刷新，monitor 高频路径不再查库
+            # events 在 _attach_earn_ui 里每次从 SQLite 带上，避免后台动作后页面看不到日志
             "monitor_cached": False,
         }
         self._monitor_cache[account.id] = (now, out)
