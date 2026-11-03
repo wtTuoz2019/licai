@@ -58,8 +58,8 @@
 </head>
 <body>
   <form id="login-form" autocomplete="on">
-    <h1>理财看板</h1>
-    <p>输入访问密码后进入展示页；操作后台在登录后点「进入后台」</p>
+    <h1>操作后台</h1>
+    <p>输入访问密码后进入操作台；理财看板无需密码，打开首页即可</p>
     <input id="password" type="password" name="password" required autofocus autocomplete="current-password" placeholder="访问密码" />
     <p id="err" class="err" hidden></p>
     <button type="submit">进入</button>
@@ -82,7 +82,7 @@
           err.hidden = false;
           return;
         }
-        location.replace("/");
+        location.replace("/ops");
       } catch (exc) {
         err.textContent = exc.message || "登录失败";
         err.hidden = false;

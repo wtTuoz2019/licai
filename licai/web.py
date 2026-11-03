@@ -18,6 +18,7 @@ from .auth import (
     make_session_token,
     mark_login_fail,
     session_cookie,
+    session_role,
     valid_session,
     COOKIE_NAME,
 )
@@ -98,11 +99,9 @@ def create_app() -> FastAPI:
     app.add_middleware(AuthMiddleware)
 
     @app.get("/")
-    def board_page(request: Request):
-        """登录后默认进理财展示看板；操作台在 /ops。"""
-        if valid_session(request.cookies.get(COOKIE_NAME)):
-            return FileResponse(STATIC_DIR / "board.html", headers=NO_STORE)
-        return FileResponse(STATIC_DIR / "login.html", headers=NO_STORE)
+    def board_page():
+        """理财展示看板公开访问，无需密码；操作台仍在 /ops 需登录。"""
+        return FileResponse(STATIC_DIR / "board.html", headers=NO_STORE)
 
     @app.get("/ops")
     def ops_page(request: Request):
@@ -150,8 +149,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/board")
     def board(request: Request, force: bool = False):
-        """展示页：只返回本金/理财/日收益/年化，不含仓位浮盈浮亏。"""
-        role = _role(request)
+        """展示页公开：本金/理财/日收益/年化；隐藏账号仅超管可见。"""
+        role = session_role(request.cookies.get(COOKIE_NAME)) or "admin"
+        if role not in {"admin", "super"}:
+            role = "admin"
+        # 未登录不允许强刷，避免公开接口打爆币安
+        if not valid_session(request.cookies.get(COOKIE_NAME)):
+            force = False
         try:
             return ops.board_summary(role=role, force=force)
         except Exception as exc:

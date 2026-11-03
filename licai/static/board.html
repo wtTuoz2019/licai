@@ -183,7 +183,6 @@
     <div class="tools">
       <button type="button" id="btn-refresh" class="ghost">刷新</button>
       <a class="btn primary" href="/ops">进入后台</a>
-      <button type="button" id="btn-logout" class="ghost">退出</button>
     </div>
   </header>
   <main>
@@ -216,10 +215,6 @@
         headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
         ...opts,
       });
-      if (res.status === 401) {
-        location.replace("/");
-        throw new Error("未登录");
-      }
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || res.statusText || "请求失败");
       return data;
@@ -304,13 +299,7 @@
       }
     }
 
-    $("btn-refresh").onclick = () => load({ force: true });
-    $("btn-logout").onclick = async () => {
-      try {
-        await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
-      } catch (_) {}
-      location.replace("/");
-    };
+    $("btn-refresh").onclick = () => load({ force: false });
 
     load({ force: false });
     setInterval(() => {

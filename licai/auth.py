@@ -21,6 +21,7 @@ OPEN_PATHS = {
     ("/", "HEAD"),
     ("/ops", "GET"),
     ("/ops", "HEAD"),
+    ("/api/board", "GET"),
     ("/api/login", "POST"),
     ("/api/logout", "POST"),
 }
