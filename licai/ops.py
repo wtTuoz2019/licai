@@ -1438,6 +1438,7 @@ class OpsService:
                         "ui_no": idx,
                         "id": account.id,
                         "name": account.name,
+                        "symbol": str(account.hedge_symbol or "").upper(),
                         "ok": False,
                         "error": str(exc),
                     }
@@ -1449,6 +1450,7 @@ class OpsService:
                         "ui_no": idx,
                         "id": account.id,
                         "name": account.name,
+                        "symbol": str(account.hedge_symbol or snap.get("symbol") or "").upper(),
                         "ok": False,
                         "error": snap.get("error") or "快照失败",
                     }
@@ -1459,6 +1461,7 @@ class OpsService:
                     "ui_no": idx,
                     "id": account.id,
                     "name": account.name,
+                    "symbol": str(snap.get("symbol") or account.hedge_symbol or "").upper(),
                     "ok": True,
                     "principal": snap.get("earn_principal") or snap.get("account_total") or "0",
                     "earn_total": snap.get("earn_total") or "0",

@@ -135,6 +135,18 @@
       font-size: 12px;
       font-variant-numeric: tabular-nums;
     }
+    .card-head .sym {
+      margin-left: 8px;
+      padding: 1px 7px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--panel2);
+      color: #c5d3e2;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      font-variant-numeric: tabular-nums;
+    }
     .metrics {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -239,9 +251,10 @@
         const card = document.createElement("article");
         card.className = "card" + (row.ok ? "" : " err");
         if (!row.ok) {
+          const errSym = row.symbol ? `<span class="sym">${esc(row.symbol)}</span>` : "";
           card.innerHTML = `
             <div class="card-head">
-              <div class="name">${esc(row.name || "账号")}</div>
+              <div class="name">${esc(row.name || "账号")}${errSym}</div>
               <div class="no">#${esc(row.ui_no)} · id ${esc(row.id)}</div>
             </div>
             <p class="err-text">${esc(row.error || "加载失败")}</p>`;
@@ -258,9 +271,10 @@
         if (row.earn_yesterday_rwusd && row.earn_yesterday_rwusd !== "0") parts.push(`RWUSD ${esc(row.earn_yesterday_rwusd)}`);
         if (row.earn_yesterday_flex && row.earn_yesterday_flex !== "0") parts.push(`活期 ${esc(row.earn_yesterday_flex)}`);
         const ydayTip = parts.length ? `${day}：${parts.join(" + ")}` : day;
+        const sym = row.symbol ? `<span class="sym">${esc(row.symbol)}</span>` : "";
         card.innerHTML = `
           <div class="card-head">
-            <div class="name">${esc(row.name || "账号")}</div>
+            <div class="name">${esc(row.name || "账号")}${sym}</div>
             <div class="no">#${esc(row.ui_no)}</div>
           </div>
           <div class="metrics">
