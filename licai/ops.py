@@ -419,6 +419,11 @@ class OpsService:
         self._daily_apy: dict[int, dict] = {}
         self._daily_apy_lock = threading.Lock()
         self._load_daily_apy()
+        # 上次收利实付手续费（展示用，不走费率预估）
+        self._last_harvest_fee_path = ROOT / "data" / "last_harvest_fee.json"
+        self._last_harvest_fee: dict[int, dict] = {}
+        self._last_harvest_fee_lock = threading.Lock()
+        self._load_last_harvest_fee()
         # 理财全部到账后 bump；前端 monitor 看到代次变大就自动强刷一次
         self._earn_ui_gen: dict[int, int] = {}
         # 累计理财收益：按首次入场日起算，SQLite 记账，每日到账加一次
@@ -471,6 +476,111 @@ class OpsService:
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = {str(aid): row for aid, row in sorted(self._daily_apy.items())}
             path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_last_harvest_fee(self) -> None:
+        path = getattr(self, "_last_harvest_fee_path", ROOT / "data" / "last_harvest_fee.json")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            raw = {}
+        out: dict[int, dict] = {}
+        if isinstance(raw, dict):
+            for key, row in raw.items():
+                try:
+                    aid = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                fee = d(row.get("fee") or 0)
+                if fee <= 0:
+                    continue
+                out[aid] = {
+                    "fee": fmt_amount(fee, 4),
+                    "symbol": str(row.get("symbol") or "").upper(),
+                    "at": str(row.get("at") or ""),
+                    "source": str(row.get("source") or "trades"),
+                }
+        self._last_harvest_fee = out
+
+    def _save_last_harvest_fee(self) -> None:
+        path = getattr(self, "_last_harvest_fee_path", ROOT / "data" / "last_harvest_fee.json")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {str(aid): row for aid, row in sorted(self._last_harvest_fee.items())}
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    def remember_harvest_fee(
+        self,
+        account_id: int,
+        fee: Decimal,
+        *,
+        symbol: str = "",
+        source: str = "trades",
+    ) -> None:
+        fee = d(fee)
+        if fee <= 0:
+            return
+        with self._last_harvest_fee_lock:
+            self._last_harvest_fee[account_id] = {
+                "fee": fmt_amount(fee, 4),
+                "symbol": str(symbol or "").upper(),
+                "at": datetime.now(timezone.utc).isoformat(),
+                "source": str(source or "trades"),
+            }
+            self._save_last_harvest_fee()
+
+    def harvest_fee_for_ui(
+        self,
+        account: Account,
+        futures,
+        symbol: str,
+        legs,
+        mid: Decimal,
+        settings: Settings,
+    ) -> tuple[Decimal, str]:
+        """页面展示：优先上次收利实付；否则拉成交实付；再不行才费率估算。"""
+        with self._last_harvest_fee_lock:
+            hit = dict(self._last_harvest_fee.get(account.id) or {})
+        last_fee = d(hit.get("fee") or 0)
+        if last_fee > 0:
+            return last_fee, "last"
+        qty = max(getattr(legs, "long_qty", Decimal("0")), getattr(legs, "short_qty", Decimal("0")))
+        try:
+            info = futures.round_trip_fee(symbol, qty, mid)
+            fee = d(info.get("fee") or 0)
+            source = str(info.get("source") or "")
+            if fee > 0 and source == "trades":
+                self.remember_harvest_fee(account.id, fee, symbol=symbol, source="trades")
+                return fee, "trades"
+            if fee > 0:
+                return fee, source or "rate"
+        except Exception:
+            pass
+        est = harvest_fee_estimate(legs, mid, settings) if qty > 0 and mid > 0 else Decimal("0")
+        return est, "estimate"
+
+    def _capture_harvest_fee_after_action(self, account: Account, cycle: HedgeCycle) -> None:
+        try:
+            symbol = str(getattr(cycle, "symbol", "") or account.hedge_symbol or "")
+            futures = cycle.futures
+            legs = futures.legs(symbol)
+            qty = max(legs.long_qty, legs.short_qty)
+            mid = Decimal("0")
+            try:
+                stab = price_stability(futures, cycle.settings, purpose="harvest")
+                mid = stab.mid
+            except Exception:
+                mid = Decimal("0")
+            info = futures.round_trip_fee(symbol, qty, mid)
+            fee = d(info.get("fee") or 0)
+            source = str(info.get("source") or "")
+            if fee > 0 and source == "trades":
+                self.remember_harvest_fee(account.id, fee, symbol=symbol, source="trades")
         except Exception:
             pass
 
@@ -1167,15 +1277,16 @@ class OpsService:
         if snap_hit:
             fallback = d(snap_hit[1].get("collateral_usdt") or snap_hit[1].get("bfusd") or "0")
         coll = _sizing_collateral(risk, fallback)
-        # 展示用配置费率估算；真下单路径仍走 resolve_harvest_fee
+        # 展示/门槛优先上次收利实付手续费，不再用费率预估糊弄页面
+        fee, fee_source = self.harvest_fee_for_ui(
+            account, futures, settings.hedge_symbol, legs, stability.mid, settings
+        )
         if has_pos:
-            fee = harvest_fee_estimate(legs, stability.mid, settings)
             try:
                 harvest_stab = price_stability(futures, settings, purpose="harvest")
             except Exception:
                 harvest_stab = stability
         else:
-            fee = Decimal("0")
             harvest_stab = stability
         sized = _sizing_settings(settings, legs)
         plan = position_plan(
@@ -1198,6 +1309,8 @@ class OpsService:
                 legs, stability.mid, plan, collateral=coll, settings=sized
             ),
         )
+        advice_dict = advice.as_dict()
+        advice_dict["fee_source"] = fee_source
         mmr_text = format_uni_mmr(mmr, has_pos)
         lev, lev_tgt = _display_leverage(legs, settings)
         # 现货余额：优先快照；最多每小时实拉一次
@@ -1234,7 +1347,7 @@ class OpsService:
             "stability": stability.as_dict(),
             "enter": enter_advice(legs, stability, spot_usdt, plan),
             "harvest": self._apply_migrate_harvest_advice(
-                advice.as_dict(),
+                advice_dict,
                 others,
                 settings.hedge_symbol,
                 armed=bool(armed),
@@ -1298,16 +1411,17 @@ class OpsService:
         equity = risk.get("equity") or Decimal("0")
         sizing_coll = _sizing_collateral(risk, earn_collateral)
         has_pos = legs.long_qty > 0 or legs.short_qty > 0
+        fee, fee_source = self.harvest_fee_for_ui(
+            account, futures, settings.hedge_symbol, legs, stability.mid, settings
+        )
         if has_pos:
             last_harvest = self.store.last_ok_action_at(account.id, "harvest")
-            fee = harvest_fee_estimate(legs, stability.mid, settings)
             try:
                 harvest_stab = price_stability(futures, settings, purpose="harvest")
             except Exception:
                 harvest_stab = stability
         else:
             last_harvest = None
-            fee = Decimal("0")
             harvest_stab = stability
         filters = fetched.get("filters")
         step = filters[1] if isinstance(filters, tuple) and len(filters) > 1 else Decimal("0.001")
@@ -1332,6 +1446,8 @@ class OpsService:
                 legs, stability.mid, plan, collateral=sizing_coll, settings=sized
             ),
         )
+        advice_dict = advice.as_dict()
+        advice_dict["fee_source"] = fee_source
         enter = enter_advice(legs, stability, spot_usdt, plan)
         try:
             switch = pipe.switch_advice(mmr=mmr, equity=equity)
@@ -1412,7 +1528,7 @@ class OpsService:
             "stability": stability.as_dict(),
             "enter": enter,
             "harvest": self._apply_migrate_harvest_advice(
-                advice.as_dict(),
+                advice_dict,
                 others,
                 settings.hedge_symbol,
                 armed=bool(armed),
@@ -1850,6 +1966,8 @@ class OpsService:
                 fails = [f"{s.name}: {_detail(s.detail)}" for s in steps if not s.ok]
             if fails:
                 print(f"动作失败 account={account.id} action={action} " + " | ".join(fails)[:800])
+        if ok and action == "harvest":
+            self._capture_harvest_fee_after_action(account, cycle)
         # 挂起自动加仓：真正加到仓后清空数量并关闭开关；软跳过（满仓/暂不加）保留挂起
         if ok and auto and action == "scale" and getattr(account, "auto_scale", False):
             soft = any(
